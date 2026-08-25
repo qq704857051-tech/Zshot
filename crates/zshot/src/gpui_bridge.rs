@@ -1,5 +1,6 @@
-//! GPUI overlay bridge: smoke dual-visual freeze swapchain.
+//! GPUI overlay bridge: freeze composition swapchain (visual 0) under GPUI UI.
 
+use std::sync::Mutex;
 use std::time::Duration;
 
 use gpui::{
@@ -15,13 +16,16 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::{
     IDXGIDevice, IDXGIFactory2, IDXGISwapChain1, DXGI_PRESENT, DXGI_SCALING_STRETCH,
-    DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT,
+    DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+    DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
 
 use crate::error::{Error, Result};
 
 const SMOKE_W: u32 = 800;
 const SMOKE_H: u32 = 600;
+
+static FREEZE_SWAP: Mutex<Option<(IDXGISwapChain1, u32, u32)>> = Mutex::new(None);
 
 struct SmokeOverlay {
     /// Keeps the freeze swapchain alive while the window is open.
@@ -94,13 +98,80 @@ pub fn open_smoke_overlay(cx: &mut App) -> Result<()> {
     Ok(())
 }
 
+/// Drop the cached freeze swapchain (GPU reset).
+pub fn drop_freeze_swapchain() {
+    *FREEZE_SWAP.lock().unwrap_or_else(|p| p.into_inner()) = None;
+}
+
+/// Create or resize a composition swapchain, copy `src` into it, and Present.
+pub fn present_freeze_from_texture(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    src: &ID3D11Texture2D,
+    width: u32,
+    height: u32,
+) -> Result<IDXGISwapChain1> {
+    struct RestoreGpu<'a>(&'a ID3D11DeviceContext);
+    impl Drop for RestoreGpu<'_> {
+        fn drop(&mut self) {
+            unsafe {
+                self.0.PSSetShaderResources(0, Some(&[None]));
+                self.0.OMSetRenderTargets(None, None);
+                self.0.ClearState();
+            }
+        }
+    }
+
+    let _restore = RestoreGpu(context);
+    let width = width.max(1);
+    let height = height.max(1);
+    let swap = reuse_or_create_swapchain(device, width, height)?;
+    unsafe {
+        let buf: ID3D11Texture2D = swap.GetBuffer(0)?;
+        context.CopyResource(&buf, src);
+        swap.Present(0, DXGI_PRESENT(0)).ok()?;
+    }
+    Ok(swap)
+}
+
+fn reuse_or_create_swapchain(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+) -> Result<IDXGISwapChain1> {
+    let mut slot = FREEZE_SWAP.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((swap, w, h)) = slot.as_ref() {
+        if *w == width && *h == height {
+            return Ok(swap.clone());
+        }
+        unsafe {
+            if swap
+                .ResizeBuffers(
+                    2,
+                    width,
+                    height,
+                    DXGI_FORMAT_B8G8R8A8_UNORM,
+                    DXGI_SWAP_CHAIN_FLAG(0),
+                )
+                .is_ok()
+            {
+                let swap = swap.clone();
+                *slot = Some((swap.clone(), width, height));
+                return Ok(swap);
+            }
+        }
+    }
+    let swap = unsafe { create_composition_swapchain(device, width, height)? };
+    *slot = Some((swap.clone(), width, height));
+    Ok(swap)
+}
+
 fn create_red_composition_swapchain(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
     width: u32,
     height: u32,
 ) -> Result<IDXGISwapChain1> {
-    // Always restore GPUI's immediate context, even if clear/Present fails mid-pass.
     struct RestoreGpu<'a>(&'a ID3D11DeviceContext);
     impl Drop for RestoreGpu<'_> {
         fn drop(&mut self) {

@@ -1806,6 +1806,25 @@ impl Window {
         self.platform_window.set_background_swap_chain(swap)
     }
 
+    /// Native Win32 HWND for this window.
+    #[cfg(target_os = "windows")]
+    pub fn win32_hwnd(&self) -> windows::Win32::Foundation::HWND {
+        self.platform_window.get_raw_handle()
+    }
+
+    /// Block until DirectComposition has finished the last `Commit`.
+    #[cfg(target_os = "windows")]
+    pub fn wait_for_commit_completion(&self) -> anyhow::Result<()> {
+        self.platform_window.wait_for_commit_completion()
+    }
+
+    /// Called when WndProc receives `WM_APP+32` (0x8020), used as the overlay ready sentinel.
+    #[cfg(target_os = "windows")]
+    pub fn on_app_ready_sentinel(&self, callback: impl FnMut() + 'static) {
+        self.platform_window
+            .on_app_ready_sentinel(Box::new(callback));
+    }
+
     /// Mark the window as dirty at the platform level.
     pub fn set_window_edited(&mut self, edited: bool) {
         self.platform_window.set_edited(edited);

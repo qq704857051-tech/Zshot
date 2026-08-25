@@ -187,6 +187,13 @@ impl DirectXRenderer {
         composition.set_freeze_swap_chain(swap)
     }
 
+    pub(crate) fn wait_for_commit_completion(&self) -> Result<()> {
+        if let Some(composition) = self.direct_composition.as_ref() {
+            unsafe { composition.comp_device.WaitForCommitCompletion()? };
+        }
+        Ok(())
+    }
+
     fn pre_draw(&self) -> Result<()> {
         update_buffer(
             &self.devices.device_context,

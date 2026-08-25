@@ -109,6 +109,8 @@ impl WindowsWindowInner {
             WM_GPUI_CURSOR_STYLE_CHANGED => self.handle_cursor_changed(lparam),
             WM_GPUI_FORCE_UPDATE_WINDOW => self.draw_window(handle, true),
             WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
+            // WM_APP + 32 — overlay input-ready sentinel (T7)
+            0x8020 => self.handle_app_ready_sentinel(),
             _ => None,
         };
         if let Some(n) = handled {
@@ -771,6 +773,16 @@ impl WindowsWindowInner {
         } else {
             None
         }
+    }
+
+    fn handle_app_ready_sentinel(&self) -> Option<isize> {
+        let mut lock = self.state.borrow_mut();
+        if let Some(mut callback) = lock.callbacks.app_ready_sentinel.take() {
+            drop(lock);
+            callback();
+            self.state.borrow_mut().callbacks.app_ready_sentinel = Some(callback);
+        }
+        Some(0)
     }
 
     fn handle_dpi_changed_msg(

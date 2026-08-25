@@ -21,9 +21,9 @@ use crate::capture::{
 };
 use crate::codec::{set_clipboard_dib, write_png_file};
 use crate::error::{Error, Result};
-use crate::gpui_bridge::open_smoke_overlay;
+use crate::gpui_bridge::{drop_freeze_swapchain, open_smoke_overlay};
 use crate::hotkey::{HotkeyAction, HotkeyBindings};
-use crate::overlay::run_overlay;
+use crate::overlay::{show_overlay, OverlayResult};
 use crate::perf::PerfSession;
 use crate::platform::{
     action_from_wparam, add_tray_icon, handle_tray, install_ll_hook, register_fallback_hotkeys,
@@ -63,6 +63,7 @@ fn install_gpu_lifecycle(cx: &App) {
     bind_gpui_app(cx);
     cx.on_gpu_reset_begin(|| {
         drop_gpu_resources();
+        drop_freeze_swapchain();
     });
 }
 
@@ -397,14 +398,29 @@ fn dispatch_action(action: HotkeyAction) -> Result<()> {
         return Ok(());
     }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| take_shot(action)));
-    BUSY.store(false, Ordering::SeqCst);
     match result {
-        Ok(r) => r,
-        Err(_) => Err(Error::new("capture panicked")),
+        Ok(Ok(ShotFlow::OverlayOpen)) => Ok(()),
+        Ok(Ok(ShotFlow::Finished)) => {
+            BUSY.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            BUSY.store(false, Ordering::SeqCst);
+            Err(e)
+        }
+        Err(_) => {
+            BUSY.store(false, Ordering::SeqCst);
+            Err(Error::new("capture panicked"))
+        }
     }
 }
 
-fn take_shot(action: HotkeyAction) -> Result<()> {
+enum ShotFlow {
+    Finished,
+    OverlayOpen,
+}
+
+fn take_shot(action: HotkeyAction) -> Result<ShotFlow> {
     let mut perf = PerfSession::start();
     perf.mark("T2");
     let region = matches!(action, HotkeyAction::Region);
@@ -417,32 +433,77 @@ fn take_shot(action: HotkeyAction) -> Result<()> {
         None => return Err(Error::new("GPUI app unavailable")),
     };
 
-    let export = match action {
-        HotkeyAction::Fullscreen => Some((0, 0, cap.width, cap.height, true, true)),
-        HotkeyAction::CopyOnly => Some((0, 0, cap.width, cap.height, false, true)),
+    match action {
         HotkeyAction::Region => {
-            let overlay = run_overlay(&cap, &mut perf)?;
-            if overlay.confirmed {
-                Some((overlay.x, overlay.y, overlay.w, overlay.h, true, true))
-            } else {
-                None
+            // Capture is done; do not hold App across overlay interaction.
+            match with_gpui_app(|cx| show_overlay(cx, cap, &mut perf)) {
+                Some(_) => Ok(ShotFlow::OverlayOpen),
+                None => Err(Error::new("GPUI app unavailable")),
             }
         }
-    };
-
-    if let Some((x, y, w, h, write_file, copy)) = export {
-        let (px, cw, ch, stride) = with_gpui_app(|cx| crop_from_app(cx, &cap, x, y, w, h))
-            .unwrap_or_else(|| Err(Error::new("GPUI app unavailable")))?;
-        if write_file {
-            let path = default_png_path()?;
-            write_png_file(&path, &px, cw, ch, stride)?;
-            println!("saved {}", path.display());
-        }
-        if copy {
-            let _ = set_clipboard_dib(&px, cw, ch, stride);
+        HotkeyAction::Fullscreen | HotkeyAction::CopyOnly => {
+            let write_file = matches!(action, HotkeyAction::Fullscreen);
+            let (x, y, w, h) = (0, 0, cap.width, cap.height);
+            let (px, cw, ch, stride) = with_gpui_app(|cx| crop_from_app(cx, &cap, x, y, w, h))
+                .unwrap_or_else(|| Err(Error::new("GPUI app unavailable")))?;
+            export_pixels(px, cw, ch, stride, write_file, true)?;
+            let _ = perf.write_log();
+            Ok(ShotFlow::Finished)
         }
     }
-    let _ = perf.write_log();
+}
+
+pub(crate) fn complete_region_shot(
+    result: OverlayResult,
+    cap: Option<CapturedDesktop>,
+    perf: Option<PerfSession>,
+    cx: &mut App,
+) {
+    if result.confirmed {
+        if let Some(cap) = cap {
+            match crop_from_app(cx, &cap, result.x, result.y, result.w, result.h) {
+                Ok((px, cw, ch, stride)) => {
+                    if let Err(e) = export_pixels(px, cw, ch, stride, true, true) {
+                        eprintln!("export failed: {e}");
+                    }
+                }
+                Err(e) => eprintln!("crop failed: {e}"),
+            }
+        }
+    }
+    if let Some(perf) = perf {
+        let _ = perf.write_log();
+    }
+    BUSY.store(false, Ordering::SeqCst);
+}
+
+fn export_pixels(
+    px: Vec<u8>,
+    cw: u32,
+    ch: u32,
+    stride: u32,
+    write_file: bool,
+    copy: bool,
+) -> Result<()> {
+    if write_file {
+        let path = default_png_path()?;
+        let px_file = px.clone();
+        std::thread::spawn(move || {
+            unsafe {
+                let _ = windows::Win32::System::Com::CoInitializeEx(
+                    None,
+                    windows::Win32::System::Com::COINIT_MULTITHREADED,
+                );
+            }
+            match write_png_file(&path, &px_file, cw, ch, stride) {
+                Ok(()) => println!("saved {}", path.display()),
+                Err(e) => eprintln!("png write failed: {e}"),
+            }
+        });
+    }
+    if copy {
+        let _ = set_clipboard_dib(&px, cw, ch, stride);
+    }
     Ok(())
 }
 

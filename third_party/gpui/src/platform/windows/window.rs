@@ -337,6 +337,7 @@ pub(crate) struct Callbacks {
     pub(crate) close: Option<Box<dyn FnOnce()>>,
     pub(crate) hit_test_window_control: Option<Box<dyn FnMut() -> Option<WindowControlArea>>>,
     pub(crate) appearance_changed: Option<Box<dyn FnMut()>>,
+    pub(crate) app_ready_sentinel: Option<Box<dyn FnMut()>>,
 }
 
 struct WindowCreateContext {
@@ -866,6 +867,18 @@ impl PlatformWindow for WindowsWindow {
             .borrow()
             .renderer
             .set_background_swap_chain(swap)
+    }
+
+    fn wait_for_commit_completion(&self) -> Result<()> {
+        self.0
+            .state
+            .borrow()
+            .renderer
+            .wait_for_commit_completion()
+    }
+
+    fn on_app_ready_sentinel(&self, callback: Box<dyn FnMut()>) {
+        self.0.state.borrow_mut().callbacks.app_ready_sentinel = Some(callback);
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {

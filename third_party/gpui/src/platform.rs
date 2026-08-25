@@ -559,6 +559,14 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         anyhow::bail!("set_background_swap_chain is not supported")
     }
 
+    #[cfg(target_os = "windows")]
+    fn wait_for_commit_completion(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    fn on_app_ready_sentinel(&self, _callback: Box<dyn FnMut()>) {}
+
     // Linux specific methods
     fn inner_window_bounds(&self) -> WindowBounds {
         self.window_bounds()

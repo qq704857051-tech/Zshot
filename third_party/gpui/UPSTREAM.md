@@ -11,3 +11,4 @@
   3. App.with_gpu_context / gpu_generation / adapter_luid
   4. on_gpu_reset_begin before device recreate
   5. gpu_generation fetch_add on the main thread next to DirectXDevices swap
+  6. Window.win32_hwnd / wait_for_commit_completion / on_app_ready_sentinel (WM_APP+32)
