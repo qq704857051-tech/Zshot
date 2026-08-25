@@ -9,7 +9,7 @@ use windows::Graphics::Capture::{
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
-use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
+use windows::Win32::Graphics::Direct3D11::{ID3D11DeviceContext, ID3D11Texture2D};
 use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::System::WinRT::Direct3D11::IDirect3DDxgiInterfaceAccess;
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
@@ -24,7 +24,12 @@ pub struct WgcFrame {
     pub hdr: bool,
 }
 
-pub fn capture_monitor(gpu: &Gpu, mon: &MonitorInfo, want_hdr: bool) -> Result<WgcFrame> {
+pub fn capture_monitor(
+    gpu: &Gpu,
+    ctx: &ID3D11DeviceContext,
+    mon: &MonitorInfo,
+    want_hdr: bool,
+) -> Result<WgcFrame> {
     let item = create_item_for_monitor(mon.handle)?;
     let size = item.Size()?;
     if size.Width <= 0 || size.Height <= 0 {
@@ -36,7 +41,7 @@ pub fn capture_monitor(gpu: &Gpu, mon: &MonitorInfo, want_hdr: bool) -> Result<W
         DirectXPixelFormat::B8G8R8A8UIntNormalized
     };
     let device: IDirect3DDevice = gpu.winrt_device()?;
-    capture_item(gpu, &item, &device, format, mon.hdr && want_hdr)
+    capture_item(gpu, ctx, &item, &device, format, mon.hdr && want_hdr)
 }
 
 fn create_item_for_monitor(monitor: HMONITOR) -> Result<GraphicsCaptureItem> {
@@ -46,6 +51,7 @@ fn create_item_for_monitor(monitor: HMONITOR) -> Result<GraphicsCaptureItem> {
 
 fn capture_item(
     gpu: &Gpu,
+    ctx: &ID3D11DeviceContext,
     item: &GraphicsCaptureItem,
     device: &IDirect3DDevice,
     format: DirectXPixelFormat,
@@ -80,7 +86,7 @@ fn capture_item(
     let surface = frame.Surface()?;
     let access: IDirect3DDxgiInterfaceAccess = surface.cast()?;
     let src: ID3D11Texture2D = unsafe { access.GetInterface()? };
-    let owned = gpu.copy_to_owned(&src)?;
+    let owned = gpu.copy_to_owned(ctx, &src)?;
     drop(frame);
     pool.Close()?;
     Ok(WgcFrame {

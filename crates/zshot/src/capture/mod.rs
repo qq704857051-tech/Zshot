@@ -44,7 +44,7 @@ pub fn capture_for_action(
 ) -> Result<CapturedDesktop> {
     let _restore = d3d::RestoreGpu(ctx);
     let _ = overlay_luid;
-    let gpu = Gpu::bind(device, ctx, shaders);
+    let gpu = Gpu::bind(device, shaders);
     let monitors = enumerate_monitors()?;
     if monitors.is_empty() {
         return Err(Error::new("no monitors"));
@@ -93,11 +93,11 @@ pub fn capture_for_action(
         let mut wgc_black = false;
 
         if !exclusive_guess {
-            match wgc::capture_monitor(&gpu, mon, want_hdr) {
+            match wgc::capture_monitor(&gpu, ctx, mon, want_hdr) {
                 Ok(frame) => {
                     let hdr = frame.hdr;
                     let tex = frame.texture;
-                    let near_black = gpu.texture_is_near_black(&tex);
+                    let near_black = gpu.texture_is_near_black(ctx, &tex);
                     wgc_black = wgc_should_reject_frame(hdr, near_black);
                     if !wgc_black {
                         got = Some((tex, hdr, false));
@@ -114,7 +114,7 @@ pub fn capture_for_action(
         if got.is_none()
             && should_fallback_to_dxgi(exclusive_guess, wgc_failed, wgc_timeout, wgc_black)
         {
-            match dxgi_dup::capture_monitor(&gpu, mon, want_hdr) {
+            match dxgi_dup::capture_monitor(&gpu, ctx, mon, want_hdr) {
                 Ok((tex, hdr)) => {
                     used_dxgi = true;
                     saw_exclusive = is_exclusive_fullscreen(ExclusiveHints {
@@ -174,7 +174,7 @@ pub fn capture_for_action(
         let dst_x = (*mx - origin_x).max(0) as u32;
         let dst_y = (*my - origin_y).max(0) as u32;
         unsafe {
-            gpu.context.CopySubresourceRegion(
+            ctx.CopySubresourceRegion(
                 &composite,
                 0,
                 dst_x,
@@ -189,7 +189,7 @@ pub fn capture_for_action(
     }
     perf.mark("T4");
 
-    let sdr_display = gpu.to_sdr_bgra(&composite, sdr_white)?;
+    let sdr_display = gpu.to_sdr_bgra(ctx, &composite, sdr_white)?;
     perf.mark("T5");
 
     Ok(CapturedDesktop {
@@ -208,12 +208,14 @@ pub fn capture_for_action(
 
 pub fn crop_sdr_bgra(
     cap: &CapturedDesktop,
+    ctx: &ID3D11DeviceContext,
     x: u32,
     y: u32,
     w: u32,
     h: u32,
 ) -> Result<(Vec<u8>, u32, u32, u32)> {
-    cap.gpu.read_bgra_region(&cap.sdr_display, x, y, w, h)
+    let _restore = d3d::RestoreGpu(ctx);
+    cap.gpu.read_bgra_region(ctx, &cap.sdr_display, x, y, w, h)
 }
 
 #[cfg(test)]

@@ -110,12 +110,8 @@ impl GpuShaders {
 }
 
 pub fn drop_gpu_resources() {
-    if let Ok(mut slot) = GPU_SHADERS.lock() {
-        *slot = None;
-    }
-    if let Ok(mut slot) = FREEZE_TEXTURE.lock() {
-        *slot = None;
-    }
+    *GPU_SHADERS.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    *FREEZE_TEXTURE.lock().unwrap_or_else(|p| p.into_inner()) = None;
 }
 
 pub(super) struct RestoreGpu<'a>(pub(super) &'a ID3D11DeviceContext);
@@ -133,7 +129,6 @@ impl Drop for RestoreGpu<'_> {
 
 pub struct Gpu {
     pub device: ID3D11Device,
-    pub context: ID3D11DeviceContext,
     vs: ID3D11VertexShader,
     ps_tonemap: ID3D11PixelShader,
     ps_copy: ID3D11PixelShader,
@@ -141,14 +136,9 @@ pub struct Gpu {
 }
 
 impl Gpu {
-    pub fn bind(
-        device: &ID3D11Device,
-        context: &ID3D11DeviceContext,
-        shaders: &GpuShaders,
-    ) -> Self {
+    pub fn bind(device: &ID3D11Device, shaders: &GpuShaders) -> Self {
         Self {
             device: device.clone(),
-            context: context.clone(),
             vs: shaders.vs.clone(),
             ps_tonemap: shaders.ps_tonemap.clone(),
             ps_copy: shaders.ps_copy.clone(),
@@ -162,7 +152,11 @@ impl Gpu {
         inspectable.cast().map_err(Into::into)
     }
 
-    pub fn copy_to_owned(&self, src: &ID3D11Texture2D) -> Result<ID3D11Texture2D> {
+    pub fn copy_to_owned(
+        &self,
+        ctx: &ID3D11DeviceContext,
+        src: &ID3D11Texture2D,
+    ) -> Result<ID3D11Texture2D> {
         let desc = texture_desc(src);
         let owned = create_texture(
             &self.device,
@@ -174,13 +168,18 @@ impl Gpu {
             0,
         )?;
         unsafe {
-            self.context.CopyResource(&owned, src);
+            ctx.CopyResource(&owned, src);
         }
         Ok(owned)
     }
 
     /// GPU tonemap FP16 scRGB → BGRA8. SDR BGRA sources are GPU-copied, never a CPU round-trip.
-    pub fn to_sdr_bgra(&self, src: &ID3D11Texture2D, sdr_white_nits: f32) -> Result<ID3D11Texture2D> {
+    pub fn to_sdr_bgra(
+        &self,
+        ctx: &ID3D11DeviceContext,
+        src: &ID3D11Texture2D,
+        sdr_white_nits: f32,
+    ) -> Result<ID3D11Texture2D> {
         let desc = texture_desc(src);
         let dest = create_texture(
             &self.device,
@@ -192,12 +191,13 @@ impl Gpu {
             0,
         )?;
         let hdr = desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
-        self.blit(src, &dest, desc.Width, desc.Height, hdr, sdr_white_nits)?;
+        self.blit(ctx, src, &dest, desc.Width, desc.Height, hdr, sdr_white_nits)?;
         Ok(dest)
     }
 
     fn blit(
         &self,
+        ctx: &ID3D11DeviceContext,
         src: &ID3D11Texture2D,
         dest: &ID3D11Texture2D,
         w: u32,
@@ -205,7 +205,7 @@ impl Gpu {
         tonemap: bool,
         sdr_white: f32,
     ) -> Result<()> {
-        let _restore = RestoreGpu(&self.context);
+        let _restore = RestoreGpu(ctx);
         unsafe {
             let mut srv = None;
             self.device
@@ -223,24 +223,24 @@ impl Gpu {
                 MinDepth: 0.0,
                 MaxDepth: 1.0,
             };
-            self.context.RSSetViewports(Some(&[vp]));
-            self.context.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
-            self.context.VSSetShader(&self.vs, None);
+            ctx.RSSetViewports(Some(&[vp]));
+            ctx.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
+            ctx.VSSetShader(&self.vs, None);
             if tonemap {
-                self.context.PSSetShader(&self.ps_tonemap, None);
+                ctx.PSSetShader(&self.ps_tonemap, None);
                 // constant buffer: 16 bytes
                 let cb_data = [sdr_white.max(1.0), 0.0, 0.0, 0.0];
                 let cb = create_cbuffer(&self.device, &cb_data)?;
-                self.context.PSSetConstantBuffers(0, Some(&[Some(cb)]));
+                ctx.PSSetConstantBuffers(0, Some(&[Some(cb)]));
             } else {
-                self.context.PSSetShader(&self.ps_copy, None);
+                ctx.PSSetShader(&self.ps_copy, None);
             }
-            self.context.PSSetShaderResources(0, Some(&[Some(srv)]));
-            self.context.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
-            self.context.IASetPrimitiveTopology(
+            ctx.PSSetShaderResources(0, Some(&[Some(srv)]));
+            ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+            ctx.IASetPrimitiveTopology(
                 windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             );
-            self.context.Draw(3, 0);
+            ctx.Draw(3, 0);
             let _ = REFERENCE_WHITE_NITS;
         }
         Ok(())
@@ -248,11 +248,11 @@ impl Gpu {
 
     /// Small GPU copy + sample. HDR FP16 uses the FP16 detector so exclusive
     /// black frames are not skipped.
-    pub fn texture_is_near_black(&self, src: &ID3D11Texture2D) -> bool {
+    pub fn texture_is_near_black(&self, ctx: &ID3D11DeviceContext, src: &ID3D11Texture2D) -> bool {
         let desc = texture_desc(src);
         let w = desc.Width.clamp(1, 64);
         let h = desc.Height.clamp(1, 64);
-        match self.read_raw_region(src, 0, 0, w, h) {
+        match self.read_raw_region(ctx, src, 0, 0, w, h) {
             Ok((px, ww, hh, stride)) => {
                 if desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT {
                     crate::black::is_near_black_fp16(&px, ww, hh, stride as usize)
@@ -266,6 +266,7 @@ impl Gpu {
 
     fn read_raw_region(
         &self,
+        ctx: &ID3D11DeviceContext,
         src: &ID3D11Texture2D,
         x: u32,
         y: u32,
@@ -293,21 +294,23 @@ impl Gpu {
                 bottom: y + h,
                 back: 1,
             };
-            self.context
-                .CopySubresourceRegion(&staging, 0, 0, 0, 0, src, 0, Some(&box_));
+            ctx.CopySubresourceRegion(&staging, 0, 0, 0, 0, src, 0, Some(&box_));
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            self.context
-                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+            ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
             let stride = mapped.RowPitch;
             let size = stride * h;
             let slice = std::slice::from_raw_parts(mapped.pData as *const u8, size as usize);
             let pixels = slice.to_vec();
-            self.context.Unmap(&staging, 0);
+            ctx.Unmap(&staging, 0);
             Ok((pixels, w, h, stride))
         }
     }
 
-    pub fn read_bgra(&self, src: &ID3D11Texture2D) -> Result<(Vec<u8>, u32, u32, u32)> {
+    pub fn read_bgra(
+        &self,
+        ctx: &ID3D11DeviceContext,
+        src: &ID3D11Texture2D,
+    ) -> Result<(Vec<u8>, u32, u32, u32)> {
         let desc = texture_desc(src);
         let staging = create_texture(
             &self.device,
@@ -319,15 +322,14 @@ impl Gpu {
             D3D11_CPU_ACCESS_READ.0 as u32,
         )?;
         unsafe {
-            self.context.CopyResource(&staging, src);
+            ctx.CopyResource(&staging, src);
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            self.context
-                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+            ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
             let stride = mapped.RowPitch;
             let size = stride * desc.Height;
             let slice = std::slice::from_raw_parts(mapped.pData as *const u8, size as usize);
             let mut pixels = slice.to_vec();
-            self.context.Unmap(&staging, 0);
+            ctx.Unmap(&staging, 0);
             if desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT {
                 pixels = fp16_to_bgra(&pixels, desc.Width, desc.Height, stride);
                 return Ok((pixels, desc.Width, desc.Height, desc.Width * 4));
@@ -338,6 +340,7 @@ impl Gpu {
 
     pub fn read_bgra_region(
         &self,
+        ctx: &ID3D11DeviceContext,
         src: &ID3D11Texture2D,
         x: u32,
         y: u32,
@@ -365,10 +368,9 @@ impl Gpu {
                 bottom: y + h,
                 back: 1,
             };
-            self.context
-                .CopySubresourceRegion(&staging, 0, 0, 0, 0, src, 0, Some(&box_));
+            ctx.CopySubresourceRegion(&staging, 0, 0, 0, 0, src, 0, Some(&box_));
         }
-        self.read_bgra(&staging)
+        self.read_bgra(ctx, &staging)
     }
 }
 

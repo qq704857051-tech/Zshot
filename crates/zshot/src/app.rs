@@ -81,6 +81,20 @@ fn capture_from_app(
     }
 }
 
+fn crop_from_app(
+    cx: &mut App,
+    cap: &CapturedDesktop,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<(Vec<u8>, u32, u32, u32)> {
+    match cx.with_gpu_context(|_device, ctx| crop_sdr_bgra(cap, ctx, x, y, w, h)) {
+        Some(r) => r,
+        None => Err(Error::new("GPU context unavailable")),
+    }
+}
+
 pub fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
@@ -141,7 +155,7 @@ pub fn once_capture(path: PathBuf) -> Result<()> {
             perf.mark("T2");
             let r = (|| {
                 let cap = capture_from_app(cx, false, &mut perf)?;
-                let (px, w, h, stride) = cap.gpu.read_bgra(&cap.sdr_display)?;
+                let (px, w, h, stride) = crop_from_app(cx, &cap, 0, 0, cap.width, cap.height)?;
                 write_png_file(&path, &px, w, h, stride)?;
                 let _ = perf.write_log();
                 Ok((w, h))
@@ -382,20 +396,16 @@ fn dispatch_action(action: HotkeyAction) -> Result<()> {
 }
 
 fn take_shot(action: HotkeyAction) -> Result<()> {
-    with_gpui_app(|cx| take_shot_in_app(action, cx))
-        .unwrap_or_else(|| Err(Error::new("GPUI app unavailable")))
-}
-
-fn take_shot_in_app(action: HotkeyAction, cx: &mut App) -> Result<()> {
     let mut perf = PerfSession::start();
     perf.mark("T2");
     let region = matches!(action, HotkeyAction::Region);
-    let cap = match capture_from_app(cx, region, &mut perf) {
-        Ok(c) => c,
-        Err(e) => {
+    let cap = match with_gpui_app(|cx| capture_from_app(cx, region, &mut perf)) {
+        Some(Ok(c)) => c,
+        Some(Err(e)) => {
             eprintln!("capture failed: {e}");
             return Err(e);
         }
+        None => return Err(Error::new("GPUI app unavailable")),
     };
 
     let export = match action {
@@ -412,7 +422,8 @@ fn take_shot_in_app(action: HotkeyAction, cx: &mut App) -> Result<()> {
     };
 
     if let Some((x, y, w, h, write_file, copy)) = export {
-        let (px, cw, ch, stride) = crop_sdr_bgra(&cap, x, y, w, h)?;
+        let (px, cw, ch, stride) = with_gpui_app(|cx| crop_from_app(cx, &cap, x, y, w, h))
+            .unwrap_or_else(|| Err(Error::new("GPUI app unavailable")))?;
         if write_file {
             let path = default_png_path()?;
             write_png_file(&path, &px, cw, ch, stride)?;

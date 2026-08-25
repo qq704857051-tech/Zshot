@@ -1,6 +1,6 @@
 use windows::core::Interface;
 use windows::Win32::Foundation::HMODULE;
-use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
+use windows::Win32::Graphics::Direct3D11::{ID3D11DeviceContext, ID3D11Texture2D};
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_R16G16B16A16_FLOAT};
 use windows::Win32::Graphics::Dxgi::{
     IDXGIOutput1, IDXGIOutput5, IDXGIOutputDuplication, DXGI_OUTDUPL_FRAME_INFO,
@@ -12,7 +12,12 @@ use crate::error::{Error, Result};
 use super::d3d::Gpu;
 use super::monitors::MonitorInfo;
 
-pub fn capture_monitor(gpu: &Gpu, mon: &MonitorInfo, want_hdr: bool) -> Result<(ID3D11Texture2D, bool)> {
+pub fn capture_monitor(
+    gpu: &Gpu,
+    ctx: &ID3D11DeviceContext,
+    mon: &MonitorInfo,
+    want_hdr: bool,
+) -> Result<(ID3D11Texture2D, bool)> {
     let output = mon
         .output
         .as_ref()
@@ -37,7 +42,7 @@ pub fn capture_monitor(gpu: &Gpu, mon: &MonitorInfo, want_hdr: bool) -> Result<(
     }
     let resource = resource.ok_or_else(|| Error::new("DXGI frame resource"))?;
     let tex: ID3D11Texture2D = resource.cast()?;
-    let owned = gpu.copy_to_owned(&tex)?;
+    let owned = gpu.copy_to_owned(ctx, &tex)?;
     unsafe {
         let _ = dup.ReleaseFrame();
     }
