@@ -17,6 +17,7 @@ use crate::action_queue::ActionQueue;
 use crate::capture::{capture_for_action, crop_sdr_bgra};
 use crate::codec::{set_clipboard_dib, write_png_file};
 use crate::error::{Error, Result};
+use crate::gpui_bridge::open_smoke_overlay;
 use crate::hotkey::{HotkeyAction, HotkeyBindings};
 use crate::overlay::run_overlay;
 use crate::perf::PerfSession;
@@ -42,6 +43,7 @@ pub fn run() -> Result<()> {
             return once_capture(PathBuf::from(path));
         }
         Some("--self-test") => return self_test(),
+        Some("--overlay-smoke") => return overlay_smoke(),
         Some("--probe-gpui") => {
             eprintln!("--probe-gpui removed; GPUI is the main message pump");
             return Ok(());
@@ -49,6 +51,28 @@ pub fn run() -> Result<()> {
         _ => {}
     }
     run_tray()
+}
+
+fn overlay_smoke() -> Result<()> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    }
+    set_dpi_aware();
+    let boot_error = std::rc::Rc::new(std::cell::RefCell::new(None::<Error>));
+    Application::new().run({
+        let boot_error = boot_error.clone();
+        move |cx: &mut App| {
+            if let Err(e) = open_smoke_overlay(cx) {
+                eprintln!("{e}");
+                *boot_error.borrow_mut() = Some(e);
+                cx.quit();
+            }
+        }
+    });
+    if let Some(e) = boot_error.borrow_mut().take() {
+        return Err(e);
+    }
+    Ok(())
 }
 
 pub fn once_capture(path: PathBuf) -> Result<()> {
