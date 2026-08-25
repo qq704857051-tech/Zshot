@@ -16,7 +16,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::action_queue::ActionQueue;
 use crate::capture::{
-    capture_for_action, crop_sdr_bgra, drop_gpu_resources, CapturedDesktop, GpuShaders,
+    capture_for_action, crop_sdr_bgra, drop_gpu_resources, prepare_capture, CapturedDesktop,
+    GpuShaders,
 };
 use crate::codec::{set_clipboard_dib, write_png_file};
 use crate::error::{Error, Result};
@@ -72,10 +73,18 @@ fn capture_from_app(
 ) -> Result<CapturedDesktop> {
     let generation = cx.gpu_generation();
     let overlay_luid = cx.adapter_luid().unwrap_or((0, 0));
-    match cx.with_gpu_context(|device, ctx| {
-        GpuShaders::get_or_compile(generation, device)
-            .and_then(|shaders| capture_for_action(region, perf, device, ctx, &shaders, overlay_luid))
+    // Borrow GPU only long enough to clone the device and compile shaders — do not hold
+    // with_gpu_context across the parallel WGC wait.
+    let (device, shaders) = match cx.with_gpu_context(|device, _ctx| {
+        GpuShaders::get_or_compile(generation, device).map(|shaders| (device.clone(), shaders))
     }) {
+        Some(Ok(pair)) => pair,
+        Some(Err(e)) => return Err(e),
+        None => return Err(Error::new("GPU context unavailable")),
+    };
+    let prepared = prepare_capture(region, &device, &shaders, overlay_luid)?;
+    match cx.with_gpu_context(|device, ctx| capture_for_action(prepared, perf, device, ctx, &shaders))
+    {
         Some(r) => r,
         None => Err(Error::new("GPU context unavailable")),
     }

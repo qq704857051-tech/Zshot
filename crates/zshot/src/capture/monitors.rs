@@ -35,6 +35,47 @@ pub struct MonitorInfo {
     pub hdr: bool,
     pub sdr_white_nits: f32,
     pub output: Option<IDXGIOutput>,
+    pub adapter_luid: Option<(u32, i32)>,
+}
+
+pub fn luid_eq(a: (u32, i32), b: (u32, i32)) -> bool {
+    a == b
+}
+
+pub fn dxgi_allowed(mon: &MonitorInfo, overlay_luid: (u32, i32)) -> bool {
+    mon.adapter_luid
+        .is_some_and(|luid| luid_eq(luid, overlay_luid))
+}
+
+#[cfg(test)]
+pub fn dummy_monitor(adapter_luid: Option<(u32, i32)>) -> MonitorInfo {
+    MonitorInfo {
+        handle: HMONITOR(std::ptr::null_mut()),
+        x: 0,
+        y: 0,
+        w: 1920,
+        h: 1080,
+        hdr: false,
+        sdr_white_nits: REFERENCE_WHITE_NITS,
+        output: None,
+        adapter_luid,
+    }
+}
+
+#[cfg(test)]
+mod luid_tests {
+    use super::*;
+
+    #[test]
+    fn dxgi_allowed_only_when_luid_matches() {
+        let overlay = (1, 0);
+        let same = dummy_monitor(Some((1, 0)));
+        let other = dummy_monitor(Some((2, 0)));
+        let unknown = dummy_monitor(None);
+        assert!(dxgi_allowed(&same, overlay));
+        assert!(!dxgi_allowed(&other, overlay));
+        assert!(!dxgi_allowed(&unknown, overlay));
+    }
 }
 
 pub struct VirtualDesktop {
@@ -65,15 +106,25 @@ pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>> {
             LPARAM(&mut raw as *mut _ as isize),
         );
     }
+    struct EnumeratedOutput {
+        output: IDXGIOutput,
+        rect: RECT,
+        hdr: bool,
+        adapter_luid: Option<(u32, i32)>,
+    }
+
     let factory = dxgi_factory()?;
     let mut adapter_i = 0;
-    let mut outputs: Vec<(IDXGIOutput, RECT, bool)> = Vec::new();
+    let mut outputs: Vec<EnumeratedOutput> = Vec::new();
     loop {
         let adapter: IDXGIAdapter1 = match unsafe { factory.EnumAdapters1(adapter_i) } {
             Ok(a) => a,
             Err(_) => break,
         };
         adapter_i += 1;
+        let adapter_luid = unsafe { adapter.GetDesc() }
+            .ok()
+            .map(|d| (d.AdapterLuid.LowPart, d.AdapterLuid.HighPart));
         let mut out_i = 0;
         loop {
             let output = match unsafe { adapter.EnumOutputs(out_i) } {
@@ -83,7 +134,12 @@ pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>> {
             out_i += 1;
             let desc = unsafe { output.GetDesc()? };
             let hdr = output_is_hdr(&output).unwrap_or(false);
-            outputs.push((output, desc.DesktopCoordinates, hdr));
+            outputs.push(EnumeratedOutput {
+                output,
+                rect: desc.DesktopCoordinates,
+                hdr,
+                adapter_luid,
+            });
         }
     }
 
@@ -93,10 +149,12 @@ pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>> {
         let h = rect.bottom - rect.top;
         let mut hdr = false;
         let mut output = None;
-        for (o, r, is_hdr) in &outputs {
-            if r.left == rect.left && r.top == rect.top {
-                hdr = *is_hdr;
-                output = Some(o.clone());
+        let mut adapter_luid = None;
+        for o in &outputs {
+            if o.rect.left == rect.left && o.rect.top == rect.top {
+                hdr = o.hdr;
+                output = Some(o.output.clone());
+                adapter_luid = o.adapter_luid;
                 break;
             }
         }
@@ -110,6 +168,7 @@ pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>> {
             hdr,
             sdr_white_nits,
             output,
+            adapter_luid,
         });
     }
     Ok(monitors)

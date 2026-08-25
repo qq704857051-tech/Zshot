@@ -10,14 +10,20 @@ use windows::Win32::Graphics::Dxgi::{
 use crate::error::{Error, Result};
 
 use super::d3d::Gpu;
-use super::monitors::MonitorInfo;
+use super::monitors::{dxgi_allowed, MonitorInfo};
 
 pub fn capture_monitor(
     gpu: &Gpu,
     ctx: &ID3D11DeviceContext,
     mon: &MonitorInfo,
     want_hdr: bool,
+    overlay_luid: (u32, i32),
 ) -> Result<(ID3D11Texture2D, bool)> {
+    if !dxgi_allowed(mon, overlay_luid) {
+        return Err(Error::new(
+            "DXGI blocked: monitor adapter LUID != overlay",
+        ));
+    }
     let output = mon
         .output
         .as_ref()
