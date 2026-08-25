@@ -100,13 +100,21 @@ fn create_red_composition_swapchain(
     width: u32,
     height: u32,
 ) -> Result<IDXGISwapChain1> {
-    let swap = unsafe { create_composition_swapchain(device, width, height)? };
-    unsafe {
-        clear_swapchain_red(device, context, &swap)?;
-        context.PSSetShaderResources(0, Some(&[None]));
-        context.OMSetRenderTargets(None, None);
-        context.ClearState();
+    // Always restore GPUI's immediate context, even if clear/Present fails mid-pass.
+    struct RestoreGpu<'a>(&'a ID3D11DeviceContext);
+    impl Drop for RestoreGpu<'_> {
+        fn drop(&mut self) {
+            unsafe {
+                self.0.PSSetShaderResources(0, Some(&[None]));
+                self.0.OMSetRenderTargets(None, None);
+                self.0.ClearState();
+            }
+        }
     }
+
+    let _restore = RestoreGpu(context);
+    let swap = unsafe { create_composition_swapchain(device, width, height)? };
+    unsafe { clear_swapchain_red(device, context, &swap)? };
     Ok(swap)
 }
 
