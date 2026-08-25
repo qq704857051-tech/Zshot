@@ -1,0 +1,9 @@
+[package]
+name = "zshot-ocr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "Zshot_Ocr"
+path = "src/main.rs"

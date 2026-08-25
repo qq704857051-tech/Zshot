@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/zshot", "crates/zshot-ocr"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
