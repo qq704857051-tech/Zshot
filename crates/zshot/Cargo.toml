@@ -12,12 +12,8 @@ path = "src/lib.rs"
 name = "Zshot"
 path = "src/main.rs"
 
-[features]
-default = []
-gpui-probe = ["dep:gpui"]
-
 [dependencies]
-gpui = { version = "0.2.2", optional = true }
+gpui = "0.2.2"
 windows-numerics = "0.2"
 windows = { version = "0.61", features = [
     "Foundation",

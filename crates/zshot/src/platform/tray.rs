@@ -39,9 +39,23 @@ pub fn add_tray_icon(hwnd: HWND) -> Result<()> {
         };
         let tip: Vec<u16> = "Zshot\0".encode_utf16().collect();
         nid.szTip[..tip.len()].copy_from_slice(&tip);
-        Shell_NotifyIconW(NIM_ADD, &nid).ok()?;
+
+        let mut last_err = None;
+        for attempt in 0..3 {
+            match Shell_NotifyIconW(NIM_ADD, &nid).ok() {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt + 1 < 3 {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                }
+            }
+        }
+        Err(last_err
+            .expect("NIM_ADD retried with at least one error")
+            .into())
     }
-    Ok(())
 }
 
 pub fn remove_tray_icon(hwnd: HWND) {

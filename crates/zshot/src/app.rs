@@ -1,20 +1,19 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
+use gpui::{App, Application};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{
-    GetCurrentProcess, SetPriorityClass, HIGH_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
-};
 use windows::Win32::UI::Shell::{SHGetKnownFolderPath, FOLDERID_Pictures, KF_FLAG_DEFAULT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostQuitMessage,
-    RegisterClassExW, TranslateMessage, CS_HREDRAW, CS_VREDRAW, HWND_MESSAGE, MSG, WM_DESTROY,
-    WM_HOTKEY, WNDCLASSEXW, WS_OVERLAPPED,
+    CreateWindowExW, DefWindowProcW, PostQuitMessage, RegisterClassExW, ShowWindow, CS_HREDRAW,
+    CS_VREDRAW, SW_HIDE, WM_DESTROY, WM_HOTKEY, WNDCLASSEXW, WS_OVERLAPPED,
 };
 
+use crate::action_queue::ActionQueue;
 use crate::capture::{capture_for_action, crop_sdr_bgra};
 use crate::codec::{set_clipboard_dib, write_png_file};
 use crate::error::{Error, Result};
@@ -28,8 +27,7 @@ use crate::platform::{
 };
 
 static BUSY: AtomicBool = AtomicBool::new(false);
-
-
+static ACTION_TX: Mutex<Option<ActionQueue>> = Mutex::new(None);
 
 pub fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -42,7 +40,10 @@ pub fn run() -> Result<()> {
             return once_capture(PathBuf::from(path));
         }
         Some("--self-test") => return self_test(),
-        Some("--probe-gpui") => return crate::gpui_probe::run(),
+        Some("--probe-gpui") => {
+            eprintln!("--probe-gpui removed; GPUI is the main message pump");
+            return Ok(());
+        }
         _ => {}
     }
     run_tray()
@@ -73,7 +74,7 @@ fn self_test() -> Result<()> {
     let mut perf = PerfSession::start();
     perf.mark("T0");
     let _instance = SingleInstance::acquire()?;
-    let hwnd = create_message_window()?;
+    let hwnd = create_hidden_overlapped_window()?;
     let bindings = HotkeyBindings::poc_defaults();
     set_hook_target(hwnd, bindings);
     let hook_ok = install_ll_hook().is_ok();
@@ -102,7 +103,50 @@ fn run_tray() -> Result<()> {
             return Ok(());
         }
     };
-    let hwnd = create_message_window()?;
+
+    let cleanup_hwnd: std::sync::Arc<Mutex<Option<HWND>>> =
+        std::sync::Arc::new(Mutex::new(None));
+    let boot_error: std::sync::Arc<Mutex<Option<Error>>> =
+        std::sync::Arc::new(Mutex::new(None));
+
+    Application::new().run({
+        let cleanup_hwnd = cleanup_hwnd.clone();
+        let boot_error = boot_error.clone();
+        move |cx: &mut App| {
+            match boot_resident(cleanup_hwnd) {
+                Ok(()) => {
+                    perf_boot.mark("T1");
+                    let _ = perf_boot.write_log();
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    *boot_error.lock().unwrap() = Some(e);
+                    cx.quit();
+                }
+            }
+        }
+    });
+
+    if let Some(hwnd) = cleanup_hwnd.lock().unwrap().take() {
+        remove_tray_icon(hwnd);
+        unregister_fallback_hotkeys(hwnd);
+    }
+    uninstall_ll_hook();
+    clear_action_queue();
+
+    if let Some(e) = boot_error.lock().unwrap().take() {
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn boot_resident(cleanup_hwnd: std::sync::Arc<Mutex<Option<HWND>>>) -> Result<()> {
+    let (queue, rx) = ActionQueue::new();
+    *ACTION_TX.lock().unwrap() = Some(queue);
+
+    let hwnd = create_hidden_overlapped_window()?;
+    *cleanup_hwnd.lock().unwrap() = Some(hwnd);
+
     let bindings = HotkeyBindings::poc_defaults();
     set_hook_target(hwnd, bindings);
     if let Err(e) = install_ll_hook() {
@@ -110,24 +154,30 @@ fn run_tray() -> Result<()> {
     }
     register_fallback_hotkeys(hwnd, &bindings);
     add_tray_icon(hwnd)?;
-    perf_boot.mark("T1");
-    let _ = perf_boot.write_log();
-    let _ = bindings;
 
-    unsafe {
-        let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+    // AsyncApp is !Send, so dispatch here instead of async_app.update.
+    std::thread::spawn(move || {
+        while let Ok(action) = rx.recv() {
+            let _ = dispatch_action(action);
         }
-    }
-    remove_tray_icon(hwnd);
-    unregister_fallback_hotkeys(hwnd);
-    uninstall_ll_hook();
+    });
+
     Ok(())
 }
 
-fn create_message_window() -> Result<HWND> {
+fn clear_action_queue() {
+    *ACTION_TX.lock().unwrap() = None;
+}
+
+fn enqueue_action(action: HotkeyAction) {
+    if let Ok(guard) = ACTION_TX.lock() {
+        if let Some(queue) = guard.as_ref() {
+            queue.send(action);
+        }
+    }
+}
+
+fn create_hidden_overlapped_window() -> Result<HWND> {
     let name = wide("ZshotHidden\0");
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -139,7 +189,7 @@ fn create_message_window() -> Result<HWND> {
     };
     unsafe {
         let _ = RegisterClassExW(&wc);
-        CreateWindowExW(
+        let hwnd = CreateWindowExW(
             Default::default(),
             PCWSTR(name.as_ptr()),
             PCWSTR(wide("Zshot\0").as_ptr()),
@@ -148,12 +198,13 @@ fn create_message_window() -> Result<HWND> {
             0,
             0,
             0,
-            Some(HWND_MESSAGE),
+            None,
             None,
             GetModuleHandleW(None).ok().map(Into::into),
             None,
-        )
-        .map_err(Into::into)
+        )?;
+        let _ = ShowWindow(hwnd, SW_HIDE);
+        Ok(hwnd)
     }
 }
 
@@ -165,7 +216,7 @@ unsafe extern "system" fn hidden_proc(
 ) -> LRESULT {
     if msg == WM_ZSHOT_HOTKEY {
         if let Some(action) = action_from_wparam(wparam.0) {
-            let _ = on_action(action);
+            enqueue_action(action);
         }
         return LRESULT(0);
     }
@@ -177,24 +228,19 @@ unsafe extern "system" fn hidden_proc(
             _ => None,
         };
         if let Some(a) = action {
-            let _ = on_action(a);
+            enqueue_action(a);
         }
         return LRESULT(0);
     }
     if msg == WM_TRAYICON {
         if let Some(cmd) = handle_tray(hwnd, lparam) {
             match cmd {
-                TrayCommand::Region => {
-                    let _ = on_action(HotkeyAction::Region);
-                }
-                TrayCommand::Fullscreen => {
-                    let _ = on_action(HotkeyAction::Fullscreen);
-                }
-                TrayCommand::CopyOnly => {
-                    let _ = on_action(HotkeyAction::CopyOnly);
-                }
+                TrayCommand::Region => enqueue_action(HotkeyAction::Region),
+                TrayCommand::Fullscreen => enqueue_action(HotkeyAction::Fullscreen),
+                TrayCommand::CopyOnly => enqueue_action(HotkeyAction::CopyOnly),
                 TrayCommand::Exit => {
                     remove_tray_icon(hwnd);
+                    clear_action_queue();
                     PostQuitMessage(0);
                 }
             }
@@ -202,13 +248,14 @@ unsafe extern "system" fn hidden_proc(
         return LRESULT(0);
     }
     if msg == WM_DESTROY {
+        clear_action_queue();
         PostQuitMessage(0);
         return LRESULT(0);
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
-fn on_action(action: HotkeyAction) -> Result<()> {
+fn dispatch_action(action: HotkeyAction) -> Result<()> {
     if BUSY.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
@@ -221,18 +268,12 @@ fn on_action(action: HotkeyAction) -> Result<()> {
 }
 
 fn take_shot(action: HotkeyAction) -> Result<()> {
-    unsafe {
-        let _ = SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
-    }
     let mut perf = PerfSession::start();
     perf.mark("T2");
     let region = matches!(action, HotkeyAction::Region);
     let cap = match capture_for_action(region, &mut perf) {
         Ok(c) => c,
         Err(e) => {
-            unsafe {
-                let _ = SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
-            }
             eprintln!("capture failed: {e}");
             return Err(e);
         }
@@ -242,7 +283,6 @@ fn take_shot(action: HotkeyAction) -> Result<()> {
         HotkeyAction::Fullscreen => Some((0, 0, cap.width, cap.height, true, true)),
         HotkeyAction::CopyOnly => Some((0, 0, cap.width, cap.height, false, true)),
         HotkeyAction::Region => {
-            // Exclusive-fullscreen region: frame is already captured; force overlay.
             let overlay = run_overlay(&cap, &mut perf)?;
             if overlay.confirmed {
                 Some((overlay.x, overlay.y, overlay.w, overlay.h, true, true))
@@ -264,9 +304,6 @@ fn take_shot(action: HotkeyAction) -> Result<()> {
         }
     }
     let _ = perf.write_log();
-    unsafe {
-        let _ = SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
-    }
     Ok(())
 }
 
