@@ -21,3 +21,4 @@ pub fn set_dpi_aware() {
 
 pub const WM_ZSHOT_HOTKEY: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP;
 pub const WM_TRAYICON: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 1;
+pub const WM_ZSHOT_DISPATCH: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 33;

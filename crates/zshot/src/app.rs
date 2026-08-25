@@ -9,8 +9,8 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{SHGetKnownFolderPath, FOLDERID_Pictures, KF_FLAG_DEFAULT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, PostQuitMessage, RegisterClassExW, ShowWindow, CS_HREDRAW,
-    CS_VREDRAW, SW_HIDE, WM_DESTROY, WM_HOTKEY, WNDCLASSEXW, WS_OVERLAPPED,
+    CreateWindowExW, DefWindowProcW, PostMessageW, PostQuitMessage, RegisterClassExW, ShowWindow,
+    CS_HREDRAW, CS_VREDRAW, SW_HIDE, WM_DESTROY, WM_HOTKEY, WNDCLASSEXW, WS_OVERLAPPED,
 };
 
 use crate::action_queue::ActionQueue;
@@ -23,11 +23,13 @@ use crate::perf::PerfSession;
 use crate::platform::{
     action_from_wparam, add_tray_icon, handle_tray, install_ll_hook, register_fallback_hotkeys,
     remove_tray_icon, set_dpi_aware, set_hook_target, uninstall_ll_hook,
-    unregister_fallback_hotkeys, SingleInstance, TrayCommand, WM_TRAYICON, WM_ZSHOT_HOTKEY,
+    unregister_fallback_hotkeys, SingleInstance, TrayCommand, WM_TRAYICON, WM_ZSHOT_DISPATCH,
+    WM_ZSHOT_HOTKEY,
 };
 
 static BUSY: AtomicBool = AtomicBool::new(false);
 static ACTION_TX: Mutex<Option<ActionQueue>> = Mutex::new(None);
+static ACTION_RX: Mutex<Option<std::sync::mpsc::Receiver<HotkeyAction>>> = Mutex::new(None);
 
 pub fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -104,10 +106,8 @@ fn run_tray() -> Result<()> {
         }
     };
 
-    let cleanup_hwnd: std::sync::Arc<Mutex<Option<HWND>>> =
-        std::sync::Arc::new(Mutex::new(None));
-    let boot_error: std::sync::Arc<Mutex<Option<Error>>> =
-        std::sync::Arc::new(Mutex::new(None));
+    let cleanup_hwnd = std::rc::Rc::new(std::cell::RefCell::new(None::<HWND>));
+    let boot_error = std::rc::Rc::new(std::cell::RefCell::new(None::<Error>));
 
     Application::new().run({
         let cleanup_hwnd = cleanup_hwnd.clone();
@@ -120,32 +120,33 @@ fn run_tray() -> Result<()> {
                 }
                 Err(e) => {
                     eprintln!("{e}");
-                    *boot_error.lock().unwrap() = Some(e);
+                    *boot_error.borrow_mut() = Some(e);
                     cx.quit();
                 }
             }
         }
     });
 
-    if let Some(hwnd) = cleanup_hwnd.lock().unwrap().take() {
+    if let Some(hwnd) = cleanup_hwnd.borrow_mut().take() {
         remove_tray_icon(hwnd);
         unregister_fallback_hotkeys(hwnd);
     }
     uninstall_ll_hook();
     clear_action_queue();
 
-    if let Some(e) = boot_error.lock().unwrap().take() {
+    if let Some(e) = boot_error.borrow_mut().take() {
         return Err(e);
     }
     Ok(())
 }
 
-fn boot_resident(cleanup_hwnd: std::sync::Arc<Mutex<Option<HWND>>>) -> Result<()> {
+fn boot_resident(cleanup_hwnd: std::rc::Rc<std::cell::RefCell<Option<HWND>>>) -> Result<()> {
     let (queue, rx) = ActionQueue::new();
     *ACTION_TX.lock().unwrap() = Some(queue);
+    *ACTION_RX.lock().unwrap() = Some(rx);
 
     let hwnd = create_hidden_overlapped_window()?;
-    *cleanup_hwnd.lock().unwrap() = Some(hwnd);
+    *cleanup_hwnd.borrow_mut() = Some(hwnd);
 
     let bindings = HotkeyBindings::poc_defaults();
     set_hook_target(hwnd, bindings);
@@ -154,26 +155,35 @@ fn boot_resident(cleanup_hwnd: std::sync::Arc<Mutex<Option<HWND>>>) -> Result<()
     }
     register_fallback_hotkeys(hwnd, &bindings);
     add_tray_icon(hwnd)?;
-
-    // AsyncApp is !Send, so dispatch here instead of async_app.update.
-    std::thread::spawn(move || {
-        while let Ok(action) = rx.recv() {
-            let _ = dispatch_action(action);
-        }
-    });
-
     Ok(())
 }
 
 fn clear_action_queue() {
     *ACTION_TX.lock().unwrap() = None;
+    *ACTION_RX.lock().unwrap() = None;
 }
 
-fn enqueue_action(action: HotkeyAction) {
+fn enqueue_action(hwnd: HWND, action: HotkeyAction) {
     if let Ok(guard) = ACTION_TX.lock() {
         if let Some(queue) = guard.as_ref() {
             queue.send(action);
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), WM_ZSHOT_DISPATCH, WPARAM(0), LPARAM(0));
+            }
         }
+    }
+}
+
+fn drain_actions() {
+    let mut guard = match ACTION_RX.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let Some(rx) = guard.as_mut() else {
+        return;
+    };
+    while let Ok(action) = rx.try_recv() {
+        let _ = dispatch_action(action);
     }
 }
 
@@ -216,7 +226,7 @@ unsafe extern "system" fn hidden_proc(
 ) -> LRESULT {
     if msg == WM_ZSHOT_HOTKEY {
         if let Some(action) = action_from_wparam(wparam.0) {
-            enqueue_action(action);
+            enqueue_action(hwnd, action);
         }
         return LRESULT(0);
     }
@@ -228,16 +238,16 @@ unsafe extern "system" fn hidden_proc(
             _ => None,
         };
         if let Some(a) = action {
-            enqueue_action(a);
+            enqueue_action(hwnd, a);
         }
         return LRESULT(0);
     }
     if msg == WM_TRAYICON {
         if let Some(cmd) = handle_tray(hwnd, lparam) {
             match cmd {
-                TrayCommand::Region => enqueue_action(HotkeyAction::Region),
-                TrayCommand::Fullscreen => enqueue_action(HotkeyAction::Fullscreen),
-                TrayCommand::CopyOnly => enqueue_action(HotkeyAction::CopyOnly),
+                TrayCommand::Region => enqueue_action(hwnd, HotkeyAction::Region),
+                TrayCommand::Fullscreen => enqueue_action(hwnd, HotkeyAction::Fullscreen),
+                TrayCommand::CopyOnly => enqueue_action(hwnd, HotkeyAction::CopyOnly),
                 TrayCommand::Exit => {
                     remove_tray_icon(hwnd);
                     clear_action_queue();
@@ -245,6 +255,10 @@ unsafe extern "system" fn hidden_proc(
                 }
             }
         }
+        return LRESULT(0);
+    }
+    if msg == WM_ZSHOT_DISPATCH {
+        drain_actions();
         return LRESULT(0);
     }
     if msg == WM_DESTROY {
