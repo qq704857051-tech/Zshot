@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -14,7 +15,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::action_queue::ActionQueue;
-use crate::capture::{capture_for_action, crop_sdr_bgra};
+use crate::capture::{
+    capture_for_action, crop_sdr_bgra, drop_gpu_resources, CapturedDesktop, GpuShaders,
+};
 use crate::codec::{set_clipboard_dib, write_png_file};
 use crate::error::{Error, Result};
 use crate::gpui_bridge::open_smoke_overlay;
@@ -31,6 +34,52 @@ use crate::platform::{
 static BUSY: AtomicBool = AtomicBool::new(false);
 static ACTION_TX: Mutex<Option<ActionQueue>> = Mutex::new(None);
 static ACTION_RX: Mutex<Option<std::sync::mpsc::Receiver<HotkeyAction>>> = Mutex::new(None);
+
+thread_local! {
+    static GPUI_APP: RefCell<Option<gpui::AsyncApp>> = const { RefCell::new(None) };
+}
+
+fn bind_gpui_app(cx: &App) {
+    GPUI_APP.with(|slot| {
+        *slot.borrow_mut() = Some(cx.to_async());
+    });
+}
+
+fn unbind_gpui_app() {
+    GPUI_APP.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+}
+
+fn with_gpui_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
+    GPUI_APP.with(|slot| {
+        let app = slot.borrow().clone()?;
+        app.update(f).ok()
+    })
+}
+
+fn install_gpu_lifecycle(cx: &App) {
+    bind_gpui_app(cx);
+    cx.on_gpu_reset_begin(|| {
+        drop_gpu_resources();
+    });
+}
+
+fn capture_from_app(
+    cx: &mut App,
+    region: bool,
+    perf: &mut PerfSession,
+) -> Result<CapturedDesktop> {
+    let generation = cx.gpu_generation();
+    let overlay_luid = cx.adapter_luid().unwrap_or((0, 0));
+    match cx.with_gpu_context(|device, ctx| {
+        GpuShaders::get_or_compile(generation, device)
+            .and_then(|shaders| capture_for_action(region, perf, device, ctx, &shaders, overlay_luid))
+    }) {
+        Some(r) => r,
+        None => Err(Error::new("GPU context unavailable")),
+    }
+}
 
 pub fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -80,16 +129,37 @@ pub fn once_capture(path: PathBuf) -> Result<()> {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     }
     set_dpi_aware();
-    let mut perf = PerfSession::start();
-    perf.mark("T0");
-    perf.mark("T1");
-    perf.mark("T2");
-    let cap = capture_for_action(false, &mut perf)?;
-    let (px, w, h, stride) = cap.gpu.read_bgra(&cap.sdr_display)?;
-    write_png_file(&path, &px, w, h, stride)?;
-    let _ = perf.write_log();
-    println!("wrote {} ({}x{})", path.display(), w, h);
-    Ok(())
+    let outcome = std::rc::Rc::new(RefCell::new(None::<Result<(u32, u32)>>));
+    Application::new().run({
+        let outcome = outcome.clone();
+        let path = path.clone();
+        move |cx: &mut App| {
+            install_gpu_lifecycle(cx);
+            let mut perf = PerfSession::start();
+            perf.mark("T0");
+            perf.mark("T1");
+            perf.mark("T2");
+            let r = (|| {
+                let cap = capture_from_app(cx, false, &mut perf)?;
+                let (px, w, h, stride) = cap.gpu.read_bgra(&cap.sdr_display)?;
+                write_png_file(&path, &px, w, h, stride)?;
+                let _ = perf.write_log();
+                Ok((w, h))
+            })();
+            *outcome.borrow_mut() = Some(r);
+            cx.quit();
+        }
+    });
+    unbind_gpui_app();
+    let result = outcome.borrow_mut().take();
+    match result {
+        Some(Ok((w, h))) => {
+            println!("wrote {} ({}x{})", path.display(), w, h);
+            Ok(())
+        }
+        Some(Err(e)) => Err(e),
+        None => Err(Error::new("once-capture did not run")),
+    }
 }
 
 fn self_test() -> Result<()> {
@@ -137,7 +207,7 @@ fn run_tray() -> Result<()> {
         let cleanup_hwnd = cleanup_hwnd.clone();
         let boot_error = boot_error.clone();
         move |cx: &mut App| {
-            match boot_resident(cleanup_hwnd) {
+            match boot_resident(cx, cleanup_hwnd) {
                 Ok(()) => {
                     perf_boot.mark("T1");
                     let _ = perf_boot.write_log();
@@ -158,13 +228,19 @@ fn run_tray() -> Result<()> {
     uninstall_ll_hook();
     clear_action_queue();
 
+    unbind_gpui_app();
+
     if let Some(e) = boot_error.borrow_mut().take() {
         return Err(e);
     }
     Ok(())
 }
 
-fn boot_resident(cleanup_hwnd: std::rc::Rc<std::cell::RefCell<Option<HWND>>>) -> Result<()> {
+fn boot_resident(
+    cx: &mut App,
+    cleanup_hwnd: std::rc::Rc<std::cell::RefCell<Option<HWND>>>,
+) -> Result<()> {
+    install_gpu_lifecycle(cx);
     let (queue, rx) = ActionQueue::new();
     *ACTION_TX.lock().unwrap() = Some(queue);
     *ACTION_RX.lock().unwrap() = Some(rx);
@@ -306,10 +382,15 @@ fn dispatch_action(action: HotkeyAction) -> Result<()> {
 }
 
 fn take_shot(action: HotkeyAction) -> Result<()> {
+    with_gpui_app(|cx| take_shot_in_app(action, cx))
+        .unwrap_or_else(|| Err(Error::new("GPUI app unavailable")))
+}
+
+fn take_shot_in_app(action: HotkeyAction, cx: &mut App) -> Result<()> {
     let mut perf = PerfSession::start();
     perf.mark("T2");
     let region = matches!(action, HotkeyAction::Region);
-    let cap = match capture_for_action(region, &mut perf) {
+    let cap = match capture_from_app(cx, region, &mut perf) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("capture failed: {e}");

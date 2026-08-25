@@ -248,7 +248,6 @@ impl WindowsPlatform {
         let validation_number = self.inner.validation_number;
         let all_windows = Arc::downgrade(&self.raw_window_handles);
         let text_system = Arc::downgrade(&self.text_system);
-        let gpu_generation = self.inner.gpu_generation.clone();
         std::thread::Builder::new()
             .name("VSyncProvider".to_owned())
             .spawn(move || {
@@ -262,7 +261,6 @@ impl WindowsPlatform {
                             validation_number,
                             &all_windows,
                             &text_system,
-                            &gpu_generation,
                         );
                     }
                     let Some(all_windows) = all_windows.upgrade() else {
@@ -838,6 +836,8 @@ impl WindowsPlatformInner {
             ManuallyDrop::drop(&mut lock.directx_devices);
         }
         lock.directx_devices = ManuallyDrop::new(directx_devices.clone());
+        drop(lock);
+        self.gpu_generation.fetch_add(1, Ordering::SeqCst);
 
         Some(0)
     }
@@ -1083,7 +1083,6 @@ fn handle_gpu_device_lost(
     validation_number: usize,
     all_windows: &std::sync::Weak<RwLock<SmallVec<[SafeHwnd; 4]>>>,
     text_system: &std::sync::Weak<DirectWriteTextSystem>,
-    gpu_generation: &AtomicU64,
 ) {
     // Here we wait a bit to ensure the system has time to recover from the device lost state.
     // If we don't wait, the final drawing result will be blank.
@@ -1104,7 +1103,6 @@ fn handle_gpu_device_lost(
                 .context("Failed to recreate new DirectX devices after device lost")
         },
         |new_devices| {
-            gpu_generation.fetch_add(1, Ordering::SeqCst);
             *directx_devices = new_devices;
         },
         || {

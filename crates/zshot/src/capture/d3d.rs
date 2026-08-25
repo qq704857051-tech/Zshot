@@ -1,25 +1,20 @@
-//! Shared D3D11 device, GPU copies, HDR tonemap pass, staging readback.
+//! Shared D3D11 helpers, GPU copies, HDR tonemap pass, staging readback.
 
-use std::mem::ManuallyDrop;
+use std::sync::Mutex;
 
 use windows::core::{Interface, PCSTR};
-use windows::Win32::Foundation::HMODULE;
-use windows::Win32::Graphics::Direct3D::{
-    D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0,
-};
 use windows::Win32::Graphics::Direct3D::Fxc::{D3DCompile, D3DCOMPILE_OPTIMIZATION_LEVEL3};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader, ID3D11RenderTargetView,
+    ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader, ID3D11RenderTargetView,
     ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
     D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_CPU_ACCESS_READ,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_MAPPED_SUBRESOURCE,
-    D3D11_MAP_READ, D3D11_SAMPLER_DESC, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11_VIEWPORT,
+    D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SAMPLER_DESC,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11_VIEWPORT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
 };
-use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice, IDXGIFactory1};
+use windows::Win32::Graphics::Dxgi::{IDXGIDevice, IDXGIFactory1};
 use windows::Win32::System::WinRT::Direct3D11::CreateDirect3D11DeviceFromDXGIDevice;
 
 use crate::error::{Error, Result};
@@ -57,21 +52,38 @@ float4 ps_copy(VSOut i) : SV_Target {
 }
 "#;
 
-pub struct Gpu {
-    pub device: ID3D11Device,
-    pub context: ID3D11DeviceContext,
+static GPU_SHADERS: Mutex<Option<GpuShaders>> = Mutex::new(None);
+static FREEZE_TEXTURE: Mutex<Option<ID3D11Texture2D>> = Mutex::new(None);
+
+#[derive(Clone)]
+pub struct GpuShaders {
+    generation: u64,
     vs: ID3D11VertexShader,
     ps_tonemap: ID3D11PixelShader,
     ps_copy: ID3D11PixelShader,
+    #[allow(dead_code)]
+    ps_white_lift: ID3D11PixelShader,
     sampler: ID3D11SamplerState,
 }
 
-impl Gpu {
-    pub fn new() -> Result<Self> {
-        let (device, context) = create_device(None)?;
-        let vs = compile_vs(&device)?;
-        let ps_tonemap = compile_ps(&device, "ps_main")?;
-        let ps_copy = compile_ps(&device, "ps_copy")?;
+impl GpuShaders {
+    pub fn get_or_compile(generation: u64, device: &ID3D11Device) -> Result<Self> {
+        let mut slot = GPU_SHADERS.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(existing) = slot.as_ref() {
+            if existing.generation == generation {
+                return Ok(existing.clone());
+            }
+        }
+        let compiled = Self::compile(generation, device)?;
+        *slot = Some(compiled.clone());
+        Ok(compiled)
+    }
+
+    fn compile(generation: u64, device: &ID3D11Device) -> Result<Self> {
+        let vs = compile_vs(device)?;
+        let ps_tonemap = compile_ps(device, "ps_main")?;
+        let ps_copy = compile_ps(device, "ps_copy")?;
+        let ps_white_lift = ps_copy.clone();
         let sampler = unsafe {
             let desc = D3D11_SAMPLER_DESC {
                 Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
@@ -87,13 +99,61 @@ impl Gpu {
             s.ok_or_else(|| Error::new("CreateSamplerState"))?
         };
         Ok(Self {
-            device,
-            context,
+            generation,
             vs,
             ps_tonemap,
             ps_copy,
+            ps_white_lift,
             sampler,
         })
+    }
+}
+
+pub fn drop_gpu_resources() {
+    if let Ok(mut slot) = GPU_SHADERS.lock() {
+        *slot = None;
+    }
+    if let Ok(mut slot) = FREEZE_TEXTURE.lock() {
+        *slot = None;
+    }
+}
+
+pub(super) struct RestoreGpu<'a>(pub(super) &'a ID3D11DeviceContext);
+
+impl Drop for RestoreGpu<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            self.0
+                .PSSetShaderResources(0, Some(&[None::<ID3D11ShaderResourceView>]));
+            self.0.OMSetRenderTargets(None, None);
+            self.0.ClearState();
+        }
+    }
+}
+
+pub struct Gpu {
+    pub device: ID3D11Device,
+    pub context: ID3D11DeviceContext,
+    vs: ID3D11VertexShader,
+    ps_tonemap: ID3D11PixelShader,
+    ps_copy: ID3D11PixelShader,
+    sampler: ID3D11SamplerState,
+}
+
+impl Gpu {
+    pub fn bind(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        shaders: &GpuShaders,
+    ) -> Self {
+        Self {
+            device: device.clone(),
+            context: context.clone(),
+            vs: shaders.vs.clone(),
+            ps_tonemap: shaders.ps_tonemap.clone(),
+            ps_copy: shaders.ps_copy.clone(),
+            sampler: shaders.sampler.clone(),
+        }
     }
 
     pub fn winrt_device(&self) -> Result<windows::Graphics::DirectX::Direct3D11::IDirect3DDevice> {
@@ -145,6 +205,7 @@ impl Gpu {
         tonemap: bool,
         sdr_white: f32,
     ) -> Result<()> {
+        let _restore = RestoreGpu(&self.context);
         unsafe {
             let mut srv = None;
             self.device
@@ -180,9 +241,6 @@ impl Gpu {
                 windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             );
             self.context.Draw(3, 0);
-            self.context.OMSetRenderTargets(None, None);
-            let null_srv: [Option<ID3D11ShaderResourceView>; 1] = [None];
-            self.context.PSSetShaderResources(0, Some(&null_srv));
             let _ = REFERENCE_WHITE_NITS;
         }
         Ok(())
@@ -397,37 +455,6 @@ pub fn create_texture(
     tex.ok_or_else(|| Error::new("CreateTexture2D"))
 }
 
-pub fn create_device(adapter: Option<&IDXGIAdapter>) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
-    let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-    let levels = [D3D_FEATURE_LEVEL_11_0];
-    let try_create = |driver| -> Result<(ID3D11Device, ID3D11DeviceContext)> {
-        let mut device = None;
-        let mut ctx = None;
-        unsafe {
-            D3D11CreateDevice(
-                adapter,
-                driver,
-                HMODULE::default(),
-                flags,
-                Some(&levels),
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                Some(&mut ctx),
-            )?;
-        }
-        Ok((
-            device.ok_or_else(|| Error::new("D3D11 device"))?,
-            ctx.ok_or_else(|| Error::new("D3D11 context"))?,
-        ))
-    };
-    if adapter.is_some() {
-        try_create(D3D_DRIVER_TYPE_UNKNOWN)
-    } else {
-        try_create(D3D_DRIVER_TYPE_HARDWARE).or_else(|_| try_create(D3D_DRIVER_TYPE_WARP))
-    }
-}
-
 fn compile_vs(device: &ID3D11Device) -> Result<ID3D11VertexShader> {
     let blob = compile("vs_main", "vs_5_0")?;
     let mut vs = None;
@@ -435,8 +462,7 @@ fn compile_vs(device: &ID3D11Device) -> Result<ID3D11VertexShader> {
         let slice = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize());
         device.CreateVertexShader(slice, None, Some(&mut vs))?;
     }
-    // Keep blob alive until Create returns.
-    let _blob = ManuallyDrop::new(blob);
+    let _blob = blob; // drop after Create*Shader
     vs.ok_or_else(|| Error::new("CreateVertexShader"))
 }
 
@@ -447,7 +473,7 @@ fn compile_ps(device: &ID3D11Device, entry: &str) -> Result<ID3D11PixelShader> {
         let slice = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize());
         device.CreatePixelShader(slice, None, Some(&mut ps))?;
     }
-    let _blob = ManuallyDrop::new(blob);
+    let _blob = blob; // drop after Create*Shader
     ps.ok_or_else(|| Error::new("CreatePixelShader"))
 }
 

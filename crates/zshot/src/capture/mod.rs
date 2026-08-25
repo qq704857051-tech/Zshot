@@ -3,13 +3,13 @@ mod dxgi_dup;
 mod monitors;
 mod wgc;
 
-pub use d3d::{texture_desc, Gpu};
+pub use d3d::{drop_gpu_resources, texture_desc, Gpu, GpuShaders};
 pub use monitors::{
     enumerate_monitors, foreground_covers_monitor, monitor_from_foreground, query_monitor_exclusive,
     virtual_desktop, MonitorInfo, VirtualDesktop,
 };
 
-use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
+use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D};
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
 };
@@ -37,8 +37,14 @@ pub struct CapturedDesktop {
 pub fn capture_for_action(
     region: bool,
     perf: &mut PerfSession,
+    device: &ID3D11Device,
+    ctx: &ID3D11DeviceContext,
+    shaders: &GpuShaders,
+    overlay_luid: (u32, i32),
 ) -> Result<CapturedDesktop> {
-    let gpu = Gpu::new()?;
+    let _restore = d3d::RestoreGpu(ctx);
+    let _ = overlay_luid;
+    let gpu = Gpu::bind(device, ctx, shaders);
     let monitors = enumerate_monitors()?;
     if monitors.is_empty() {
         return Err(Error::new("no monitors"));
@@ -208,4 +214,17 @@ pub fn crop_sdr_bgra(
     h: u32,
 ) -> Result<(Vec<u8>, u32, u32, u32)> {
     cap.gpu.read_bgra_region(&cap.sdr_display, x, y, w, h)
+}
+
+#[cfg(test)]
+mod blob_drop_tests {
+    #[test]
+    fn d3d_shader_blobs_are_not_manuallydrop() {
+        let src = include_str!("d3d.rs");
+        assert!(
+            !src.contains("ManuallyDrop"),
+            "shader blobs must drop after Create*Shader"
+        );
+        assert!(src.contains("let _blob = blob"));
+    }
 }

@@ -10,3 +10,4 @@
   2. DirectComposition dual visuals + set_background_swap_chain
   3. App.with_gpu_context / gpu_generation / adapter_luid
   4. on_gpu_reset_begin before device recreate
+  5. gpu_generation fetch_add on the main thread next to DirectXDevices swap
