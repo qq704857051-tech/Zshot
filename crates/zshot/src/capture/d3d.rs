@@ -50,7 +50,19 @@ float4 ps_main(VSOut i) : SV_Target {
 float4 ps_copy(VSOut i) : SV_Target {
     return g_tex.Sample(g_samp, i.uv);
 }
+
+float4 ps_white_lift(VSOut i) : SV_Target {
+    float4 c = g_tex.Sample(g_samp, i.uv);
+    float scale = sdrWhite / 80.0;
+    return float4(c.rgb * scale, 1);
+}
 "#;
+
+enum BlitMode {
+    Copy,
+    Tonemap,
+    WhiteLift,
+}
 
 static GPU_SHADERS: Mutex<Option<GpuShaders>> = Mutex::new(None);
 static FREEZE_TEXTURE: Mutex<Option<ID3D11Texture2D>> = Mutex::new(None);
@@ -61,7 +73,6 @@ pub struct GpuShaders {
     vs: ID3D11VertexShader,
     ps_tonemap: ID3D11PixelShader,
     ps_copy: ID3D11PixelShader,
-    #[allow(dead_code)]
     ps_white_lift: ID3D11PixelShader,
     sampler: ID3D11SamplerState,
 }
@@ -83,7 +94,7 @@ impl GpuShaders {
         let vs = compile_vs(device)?;
         let ps_tonemap = compile_ps(device, "ps_main")?;
         let ps_copy = compile_ps(device, "ps_copy")?;
-        let ps_white_lift = ps_copy.clone();
+        let ps_white_lift = compile_ps(device, "ps_white_lift")?;
         let sampler = unsafe {
             let desc = D3D11_SAMPLER_DESC {
                 Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
@@ -132,6 +143,7 @@ pub struct Gpu {
     vs: ID3D11VertexShader,
     ps_tonemap: ID3D11PixelShader,
     ps_copy: ID3D11PixelShader,
+    ps_white_lift: ID3D11PixelShader,
     sampler: ID3D11SamplerState,
 }
 
@@ -142,6 +154,7 @@ impl Gpu {
             vs: shaders.vs.clone(),
             ps_tonemap: shaders.ps_tonemap.clone(),
             ps_copy: shaders.ps_copy.clone(),
+            ps_white_lift: shaders.ps_white_lift.clone(),
             sampler: shaders.sampler.clone(),
         }
     }
@@ -191,8 +204,42 @@ impl Gpu {
             0,
         )?;
         let hdr = desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
-        self.blit(ctx, src, &dest, desc.Width, desc.Height, hdr, sdr_white_nits)?;
+        let mode = if hdr {
+            BlitMode::Tonemap
+        } else {
+            BlitMode::Copy
+        };
+        self.blit(
+            ctx,
+            src,
+            &dest,
+            (0, 0, desc.Width, desc.Height),
+            mode,
+            sdr_white_nits,
+        )?;
         Ok(dest)
+    }
+
+    /// Draw SDR BGRA8 (or FP16 SDR) into an FP16 composite with `rgb * (sdrWhite/80)`.
+    /// Must not CopySubresourceRegion across formats.
+    pub(super) fn white_lift_into(
+        &self,
+        ctx: &ID3D11DeviceContext,
+        src: &ID3D11Texture2D,
+        dest: &ID3D11Texture2D,
+        dst_x: u32,
+        dst_y: u32,
+        sdr_white: f32,
+    ) -> Result<()> {
+        let desc = texture_desc(src);
+        self.blit(
+            ctx,
+            src,
+            dest,
+            (dst_x, dst_y, desc.Width, desc.Height),
+            BlitMode::WhiteLift,
+            sdr_white,
+        )
     }
 
     fn blit(
@@ -200,12 +247,12 @@ impl Gpu {
         ctx: &ID3D11DeviceContext,
         src: &ID3D11Texture2D,
         dest: &ID3D11Texture2D,
-        w: u32,
-        h: u32,
-        tonemap: bool,
+        dest_rect: (u32, u32, u32, u32),
+        mode: BlitMode,
         sdr_white: f32,
     ) -> Result<()> {
         let _restore = RestoreGpu(ctx);
+        let (dst_x, dst_y, w, h) = dest_rect;
         unsafe {
             let mut srv = None;
             self.device
@@ -216,8 +263,8 @@ impl Gpu {
             let rtv: ID3D11RenderTargetView = rtv.ok_or_else(|| Error::new("RTV"))?;
 
             let vp = D3D11_VIEWPORT {
-                TopLeftX: 0.0,
-                TopLeftY: 0.0,
+                TopLeftX: dst_x as f32,
+                TopLeftY: dst_y as f32,
                 Width: w as f32,
                 Height: h as f32,
                 MinDepth: 0.0,
@@ -226,14 +273,16 @@ impl Gpu {
             ctx.RSSetViewports(Some(&[vp]));
             ctx.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
             ctx.VSSetShader(&self.vs, None);
-            if tonemap {
-                ctx.PSSetShader(&self.ps_tonemap, None);
-                // constant buffer: 16 bytes
+            let ps = match mode {
+                BlitMode::Tonemap => &self.ps_tonemap,
+                BlitMode::WhiteLift => &self.ps_white_lift,
+                BlitMode::Copy => &self.ps_copy,
+            };
+            ctx.PSSetShader(ps, None);
+            if !matches!(mode, BlitMode::Copy) {
                 let cb_data = [sdr_white.max(1.0), 0.0, 0.0, 0.0];
                 let cb = create_cbuffer(&self.device, &cb_data)?;
                 ctx.PSSetConstantBuffers(0, Some(&[Some(cb)]));
-            } else {
-                ctx.PSSetShader(&self.ps_copy, None);
             }
             ctx.PSSetShaderResources(0, Some(&[Some(srv)]));
             ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
@@ -539,4 +588,117 @@ fn create_cbuffer(device: &ID3D11Device, data: &[f32; 4]) -> Result<windows::Win
 pub fn dxgi_factory() -> Result<IDXGIFactory1> {
     use windows::Win32::Graphics::Dxgi::CreateDXGIFactory1;
     unsafe { CreateDXGIFactory1().map_err(Into::into) }
+}
+
+#[cfg(test)]
+mod golden {
+    use super::*;
+    use windows::Win32::Foundation::HMODULE;
+    use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0};
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11CreateDevice, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
+        D3D11_SUBRESOURCE_DATA,
+    };
+    use windows::Win32::Graphics::Dxgi::IDXGIAdapter;
+
+    #[test]
+    fn white_lift_shader_scales_sdr_white_over_80() {
+        assert!(TONEMAP_HLSL.contains("ps_white_lift"));
+        assert!(TONEMAP_HLSL.contains("sdrWhite / 80.0"));
+    }
+
+    fn try_warp_device() -> Option<(ID3D11Device, ID3D11DeviceContext)> {
+        let mut device = None;
+        let mut ctx = None;
+        unsafe {
+            D3D11CreateDevice(
+                None::<&IDXGIAdapter>,
+                D3D_DRIVER_TYPE_WARP,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut ctx),
+            )
+            .ok()?;
+        }
+        Some((device?, ctx?))
+    }
+
+    fn solid_bgra(device: &ID3D11Device, b: u8, g: u8, r: u8, a: u8) -> Result<ID3D11Texture2D> {
+        let pixels = [b, g, r, a];
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: 1,
+            Height: 1,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET).0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let srd = D3D11_SUBRESOURCE_DATA {
+            pSysMem: pixels.as_ptr() as *const _,
+            SysMemPitch: 4,
+            SysMemSlicePitch: 0,
+        };
+        let mut tex = None;
+        unsafe { device.CreateTexture2D(&desc, Some(&srd), Some(&mut tex))? };
+        tex.ok_or_else(|| Error::new("CreateTexture2D"))
+    }
+
+    #[test]
+    fn gpu_golden_sdr_lift_channel_error_le_1() {
+        let Some((device, ctx)) = try_warp_device() else {
+            return;
+        };
+        let shaders = GpuShaders::compile(0, &device).expect("compile shaders");
+        let gpu = Gpu::bind(&device, &shaders);
+        let src = solid_bgra(&device, 40, 80, 200, 255).expect("src");
+        let composite = create_texture(
+            &device,
+            1,
+            1,
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+            D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET,
+            D3D11_USAGE_DEFAULT,
+            0,
+        )
+        .expect("fp16 composite");
+        let sdr_white = 203.0;
+        gpu.white_lift_into(&ctx, &src, &composite, 0, 0, sdr_white)
+            .expect("white lift");
+        let display = gpu
+            .to_sdr_bgra(&ctx, &composite, sdr_white)
+            .expect("tonemap");
+        let (px, _, _, _) = gpu.read_bgra(&ctx, &display).expect("readback");
+        let lift = |c: u8| {
+            crate::hdr::white_level_adjust(
+                c as f32 / 255.0,
+                sdr_white,
+                crate::hdr::REFERENCE_WHITE_NITS,
+            )
+        };
+        let expected = [
+            crate::hdr::tonemap_srgb8(lift(40), sdr_white),
+            crate::hdr::tonemap_srgb8(lift(80), sdr_white),
+            crate::hdr::tonemap_srgb8(lift(200), sdr_white),
+        ];
+        for i in 0..3 {
+            let err = (px[i] as i16 - expected[i] as i16).abs();
+            assert!(
+                err <= 1,
+                "channel {i}: got={} expected={} err={err}",
+                px[i],
+                expected[i]
+            );
+        }
+    }
 }

@@ -21,7 +21,7 @@ use windows::Win32::UI::Shell::{
 
 use crate::error::Result;
 use crate::exclusive::dxgi_output_is_exclusive;
-use crate::hdr::{sdr_white_nits_from_displayconfig, REFERENCE_WHITE_NITS};
+use crate::hdr::{is_hdr_color_space, sdr_white_nits_from_displayconfig, REFERENCE_WHITE_NITS};
 
 use super::d3d::dxgi_factory;
 
@@ -177,7 +177,7 @@ pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>> {
 fn output_is_hdr(output: &IDXGIOutput) -> Result<bool> {
     let output6: IDXGIOutput6 = output.cast()?;
     let desc: DXGI_OUTPUT_DESC1 = unsafe { output6.GetDesc1()? };
-    Ok(desc.ColorSpace.0 >= 10 || desc.BitsPerColor >= 10)
+    Ok(is_hdr_color_space(desc.ColorSpace.0))
 }
 
 fn sdr_white_for_paths() -> Result<f32> {

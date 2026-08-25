@@ -3,6 +3,8 @@
 //! WhiteLevelAdjustment: `rgb * (input_nits / output_nits)`
 //! TonemapToSdr uses InputWhiteLevel=80, OutputWhiteLevel=sdr_white_nits, then OETF.
 
+use windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+
 pub const REFERENCE_WHITE_NITS: f32 = 80.0;
 
 /// Scale scene-referred scRGB (1.0 = 80 nits) so SDR white maps to 1.0.
@@ -29,6 +31,12 @@ pub fn srgb_oetf(linear: f32) -> f32 {
 pub fn tonemap_srgb8(scrgb: f32, sdr_white_nits: f32) -> u8 {
     let v = srgb_oetf(tonemap_linear(scrgb, sdr_white_nits)).clamp(0.0, 1.0);
     (v * 255.0 + 0.5).floor().clamp(0.0, 255.0) as u8
+}
+
+/// HDR iff `DXGI_OUTPUT_DESC1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020`.
+/// BitsPerColor and other ColorSpace ordinals are not HDR.
+pub fn is_hdr_color_space(color_space: i32) -> bool {
+    color_space == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020.0
 }
 
 /// DISPLAYCONFIG_SDR_WHITE_LEVEL stores a multiplier of 80 nits × 1000.
@@ -73,5 +81,48 @@ mod tests {
     fn displayconfig_1000_is_80_nits() {
         assert!((sdr_white_nits_from_displayconfig(1000) - 80.0).abs() < 1e-4);
         assert!((sdr_white_nits_from_displayconfig(2537) - 203.0).abs() < 0.1);
+    }
+}
+
+#[cfg(test)]
+mod is_hdr_color_space {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+    };
+
+    #[test]
+    fn g2084_p2020_is_hdr() {
+        assert!(is_hdr_color_space(
+            DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020.0
+        ));
+    }
+
+    #[test]
+    fn g22_p709_is_not_hdr_even_if_10bit_would_have_fooled_us() {
+        assert!(!is_hdr_color_space(
+            DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709.0
+        ));
+    }
+
+    #[test]
+    fn sdr_lift_matches_csharp_white_level_adjust() {
+        assert!((white_level_adjust(1.0, 203.0, 80.0) - 203.0 / 80.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn golden_sdr_lift_channel_error_le_1() {
+        let sdr_white = 203.0;
+        for v in 0..=255u8 {
+            let x = v as f32 / 255.0;
+            let lifted = white_level_adjust(x, sdr_white, REFERENCE_WHITE_NITS);
+            let got = tonemap_srgb8(lifted, sdr_white);
+            let expected = tonemap_srgb8(x, REFERENCE_WHITE_NITS);
+            let err = (got as i16 - expected as i16).abs();
+            assert!(
+                err <= 1,
+                "v={v} got={got} expected={expected} err={err}"
+            );
+        }
     }
 }

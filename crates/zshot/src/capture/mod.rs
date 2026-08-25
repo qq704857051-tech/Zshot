@@ -282,14 +282,16 @@ pub fn capture_for_action(
         0,
     )?;
 
-    for (mx, my, tex, _hdr) in &pieces {
-        let desc = texture_desc(tex);
+    for (mx, my, tex, piece_hdr) in &pieces {
         let dst_x = (*mx - origin_x).max(0) as u32;
         let dst_y = (*my - origin_y).max(0) as u32;
-        unsafe {
-            ctx.CopySubresourceRegion(&composite, 0, dst_x, dst_y, 0, tex, 0, None);
+        if any_hdr && !*piece_hdr {
+            gpu.white_lift_into(ctx, tex, &composite, dst_x, dst_y, sdr_white)?;
+        } else {
+            unsafe {
+                ctx.CopySubresourceRegion(&composite, 0, dst_x, dst_y, 0, tex, 0, None);
+            }
         }
-        let _ = desc;
     }
     perf.mark("T4");
 
@@ -332,5 +334,12 @@ mod blob_drop_tests {
             "shader blobs must drop after Create*Shader"
         );
         assert!(src.contains("let _blob = blob"));
+    }
+
+    #[test]
+    fn mixed_hdr_composite_white_lifts_sdr_pieces() {
+        let src = include_str!("mod.rs");
+        assert!(src.contains("white_lift_into"));
+        assert!(src.contains("any_hdr && !*piece_hdr"));
     }
 }
