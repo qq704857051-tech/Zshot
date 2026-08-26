@@ -59,7 +59,7 @@ pub struct TextInput {
 }
 
 impl TextInput {
-    pub(super) fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
             content: "".into(),

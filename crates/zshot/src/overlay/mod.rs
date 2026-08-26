@@ -4,13 +4,13 @@ mod input;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gpui::{
     actions, black, canvas, div, fill, hsla, outline, point, prelude::*, px, rgb, size, white, App,
     BorderStyle, Bounds, Context, CursorStyle, Entity, FocusHandle, Focusable, InteractiveElement,
     KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels,
-    Point as GpuiPoint, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
+    Point as GpuiPoint, Timer, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
     WindowKind, WindowOptions,
 };
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
@@ -48,6 +48,10 @@ pub const ANTS_SPEED: f32 = -15.0;
 
 pub fn marching_ants_dash_offset(elapsed_secs: f32) -> f32 {
     elapsed_secs * ANTS_SPEED
+}
+
+pub fn bench_auto_hide_enabled() -> bool {
+    std::env::var_os("ZSHOT_BENCH").is_some()
 }
 
 actions!(overlay, [ConfirmSelection, CancelOverlay]);
@@ -363,9 +367,38 @@ impl OverlayView {
                 let _ = PostMessageW(Some(hwnd), WM_APP_READY_SENTINEL, WPARAM(0), LPARAM(0));
             }
         });
-        window.request_animation_frame();
+        // Do not call request_animation_frame here — it requires a paint-time
+        // current_view. focus() already refresh()ed; notify + vsync will draw.
+        if bench_auto_hide_enabled() {
+            self.schedule_bench_auto_hide(cx);
+        }
         self.refresh_magnifier_gpu(cx);
         cx.notify();
+    }
+
+    fn schedule_bench_auto_hide(&self, cx: &mut Context<Self>) {
+        let perf = self.perf.clone();
+        cx.spawn(async move |_this, cx| {
+            for _ in 0..5_000 {
+                Timer::after(Duration::from_millis(1)).await;
+                let ready = perf
+                    .borrow()
+                    .as_ref()
+                    .map(|p| p.has_mark("T7"))
+                    .unwrap_or(true);
+                if ready {
+                    break;
+                }
+            }
+            let _ = cx.update(|cx| {
+                if let Some(handle) = OVERLAY_WINDOW.with(|s| *s.borrow()) {
+                    let _ = handle.update(cx, |view, window, cx| {
+                        view.cancel(window, cx);
+                    });
+                }
+            });
+        })
+        .detach();
     }
 
     fn hide_window(window: &Window) {

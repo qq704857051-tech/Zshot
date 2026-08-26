@@ -47,37 +47,6 @@ pub fn dxgi_allowed(mon: &MonitorInfo, overlay_luid: (u32, i32)) -> bool {
         .is_some_and(|luid| luid_eq(luid, overlay_luid))
 }
 
-#[cfg(test)]
-pub fn dummy_monitor(adapter_luid: Option<(u32, i32)>) -> MonitorInfo {
-    MonitorInfo {
-        handle: HMONITOR(std::ptr::null_mut()),
-        x: 0,
-        y: 0,
-        w: 1920,
-        h: 1080,
-        hdr: false,
-        sdr_white_nits: REFERENCE_WHITE_NITS,
-        output: None,
-        adapter_luid,
-    }
-}
-
-#[cfg(test)]
-mod luid_tests {
-    use super::*;
-
-    #[test]
-    fn dxgi_allowed_only_when_luid_matches() {
-        let overlay = (1, 0);
-        let same = dummy_monitor(Some((1, 0)));
-        let other = dummy_monitor(Some((2, 0)));
-        let unknown = dummy_monitor(None);
-        assert!(dxgi_allowed(&same, overlay));
-        assert!(!dxgi_allowed(&other, overlay));
-        assert!(!dxgi_allowed(&unknown, overlay));
-    }
-}
-
 pub struct VirtualDesktop {
     pub x: i32,
     pub y: i32,
@@ -280,5 +249,36 @@ pub fn monitor_from_foreground(monitors: &[MonitorInfo]) -> Option<usize> {
         monitors.iter().position(|m| {
             cx >= m.x && cy >= m.y && cx < m.x + m.w && cy < m.y + m.h
         })
+    }
+}
+
+#[cfg(test)]
+pub fn dummy_monitor(adapter_luid: Option<(u32, i32)>) -> MonitorInfo {
+    MonitorInfo {
+        handle: HMONITOR(std::ptr::null_mut()),
+        x: 0,
+        y: 0,
+        w: 1920,
+        h: 1080,
+        hdr: false,
+        sdr_white_nits: REFERENCE_WHITE_NITS,
+        output: None,
+        adapter_luid,
+    }
+}
+
+#[cfg(test)]
+mod luid_tests {
+    use super::*;
+
+    #[test]
+    fn dxgi_allowed_only_when_luid_matches() {
+        let overlay = (1, 0);
+        let same = dummy_monitor(Some((1, 0)));
+        let other = dummy_monitor(Some((2, 0)));
+        let unknown = dummy_monitor(None);
+        assert!(dxgi_allowed(&same, overlay));
+        assert!(!dxgi_allowed(&other, overlay));
+        assert!(!dxgi_allowed(&unknown, overlay));
     }
 }

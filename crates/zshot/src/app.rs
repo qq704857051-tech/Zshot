@@ -1,13 +1,23 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
+use std::process::Command;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 
-use gpui::{App, Application};
+use gpui::{
+    div, prelude::*, px, rgb, size, App, Application, Focusable, Timer, WindowBackgroundAppearance,
+    WindowBounds, WindowKind, WindowOptions,
+};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::ProcessStatus::{
+    GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+};
+use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::Win32::UI::Shell::{SHGetKnownFolderPath, FOLDERID_Pictures, KF_FLAG_DEFAULT};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, PostMessageW, PostQuitMessage, RegisterClassExW, ShowWindow,
@@ -23,8 +33,8 @@ use crate::codec::{set_clipboard_dib, write_png_file};
 use crate::error::{Error, Result};
 use crate::gpui_bridge::{drop_freeze_swapchain, open_smoke_overlay};
 use crate::hotkey::{HotkeyAction, HotkeyBindings};
-use crate::overlay::{show_overlay, OverlayResult};
-use crate::perf::PerfSession;
+use crate::overlay::{show_overlay, OverlayResult, TextInput};
+use crate::perf::{write_perf_summary, PerfSession};
 use crate::platform::{
     action_from_wparam, add_tray_icon, handle_tray, install_ll_hook, register_fallback_hotkeys,
     remove_tray_icon, set_dpi_aware, set_hook_target, uninstall_ll_hook,
@@ -38,6 +48,25 @@ static ACTION_RX: Mutex<Option<std::sync::mpsc::Receiver<HotkeyAction>>> = Mutex
 
 thread_local! {
     static GPUI_APP: RefCell<Option<gpui::AsyncApp>> = const { RefCell::new(None) };
+    static BENCH_CTRL: RefCell<Option<BenchControl>> = const { RefCell::new(None) };
+}
+
+struct BenchControl {
+    samples: Vec<u128>,
+    remaining: usize,
+    /// After each sample: continue warm loop, quit once-mode, or stress sample.
+    kind: BenchKind,
+    stress_n: usize,
+    stress_done: usize,
+    stress_ws10: Option<usize>,
+    stress_ws100: Option<usize>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BenchKind {
+    Once,
+    Warm,
+    Stress,
 }
 
 fn bind_gpui_app(cx: &App) {
@@ -117,13 +146,39 @@ pub fn run() -> Result<()> {
         }
         Some("--self-test") => return self_test(),
         Some("--overlay-smoke") => return overlay_smoke(),
+        Some("--ime-probe") => return ime_probe(),
+        Some("--bench-once") => return bench_once(),
+        Some("--bench-overlay") => {
+            let mode = arg_value(&args, "--mode").unwrap_or_else(|| "warm".into());
+            let n = arg_value(&args, "--n")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30);
+            return match mode.as_str() {
+                "first" => bench_overlay_first(n),
+                "warm" => bench_overlay_warm(n),
+                other => Err(Error::new(format!("unknown --mode {other}"))),
+            };
+        }
+        Some("--stress-overlay") => {
+            let n = args
+                .get(2)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(100usize);
+            return stress_overlay(n);
+        }
         Some("--probe-gpui") => {
-            eprintln!("--probe-gpui removed; GPUI is the main message pump");
+            eprintln!("--probe-gpui removed; use --ime-probe");
             return Ok(());
         }
         _ => {}
     }
     run_tray()
+}
+
+fn arg_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1).cloned())
 }
 
 fn overlay_smoke() -> Result<()> {
@@ -191,22 +246,331 @@ fn self_test() -> Result<()> {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     }
     set_dpi_aware();
-    let mut perf = PerfSession::start();
-    perf.mark("T0");
-    let _instance = SingleInstance::acquire()?;
-    let hwnd = create_hidden_overlapped_window()?;
-    let bindings = HotkeyBindings::poc_defaults();
-    set_hook_target(hwnd, bindings);
-    let hook_ok = install_ll_hook().is_ok();
-    register_fallback_hotkeys(hwnd, &bindings);
-    add_tray_icon(hwnd)?;
-    perf.mark("T1");
-    let _ = perf.write_log();
-    println!("zshot-ready hook={hook_ok}");
-    remove_tray_icon(hwnd);
-    unregister_fallback_hotkeys(hwnd);
+    let cleanup_hwnd = Rc::new(RefCell::new(None::<HWND>));
+    let boot_error = Rc::new(RefCell::new(None::<Error>));
+    let ready = Rc::new(Cell::new(false));
+
+    Application::new().run({
+        let cleanup_hwnd = cleanup_hwnd.clone();
+        let boot_error = boot_error.clone();
+        let ready = ready.clone();
+        move |cx: &mut App| {
+            let mut perf = PerfSession::start();
+            perf.mark("T0");
+            let result = (|| -> Result<()> {
+                let _instance = SingleInstance::acquire()?;
+                let hwnd = create_hidden_overlapped_window()?;
+                *cleanup_hwnd.borrow_mut() = Some(hwnd);
+                let bindings = HotkeyBindings::poc_defaults();
+                set_hook_target(hwnd, bindings);
+                let hook_ok = install_ll_hook().is_ok();
+                register_fallback_hotkeys(hwnd, &bindings);
+                let tray_ok = add_tray_icon(hwnd).is_ok();
+                perf.mark("T1");
+                let _ = perf.write_log();
+                println!("zshot-ready hook={hook_ok} tray={tray_ok}");
+                ready.set(true);
+                Ok(())
+            })();
+            if let Err(e) = result {
+                eprintln!("{e}");
+                *boot_error.borrow_mut() = Some(e);
+            }
+            cx.quit();
+        }
+    });
+
+    if let Some(hwnd) = cleanup_hwnd.borrow_mut().take() {
+        remove_tray_icon(hwnd);
+        unregister_fallback_hotkeys(hwnd);
+    }
     uninstall_ll_hook();
+
+    if let Some(e) = boot_error.borrow_mut().take() {
+        return Err(e);
+    }
+    if !ready.get() {
+        return Err(Error::new("self-test did not reach ready"));
+    }
     Ok(())
+}
+
+fn ime_probe() -> Result<()> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    }
+    set_dpi_aware();
+    Application::new().run(|cx: &mut App| {
+        let bounds = gpui::Bounds {
+            origin: gpui::point(px(200.), px(200.)),
+            size: size(px(420.), px(80.)),
+        };
+        let _ = cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: None,
+                focus: true,
+                show: true,
+                kind: WindowKind::PopUp,
+                is_movable: true,
+                is_resizable: false,
+                is_minimizable: false,
+                window_background: WindowBackgroundAppearance::Opaque,
+                topmost: true,
+                ..Default::default()
+            },
+            |_window, cx| {
+                cx.new(|cx| {
+                    let input = cx.new(TextInput::new);
+                    ImeProbeView { input }
+                })
+            },
+        );
+        println!("ime-probe ready (type in the field; close window to exit)");
+    });
+    Ok(())
+}
+
+struct ImeProbeView {
+    input: gpui::Entity<TextInput>,
+}
+
+impl Render for ImeProbeView {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .size_full()
+            .p_2()
+            .bg(rgb(0x1e1e1e))
+            .child(div().w_full().child(self.input.clone()))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    window.focus(&this.input.focus_handle(cx));
+                }),
+            )
+    }
+}
+
+fn bench_once() -> Result<()> {
+    std::env::set_var("ZSHOT_BENCH", "1");
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    }
+    set_dpi_aware();
+    BENCH_CTRL.with(|slot| {
+        *slot.borrow_mut() = Some(BenchControl {
+            samples: Vec::new(),
+            remaining: 1,
+            kind: BenchKind::Once,
+            stress_n: 0,
+            stress_done: 0,
+            stress_ws10: None,
+            stress_ws100: None,
+        });
+    });
+    Application::new().run(|cx: &mut App| {
+        install_gpu_lifecycle(cx);
+        start_bench_iteration(cx);
+    });
+    unbind_gpui_app();
+    Ok(())
+}
+
+fn bench_overlay_first(n: usize) -> Result<()> {
+    let exe = std::env::current_exe().map_err(|e| Error::new(e.to_string()))?;
+    let mut samples = Vec::with_capacity(n);
+    for i in 0..n {
+        let out = Command::new(&exe)
+            .env("ZSHOT_BENCH", "1")
+            .arg("--bench-once")
+            .output()
+            .map_err(|e| Error::new(e.to_string()))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(Error::new(format!(
+                "bench-once #{i} failed status={:?}: {stderr}",
+                out.status.code()
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let Some(ms) = parse_bench_sample(&stdout) else {
+            return Err(Error::new(format!(
+                "bench-once #{i} missing bench-sample line: {stdout}"
+            )));
+        };
+        samples.push(ms);
+        println!("first sample {}/{} t2_t7_ms={ms}", i + 1, n);
+    }
+    let path = write_perf_summary("first", &mut samples)?;
+    println!("wrote {}", path.display());
+    Ok(())
+}
+
+fn bench_overlay_warm(n: usize) -> Result<()> {
+    std::env::set_var("ZSHOT_BENCH", "1");
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    }
+    set_dpi_aware();
+    BENCH_CTRL.with(|slot| {
+        *slot.borrow_mut() = Some(BenchControl {
+            samples: Vec::with_capacity(n),
+            remaining: n,
+            kind: BenchKind::Warm,
+            stress_n: 0,
+            stress_done: 0,
+            stress_ws10: None,
+            stress_ws100: None,
+        });
+    });
+    Application::new().run(|cx: &mut App| {
+        install_gpu_lifecycle(cx);
+        start_bench_iteration(cx);
+    });
+    unbind_gpui_app();
+    let mut samples = BENCH_CTRL.with(|slot| {
+        slot.borrow_mut()
+            .take()
+            .map(|c| c.samples)
+            .unwrap_or_default()
+    });
+    if samples.is_empty() {
+        return Err(Error::new("warm bench produced no samples"));
+    }
+    let path = write_perf_summary("warm", &mut samples)?;
+    println!("wrote {}", path.display());
+    Ok(())
+}
+
+fn stress_overlay(n: usize) -> Result<()> {
+    std::env::set_var("ZSHOT_BENCH", "1");
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    }
+    set_dpi_aware();
+    BENCH_CTRL.with(|slot| {
+        *slot.borrow_mut() = Some(BenchControl {
+            samples: Vec::new(),
+            remaining: n,
+            kind: BenchKind::Stress,
+            stress_n: n,
+            stress_done: 0,
+            stress_ws10: None,
+            stress_ws100: None,
+        });
+    });
+    Application::new().run(|cx: &mut App| {
+        install_gpu_lifecycle(cx);
+        start_bench_iteration(cx);
+    });
+    unbind_gpui_app();
+    let ctrl = BENCH_CTRL.with(|slot| slot.borrow_mut().take());
+    let Some(ctrl) = ctrl else {
+        return Err(Error::new("stress bench state missing"));
+    };
+    println!(
+        "stress n={} ws10_bytes={:?} ws100_bytes={:?}",
+        ctrl.stress_n, ctrl.stress_ws10, ctrl.stress_ws100
+    );
+    if let (Some(a), Some(b)) = (ctrl.stress_ws10, ctrl.stress_ws100) {
+        let delta = b as i64 - a as i64;
+        println!("stress ws_delta_10_to_100={delta}");
+    }
+    Ok(())
+}
+
+fn parse_bench_sample(stdout: &str) -> Option<u128> {
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("bench-sample t2_t7_ms=") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}
+
+fn start_bench_iteration(cx: &mut App) {
+    let mut perf = PerfSession::start();
+    perf.mark("T2");
+    match capture_from_app(cx, true, &mut perf) {
+        Ok(cap) => {
+            let _ = show_overlay(cx, cap, &mut perf);
+        }
+        Err(e) => {
+            eprintln!("bench capture failed: {e}");
+            cx.quit();
+        }
+    }
+}
+
+fn private_working_set_bytes() -> Option<usize> {
+    unsafe {
+        let mut counters = PROCESS_MEMORY_COUNTERS_EX {
+            cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+            ..Default::default()
+        };
+        GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            &mut counters as *mut _ as *mut PROCESS_MEMORY_COUNTERS,
+            counters.cb,
+        )
+        .ok()?;
+        Some(counters.PrivateUsage)
+    }
+}
+
+fn on_bench_sample(cx: &mut App, ms: u128) {
+    let mut quit = false;
+    BENCH_CTRL.with(|slot| {
+        let mut guard = slot.borrow_mut();
+        let Some(ctrl) = guard.as_mut() else {
+            quit = true;
+            return;
+        };
+        println!("bench-sample t2_t7_ms={ms}");
+        match ctrl.kind {
+            BenchKind::Once => {
+                ctrl.samples.push(ms);
+                ctrl.remaining = 0;
+                quit = true;
+            }
+            BenchKind::Warm => {
+                ctrl.samples.push(ms);
+                ctrl.remaining = ctrl.remaining.saturating_sub(1);
+                if ctrl.remaining == 0 {
+                    quit = true;
+                }
+            }
+            BenchKind::Stress => {
+                ctrl.stress_done += 1;
+                let done = ctrl.stress_done;
+                if done == 10 {
+                    ctrl.stress_ws10 = private_working_set_bytes();
+                }
+                if done == 100 {
+                    ctrl.stress_ws100 = private_working_set_bytes();
+                }
+                ctrl.remaining = ctrl.remaining.saturating_sub(1);
+                if ctrl.remaining == 0 {
+                    quit = true;
+                }
+            }
+        }
+    });
+    if quit {
+        cx.quit();
+        return;
+    }
+    // Yield a frame so hide settles, then next iteration.
+    cx.spawn(async move |cx| {
+        Timer::after(Duration::from_millis(16)).await;
+        let _ = cx.update(start_bench_iteration);
+    })
+    .detach();
 }
 
 fn run_tray() -> Result<()> {
@@ -459,7 +823,8 @@ pub(crate) fn complete_region_shot(
     perf: Option<PerfSession>,
     cx: &mut App,
 ) {
-    if result.confirmed {
+    let bench = crate::overlay::bench_auto_hide_enabled();
+    if result.confirmed && !bench {
         if let Some(cap) = cap {
             match crop_from_app(cx, &cap, result.x, result.y, result.w, result.h) {
                 Ok((px, cw, ch, stride)) => {
@@ -471,10 +836,23 @@ pub(crate) fn complete_region_shot(
             }
         }
     }
+    let mut sample = None;
     if let Some(perf) = perf {
+        if bench {
+            sample = perf.delta_ms("T2", "T7");
+            if sample.is_none() {
+                eprintln!("bench: missing T2/T7 marks (T6=WaitForCommit T7=sentinel)");
+            }
+        }
         let _ = perf.write_log();
     }
     BUSY.store(false, Ordering::SeqCst);
+    if bench {
+        match sample {
+            Some(ms) => on_bench_sample(cx, ms),
+            None => cx.quit(),
+        }
+    }
 }
 
 fn export_pixels(

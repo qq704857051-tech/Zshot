@@ -112,17 +112,13 @@ mod is_hdr_color_space {
 
     #[test]
     fn golden_sdr_lift_channel_error_le_1() {
+        // Shared formula lives in golden.rs — keep this smoke check, do not fork math.
         let sdr_white = 203.0;
-        for v in 0..=255u8 {
-            let x = v as f32 / 255.0;
-            let lifted = white_level_adjust(x, sdr_white, REFERENCE_WHITE_NITS);
-            let got = tonemap_srgb8(lifted, sdr_white);
-            let expected = tonemap_srgb8(x, REFERENCE_WHITE_NITS);
+        for v in [0u8, 40, 80, 128, 200, 255] {
+            let got = crate::golden::mixed_lift_tonemap_channel(v, sdr_white);
+            let expected = tonemap_srgb8(v as f32 / 255.0, REFERENCE_WHITE_NITS);
             let err = (got as i16 - expected as i16).abs();
-            assert!(
-                err <= 1,
-                "v={v} got={got} expected={expected} err={err}"
-            );
+            assert!(err <= 1, "v={v} got={got} expected={expected} err={err}");
         }
     }
 }

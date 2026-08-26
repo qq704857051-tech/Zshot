@@ -6,6 +6,7 @@ pub mod codec;
 pub mod error;
 pub mod exclusive;
 pub mod geom;
+pub mod golden;
 pub mod gpui_bridge;
 pub mod hdr;
 pub mod hotkey;
