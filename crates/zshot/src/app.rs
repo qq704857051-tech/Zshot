@@ -3,13 +3,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 use std::time::Duration;
 
-use gpui::{
-    div, prelude::*, px, rgb, size, App, Application, Focusable, Timer, WindowBackgroundAppearance,
-    WindowBounds, WindowKind, WindowOptions,
-};
+use gpui::{App, Application, Timer};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
@@ -19,32 +15,30 @@ use windows::Win32::System::ProcessStatus::{
 };
 use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::Win32::UI::Shell::{SHGetKnownFolderPath, FOLDERID_Pictures, KF_FLAG_DEFAULT};
+use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, PostMessageW, PostQuitMessage, RegisterClassExW, ShowWindow,
     CS_HREDRAW, CS_VREDRAW, SW_HIDE, WM_DESTROY, WM_HOTKEY, WNDCLASSEXW, WS_OVERLAPPED,
 };
 
-use crate::action_queue::ActionQueue;
 use crate::capture::{
     capture_for_action, crop_sdr_bgra, drop_gpu_resources, prepare_capture, CapturedDesktop,
     GpuShaders,
 };
 use crate::codec::{set_clipboard_dib, write_png_file};
 use crate::error::{Error, Result};
-use crate::gpui_bridge::{drop_freeze_swapchain, open_smoke_overlay};
+use crate::gpui_bridge::drop_freeze_swapchain;
 use crate::hotkey::{HotkeyAction, HotkeyBindings};
-use crate::overlay::{show_overlay, OverlayResult, TextInput};
+use crate::overlay::{show_overlay, OverlayResult};
 use crate::perf::{write_perf_summary, PerfSession};
 use crate::platform::{
-    action_from_wparam, add_tray_icon, handle_tray, install_ll_hook, register_fallback_hotkeys,
-    remove_tray_icon, set_dpi_aware, set_hook_target, uninstall_ll_hook,
-    unregister_fallback_hotkeys, SingleInstance, TrayCommand, WM_TRAYICON, WM_ZSHOT_DISPATCH,
-    WM_ZSHOT_HOTKEY,
+    action_from_wparam, action_wparam, add_tray_icon, handle_tray, install_ll_hook,
+    register_fallback_hotkeys,
+    remove_tray_icon, set_dpi_aware, set_hook_target, taskbar_created_message, uninstall_ll_hook,
+    unregister_fallback_hotkeys, SingleInstance, TrayCommand, WM_TRAYICON, WM_ZSHOT_HOTKEY,
 };
 
 static BUSY: AtomicBool = AtomicBool::new(false);
-static ACTION_TX: Mutex<Option<ActionQueue>> = Mutex::new(None);
-static ACTION_RX: Mutex<Option<std::sync::mpsc::Receiver<HotkeyAction>>> = Mutex::new(None);
 
 thread_local! {
     static GPUI_APP: RefCell<Option<gpui::AsyncApp>> = const { RefCell::new(None) };
@@ -145,8 +139,6 @@ pub fn run() -> Result<()> {
             return once_capture(PathBuf::from(path));
         }
         Some("--self-test") => return self_test(),
-        Some("--overlay-smoke") => return overlay_smoke(),
-        Some("--ime-probe") => return ime_probe(),
         Some("--bench-once") => return bench_once(),
         Some("--bench-overlay") => {
             let mode = arg_value(&args, "--mode").unwrap_or_else(|| "warm".into());
@@ -166,10 +158,6 @@ pub fn run() -> Result<()> {
                 .unwrap_or(100usize);
             return stress_overlay(n);
         }
-        Some("--probe-gpui") => {
-            eprintln!("--probe-gpui removed; use --ime-probe");
-            return Ok(());
-        }
         _ => {}
     }
     run_tray()
@@ -179,28 +167,6 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
     args.iter()
         .position(|a| a == flag)
         .and_then(|i| args.get(i + 1).cloned())
-}
-
-fn overlay_smoke() -> Result<()> {
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-    }
-    set_dpi_aware();
-    let boot_error = std::rc::Rc::new(std::cell::RefCell::new(None::<Error>));
-    Application::new().run({
-        let boot_error = boot_error.clone();
-        move |cx: &mut App| {
-            if let Err(e) = open_smoke_overlay(cx) {
-                eprintln!("{e}");
-                *boot_error.borrow_mut() = Some(e);
-                cx.quit();
-            }
-        }
-    });
-    if let Some(e) = boot_error.borrow_mut().take() {
-        return Err(e);
-    }
-    Ok(())
 }
 
 pub fn once_capture(path: PathBuf) -> Result<()> {
@@ -293,66 +259,6 @@ fn self_test() -> Result<()> {
         return Err(Error::new("self-test did not reach ready"));
     }
     Ok(())
-}
-
-fn ime_probe() -> Result<()> {
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-    }
-    set_dpi_aware();
-    Application::new().run(|cx: &mut App| {
-        let bounds = gpui::Bounds {
-            origin: gpui::point(px(200.), px(200.)),
-            size: size(px(420.), px(80.)),
-        };
-        let _ = cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: None,
-                focus: true,
-                show: true,
-                kind: WindowKind::PopUp,
-                is_movable: true,
-                is_resizable: false,
-                is_minimizable: false,
-                window_background: WindowBackgroundAppearance::Opaque,
-                topmost: true,
-                ..Default::default()
-            },
-            |_window, cx| {
-                cx.new(|cx| {
-                    let input = cx.new(TextInput::new);
-                    ImeProbeView { input }
-                })
-            },
-        );
-        println!("ime-probe ready (type in the field; close window to exit)");
-    });
-    Ok(())
-}
-
-struct ImeProbeView {
-    input: gpui::Entity<TextInput>,
-}
-
-impl Render for ImeProbeView {
-    fn render(
-        &mut self,
-        _window: &mut gpui::Window,
-        cx: &mut gpui::Context<Self>,
-    ) -> impl IntoElement {
-        div()
-            .size_full()
-            .p_2()
-            .bg(rgb(0x1e1e1e))
-            .child(div().w_full().child(self.input.clone()))
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    window.focus(&this.input.focus_handle(cx));
-                }),
-            )
-    }
 }
 
 fn bench_once() -> Result<()> {
@@ -614,7 +520,6 @@ fn run_tray() -> Result<()> {
         unregister_fallback_hotkeys(hwnd);
     }
     uninstall_ll_hook();
-    clear_action_queue();
 
     unbind_gpui_app();
 
@@ -629,10 +534,6 @@ fn boot_resident(
     cleanup_hwnd: std::rc::Rc<std::cell::RefCell<Option<HWND>>>,
 ) -> Result<()> {
     install_gpu_lifecycle(cx);
-    let (queue, rx) = ActionQueue::new();
-    *ACTION_TX.lock().unwrap() = Some(queue);
-    *ACTION_RX.lock().unwrap() = Some(rx);
-
     let hwnd = create_hidden_overlapped_window()?;
     *cleanup_hwnd.borrow_mut() = Some(hwnd);
 
@@ -646,32 +547,16 @@ fn boot_resident(
     Ok(())
 }
 
-fn clear_action_queue() {
-    *ACTION_TX.lock().unwrap() = None;
-    *ACTION_RX.lock().unwrap() = None;
-}
-
-fn enqueue_action(hwnd: HWND, action: HotkeyAction) {
-    if let Ok(guard) = ACTION_TX.lock() {
-        if let Some(queue) = guard.as_ref() {
-            queue.send(action);
-            unsafe {
-                let _ = PostMessageW(Some(hwnd), WM_ZSHOT_DISPATCH, WPARAM(0), LPARAM(0));
-            }
-        }
-    }
-}
-
-fn drain_actions() {
-    let mut guard = match ACTION_RX.lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-    let Some(rx) = guard.as_mut() else {
-        return;
-    };
-    while let Ok(action) = rx.try_recv() {
-        let _ = dispatch_action(action);
+/// Never dispatch inline: this is reached from the LL hook chain (which Windows
+/// times out) and from inside the tray menu's modal loop.
+fn post_action(hwnd: HWND, action: HotkeyAction) {
+    unsafe {
+        let _ = PostMessageW(
+            Some(hwnd),
+            WM_ZSHOT_HOTKEY,
+            WPARAM(action_wparam(action)),
+            LPARAM(0),
+        );
     }
 }
 
@@ -714,43 +599,36 @@ unsafe extern "system" fn hidden_proc(
 ) -> LRESULT {
     if msg == WM_ZSHOT_HOTKEY {
         if let Some(action) = action_from_wparam(wparam.0) {
-            enqueue_action(hwnd, action);
+            let _ = dispatch_action(action);
         }
         return LRESULT(0);
     }
     if msg == WM_HOTKEY {
-        let action = match wparam.0 {
-            1 => Some(HotkeyAction::Region),
-            2 => Some(HotkeyAction::CopyOnly),
-            3 => Some(HotkeyAction::Fullscreen),
-            _ => None,
-        };
-        if let Some(a) = action {
-            enqueue_action(hwnd, a);
+        // RegisterHotKey ids mirror action_wparam.
+        if let Some(action) = action_from_wparam(wparam.0) {
+            post_action(hwnd, action);
         }
+        return LRESULT(0);
+    }
+    if msg == taskbar_created_message() {
+        let _ = add_tray_icon(hwnd);
         return LRESULT(0);
     }
     if msg == WM_TRAYICON {
         if let Some(cmd) = handle_tray(hwnd, lparam) {
             match cmd {
-                TrayCommand::Region => enqueue_action(hwnd, HotkeyAction::Region),
-                TrayCommand::Fullscreen => enqueue_action(hwnd, HotkeyAction::Fullscreen),
-                TrayCommand::CopyOnly => enqueue_action(hwnd, HotkeyAction::CopyOnly),
+                TrayCommand::Region => post_action(hwnd, HotkeyAction::Region),
+                TrayCommand::Fullscreen => post_action(hwnd, HotkeyAction::Fullscreen),
+                TrayCommand::CopyOnly => post_action(hwnd, HotkeyAction::CopyOnly),
                 TrayCommand::Exit => {
                     remove_tray_icon(hwnd);
-                    clear_action_queue();
                     PostQuitMessage(0);
                 }
             }
         }
         return LRESULT(0);
     }
-    if msg == WM_ZSHOT_DISPATCH {
-        drain_actions();
-        return LRESULT(0);
-    }
     if msg == WM_DESTROY {
-        clear_action_queue();
         PostQuitMessage(0);
         return LRESULT(0);
     }
@@ -761,20 +639,16 @@ fn dispatch_action(action: HotkeyAction) -> Result<()> {
     if BUSY.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| take_shot(action)));
-    match result {
-        Ok(Ok(ShotFlow::OverlayOpen)) => Ok(()),
-        Ok(Ok(ShotFlow::Finished)) => {
+    // Overlay flows clear BUSY from complete_region_shot once the user is done.
+    match take_shot(action) {
+        Ok(ShotFlow::OverlayOpen) => Ok(()),
+        Ok(ShotFlow::Finished) => {
             BUSY.store(false, Ordering::SeqCst);
             Ok(())
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             BUSY.store(false, Ordering::SeqCst);
             Err(e)
-        }
-        Err(_) => {
-            BUSY.store(false, Ordering::SeqCst);
-            Err(Error::new("capture panicked"))
         }
     }
 }
@@ -863,6 +737,8 @@ fn export_pixels(
     write_file: bool,
     copy: bool,
 ) -> Result<()> {
+    // Full-screen 4K is ~33 MB; share it with the writer thread instead of cloning.
+    let px = std::sync::Arc::new(px);
     if write_file {
         let path = default_png_path()?;
         let px_file = px.clone();
@@ -886,17 +762,19 @@ fn export_pixels(
 }
 
 fn default_png_path() -> Result<PathBuf> {
-    unsafe {
+    let pictures = unsafe {
         let pw = SHGetKnownFolderPath(&FOLDERID_Pictures, KF_FLAG_DEFAULT, None)?;
-        let pictures = pw.to_string().unwrap_or_else(|_| "Pictures".into());
-        let dir = PathBuf::from(pictures).join("Zshot");
-        std::fs::create_dir_all(&dir)?;
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        Ok(dir.join(format!("zshot-{stamp}.png")))
-    }
+        let s = pw.to_string().unwrap_or_else(|_| "Pictures".into());
+        CoTaskMemFree(Some(pw.0 as *const _));
+        s
+    };
+    let dir = PathBuf::from(pictures).join("Zshot");
+    std::fs::create_dir_all(&dir)?;
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    // Seconds alone collide when two shots land in the same second.
+    Ok(dir.join(format!("zshot-{}-{:03}.png", d.as_secs(), d.subsec_millis())))
 }
 
 fn wide(s: &str) -> Vec<u16> {

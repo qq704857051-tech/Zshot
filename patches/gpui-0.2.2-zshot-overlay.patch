@@ -1,0 +1,536 @@
+diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/app.rs b/src/app.rs
+--- a/src/app.rs	2026-08-26 16:53:05.056235500 +0800
++++ b/src/app.rs	2026-08-26 16:53:05.142688600 +0800
+@@ -1149,6 +1149,46 @@
+         self.platform.should_auto_hide_scrollbars()
+     }
+ 
++    /// Current GPU device generation. Increments when DirectX devices are recreated after a reset.
++    #[cfg(target_os = "windows")]
++    pub fn gpu_generation(&self) -> u64 {
++        self.platform.gpu_generation()
++    }
++
++    /// Adapter LUID `(LowPart, HighPart)` of the GPUI DirectX device, if available.
++    #[cfg(target_os = "windows")]
++    pub fn adapter_luid(&self) -> Option<(u32, i32)> {
++        self.platform.adapter_luid()
++    }
++
++    /// Temporarily borrows the GPUI Direct3D device and immediate context on the main thread.
++    ///
++    /// Returns `None` if the devices are unavailable. Do not clone the immediate context out of
++    /// the closure for long-term storage.
++    #[cfg(target_os = "windows")]
++    pub fn with_gpu_context<R>(
++        &mut self,
++        f: impl FnOnce(
++            &windows::Win32::Graphics::Direct3D11::ID3D11Device,
++            &windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
++        ) -> R,
++    ) -> Option<R> {
++        let mut result = None;
++        let mut f = Some(f);
++        let ok = self.platform.with_gpu_context(&mut |device, context| {
++            if let Some(f) = f.take() {
++                result = Some(f(device, context));
++            }
++        });
++        if ok { result } else { None }
++    }
++
++    /// Registers a callback that runs on the main thread before DirectX devices are recreated.
++    #[cfg(target_os = "windows")]
++    pub fn on_gpu_reset_begin(&self, callback: impl FnMut() + 'static) {
++        self.platform.on_gpu_reset_begin(Box::new(callback));
++    }
++
+     /// Restarts the application.
+     pub fn restart(&mut self) {
+         self.restart_observers
+diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/platform/windows/directx_devices.rs b/src/platform/windows/directx_devices.rs
+--- a/src/platform/windows/directx_devices.rs	2026-08-26 16:53:05.098708200 +0800
++++ b/src/platform/windows/directx_devices.rs	2026-08-26 16:53:05.198425700 +0800
+@@ -87,6 +87,15 @@
+             device_context,
+         })
+     }
++
++    pub(crate) fn adapter_luid(&self) -> Option<(u32, i32)> {
++        let desc = unsafe { self.adapter.GetDesc() }.ok()?;
++        Some((desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart))
++    }
++
++    pub(crate) fn is_available(&self) -> bool {
++        unsafe { self.device.GetDeviceRemovedReason() }.is_ok()
++    }
+ }
+ 
+ #[inline]
+diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/platform/windows/directx_renderer.rs b/src/platform/windows/directx_renderer.rs
+--- a/src/platform/windows/directx_renderer.rs	2026-08-26 16:53:05.099809400 +0800
++++ b/src/platform/windows/directx_renderer.rs	2026-08-26 16:53:05.199436600 +0800
+@@ -92,8 +92,13 @@
+ 
+ struct DirectComposition {
+     comp_device: IDCompositionDevice,
++    // Held so the HWND composition target and visual tree stay alive.
++    #[allow(dead_code)]
+     comp_target: IDCompositionTarget,
+-    comp_visual: IDCompositionVisual,
++    #[allow(dead_code)]
++    root_visual: IDCompositionVisual,
++    freeze_visual: IDCompositionVisual,
++    ui_visual: IDCompositionVisual,
+ }
+ 
+ impl DirectXRendererDevices {
+@@ -171,6 +176,24 @@
+         self.atlas.clone()
+     }
+ 
++    pub(crate) fn set_background_swap_chain(
++        &self,
++        swap: Option<&IDXGISwapChain1>,
++    ) -> Result<()> {
++        let composition = self
++            .direct_composition
++            .as_ref()
++            .context("DirectComposition is disabled")?;
++        composition.set_freeze_swap_chain(swap)
++    }
++
++    pub(crate) fn wait_for_commit_completion(&self) -> Result<()> {
++        if let Some(composition) = self.direct_composition.as_ref() {
++            unsafe { composition.comp_device.WaitForCommitCompletion()? };
++        }
++        Ok(())
++    }
++
+     fn pre_draw(&self) -> Result<()> {
+         update_buffer(
+             &self.devices.device_context,
+@@ -791,19 +814,40 @@
+     pub fn new(dxgi_device: &IDXGIDevice, hwnd: HWND) -> Result<Self> {
+         let comp_device = get_comp_device(dxgi_device)?;
+         let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, true) }?;
+-        let comp_visual = unsafe { comp_device.CreateVisual() }?;
++        let root_visual = unsafe { comp_device.CreateVisual() }?;
++        let freeze_visual = unsafe { comp_device.CreateVisual() }?;
++        let ui_visual = unsafe { comp_device.CreateVisual() }?;
++
++        unsafe {
++            root_visual.AddVisual(&freeze_visual, false, None)?;
++            root_visual.AddVisual(&ui_visual, true, None)?;
++            comp_target.SetRoot(&root_visual)?;
++            comp_device.Commit()?;
++        }
+ 
+         Ok(Self {
+             comp_device,
+             comp_target,
+-            comp_visual,
++            root_visual,
++            freeze_visual,
++            ui_visual,
+         })
+     }
+ 
+     pub fn set_swap_chain(&self, swap_chain: &IDXGISwapChain1) -> Result<()> {
+         unsafe {
+-            self.comp_visual.SetContent(swap_chain)?;
+-            self.comp_target.SetRoot(&self.comp_visual)?;
++            self.ui_visual.SetContent(swap_chain)?;
++            self.comp_device.Commit()?;
++        }
++        Ok(())
++    }
++
++    pub fn set_freeze_swap_chain(&self, swap_chain: Option<&IDXGISwapChain1>) -> Result<()> {
++        unsafe {
++            match swap_chain {
++                Some(swap) => self.freeze_visual.SetContent(swap)?,
++                None => self.freeze_visual.SetContent(None::<&windows::core::IUnknown>)?,
++            }
+             self.comp_device.Commit()?;
+         }
+         Ok(())
+diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/platform/windows/events.rs b/src/platform/windows/events.rs
+--- a/src/platform/windows/events.rs	2026-08-26 16:53:05.100802600 +0800
++++ b/src/platform/windows/events.rs	2026-08-26 16:53:05.200910600 +0800
+@@ -26,6 +26,7 @@
+ pub(crate) const WM_GPUI_FORCE_UPDATE_WINDOW: u32 = WM_USER + 5;
+ pub(crate) const WM_GPUI_KEYBOARD_LAYOUT_CHANGED: u32 = WM_USER + 6;
+ pub(crate) const WM_GPUI_GPU_DEVICE_LOST: u32 = WM_USER + 7;
++pub(crate) const WM_GPUI_GPU_RESET_BEGIN: u32 = WM_USER + 8;
+ 
+ const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
+ const AUTO_HIDE_TASKBAR_THICKNESS_PX: i32 = 1;
+@@ -108,6 +109,8 @@
+             WM_GPUI_CURSOR_STYLE_CHANGED => self.handle_cursor_changed(lparam),
+             WM_GPUI_FORCE_UPDATE_WINDOW => self.draw_window(handle, true),
+             WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
++            // WM_APP + 32 — overlay input-ready sentinel (T7)
++            0x8020 => self.handle_app_ready_sentinel(),
+             _ => None,
+         };
+         if let Some(n) = handled {
+@@ -772,6 +775,16 @@
+         }
+     }
+ 
++    fn handle_app_ready_sentinel(&self) -> Option<isize> {
++        let mut lock = self.state.borrow_mut();
++        if let Some(mut callback) = lock.callbacks.app_ready_sentinel.take() {
++            drop(lock);
++            callback();
++            self.state.borrow_mut().callbacks.app_ready_sentinel = Some(callback);
++        }
++        Some(0)
++    }
++
+     fn handle_dpi_changed_msg(
+         &self,
+         handle: HWND,
+diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/platform/windows/platform.rs b/src/platform/windows/platform.rs
+--- a/src/platform/windows/platform.rs	2026-08-26 16:53:05.101741700 +0800
++++ b/src/platform/windows/platform.rs	2026-08-26 16:53:05.201479700 +0800
+@@ -4,7 +4,10 @@
+     mem::ManuallyDrop,
+     path::{Path, PathBuf},
+     rc::{Rc, Weak},
+-    sync::Arc,
++    sync::{
++        Arc,
++        atomic::{AtomicU64, Ordering},
++    },
+ };
+ 
+ use ::util::{ResultExt, paths::SanitizedPath};
+@@ -48,6 +51,7 @@
+     // The below members will never change throughout the entire lifecycle of the app.
+     validation_number: usize,
+     main_receiver: flume::Receiver<Runnable>,
++    gpu_generation: Arc<AtomicU64>,
+ }
+ 
+ pub(crate) struct WindowsPlatformState {
+@@ -68,6 +72,7 @@
+     will_open_app_menu: Option<Box<dyn FnMut()>>,
+     validate_app_menu_command: Option<Box<dyn FnMut(&dyn Action) -> bool>>,
+     keyboard_layout_change: Option<Box<dyn FnMut()>>,
++    gpu_reset_begin: Option<Box<dyn FnMut()>>,
+ }
+ 
+ impl WindowsPlatformState {
+@@ -653,6 +658,34 @@
+         Task::ready(Err(anyhow!("register_url_scheme unimplemented")))
+     }
+ 
++    fn gpu_generation(&self) -> u64 {
++        self.inner.gpu_generation.load(Ordering::SeqCst)
++    }
++
++    fn adapter_luid(&self) -> Option<(u32, i32)> {
++        self.inner.state.borrow().directx_devices.adapter_luid()
++    }
++
++    fn with_gpu_context(
++        &self,
++        f: &mut dyn FnMut(
++            &windows::Win32::Graphics::Direct3D11::ID3D11Device,
++            &windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
++        ),
++    ) -> bool {
++        let state = self.inner.state.borrow();
++        let devices = &*state.directx_devices;
++        if !devices.is_available() {
++            return false;
++        }
++        f(&devices.device, &devices.device_context);
++        true
++    }
++
++    fn on_gpu_reset_begin(&self, callback: Box<dyn FnMut()>) {
++        self.inner.state.borrow_mut().callbacks.gpu_reset_begin = Some(callback);
++    }
++
+     fn perform_dock_menu_action(&self, action: usize) {
+         unsafe {
+             PostMessageW(
+@@ -684,6 +717,7 @@
+             raw_window_handles: context.raw_window_handles.clone(),
+             validation_number: context.validation_number,
+             main_receiver: context.main_receiver.take().unwrap(),
++            gpu_generation: Arc::new(AtomicU64::new(0)),
+         }))
+     }
+ 
+@@ -699,7 +733,8 @@
+             | WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD
+             | WM_GPUI_DOCK_MENU_ACTION
+             | WM_GPUI_KEYBOARD_LAYOUT_CHANGED
+-            | WM_GPUI_GPU_DEVICE_LOST => self.handle_gpui_events(msg, wparam, lparam),
++            | WM_GPUI_GPU_DEVICE_LOST
++            | WM_GPUI_GPU_RESET_BEGIN => self.handle_gpui_events(msg, wparam, lparam),
+             _ => None,
+         };
+         if let Some(result) = handled {
+@@ -725,6 +760,7 @@
+             WM_GPUI_DOCK_MENU_ACTION => self.handle_dock_action_event(lparam.0 as _),
+             WM_GPUI_KEYBOARD_LAYOUT_CHANGED => self.handle_keyboard_layout_change(),
+             WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
++            WM_GPUI_GPU_RESET_BEGIN => self.handle_gpu_reset_begin(),
+             _ => unreachable!(),
+         }
+     }
+@@ -783,6 +819,15 @@
+         Some(0)
+     }
+ 
++    fn handle_gpu_reset_begin(&self) -> Option<isize> {
++        let callback = self.state.borrow_mut().callbacks.gpu_reset_begin.take();
++        if let Some(mut callback) = callback {
++            callback();
++            self.state.borrow_mut().callbacks.gpu_reset_begin = Some(callback);
++        }
++        Some(0)
++    }
++
+     fn handle_device_lost(&self, lparam: LPARAM) -> Option<isize> {
+         let mut lock = self.state.borrow_mut();
+         let directx_devices = lparam.0 as *const DirectXDevices;
+@@ -791,6 +836,8 @@
+             ManuallyDrop::drop(&mut lock.directx_devices);
+         }
+         lock.directx_devices = ManuallyDrop::new(directx_devices.clone());
++        drop(lock);
++        self.gpu_generation.fetch_add(1, Ordering::SeqCst);
+ 
+         Some(0)
+     }
+@@ -1041,12 +1088,23 @@
+     // If we don't wait, the final drawing result will be blank.
+     std::thread::sleep(std::time::Duration::from_millis(350));
+ 
++    unsafe {
++        SendMessageW(
++            platform_window,
++            WM_GPUI_GPU_RESET_BEGIN,
++            Some(WPARAM(validation_number)),
++            None,
++        );
++    }
++
+     try_to_recover_from_device_lost(
+         || {
+             DirectXDevices::new()
+                 .context("Failed to recreate new DirectX devices after device lost")
+         },
+-        |new_devices| *directx_devices = new_devices,
++        |new_devices| {
++            *directx_devices = new_devices;
++        },
+         || {
+             log::error!("Failed to recover DirectX devices after multiple attempts.");
+             // Do something here?
+diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/platform/windows/window.rs b/src/platform/windows/window.rs
+--- a/src/platform/windows/window.rs	2026-08-26 16:53:05.103921700 +0800
++++ b/src/platform/windows/window.rs	2026-08-26 16:53:05.203074400 +0800
+@@ -337,6 +337,7 @@
+     pub(crate) close: Option<Box<dyn FnOnce()>>,
+     pub(crate) hit_test_window_control: Option<Box<dyn FnMut() -> Option<WindowControlArea>>>,
+     pub(crate) appearance_changed: Option<Box<dyn FnMut()>>,
++    pub(crate) app_ready_sentinel: Option<Box<dyn FnMut()>>,
+ }
+ 
+ struct WindowCreateContext {
+@@ -392,7 +393,11 @@
+         );
+ 
+         let (mut dwexstyle, dwstyle) = if params.kind == WindowKind::PopUp {
+-            (WS_EX_TOOLWINDOW, WINDOW_STYLE(0x0))
++            let mut dwexstyle = WS_EX_TOOLWINDOW;
++            if params.topmost {
++                dwexstyle |= WS_EX_TOPMOST;
++            }
++            (dwexstyle, WINDOW_STYLE(0x0))
+         } else {
+             let mut dwstyle = WS_SYSMENU;
+ 
+@@ -853,6 +858,29 @@
+         self.0.hwnd
+     }
+ 
++    fn set_background_swap_chain(
++        &self,
++        swap: Option<&windows::Win32::Graphics::Dxgi::IDXGISwapChain1>,
++    ) -> Result<()> {
++        self.0
++            .state
++            .borrow()
++            .renderer
++            .set_background_swap_chain(swap)
++    }
++
++    fn wait_for_commit_completion(&self) -> Result<()> {
++        self.0
++            .state
++            .borrow()
++            .renderer
++            .wait_for_commit_completion()
++    }
++
++    fn on_app_ready_sentinel(&self, callback: Box<dyn FnMut()>) {
++        self.0.state.borrow_mut().callbacks.app_ready_sentinel = Some(callback);
++    }
++
+     fn gpu_specs(&self) -> Option<GpuSpecs> {
+         self.0.state.borrow().renderer.gpu_specs().log_err()
+     }
+diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/platform.rs b/src/platform.rs
+--- a/src/platform.rs	2026-08-26 16:53:05.116695300 +0800
++++ b/src/platform.rs	2026-08-26 16:53:05.150702100 +0800
+@@ -273,6 +273,30 @@
+     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout>;
+     fn keyboard_mapper(&self) -> Rc<dyn PlatformKeyboardMapper>;
+     fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>);
++
++    #[cfg(target_os = "windows")]
++    fn gpu_generation(&self) -> u64 {
++        0
++    }
++
++    #[cfg(target_os = "windows")]
++    fn adapter_luid(&self) -> Option<(u32, i32)> {
++        None
++    }
++
++    #[cfg(target_os = "windows")]
++    fn with_gpu_context(
++        &self,
++        _f: &mut dyn FnMut(
++            &::windows::Win32::Graphics::Direct3D11::ID3D11Device,
++            &::windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
++        ),
++    ) -> bool {
++        false
++    }
++
++    #[cfg(target_os = "windows")]
++    fn on_gpu_reset_begin(&self, _callback: Box<dyn FnMut()>) {}
+ }
+ 
+ /// A handle to a platform's display, e.g. a monitor or laptop screen.
+@@ -527,6 +551,22 @@
+     #[cfg(target_os = "windows")]
+     fn get_raw_handle(&self) -> windows::HWND;
+ 
++    #[cfg(target_os = "windows")]
++    fn set_background_swap_chain(
++        &self,
++        _swap: Option<&::windows::Win32::Graphics::Dxgi::IDXGISwapChain1>,
++    ) -> anyhow::Result<()> {
++        anyhow::bail!("set_background_swap_chain is not supported")
++    }
++
++    #[cfg(target_os = "windows")]
++    fn wait_for_commit_completion(&self) -> anyhow::Result<()> {
++        Ok(())
++    }
++
++    #[cfg(target_os = "windows")]
++    fn on_app_ready_sentinel(&self, _callback: Box<dyn FnMut()>) {}
++
+     // Linux specific methods
+     fn inner_window_bounds(&self) -> WindowBounds {
+         self.window_bounds()
+@@ -1132,6 +1172,12 @@
+ 
+     /// Tab group name, allows opening the window as a native tab on macOS 10.12+. Windows with the same tabbing identifier will be grouped together.
+     pub tabbing_identifier: Option<String>,
++
++    /// Whether the window should be created as the topmost window.
++    ///
++    /// On Windows this sets `WS_EX_TOPMOST` at creation time for `WindowKind::PopUp`.
++    /// Defaults to `false` so existing windows do not become topmost.
++    pub topmost: bool,
+ }
+ 
+ /// The variables that can be configured when creating a new window
+@@ -1181,6 +1227,9 @@
+     pub window_min_size: Option<Size<Pixels>>,
+     #[cfg(target_os = "macos")]
+     pub tabbing_identifier: Option<String>,
++
++    #[cfg(target_os = "windows")]
++    pub topmost: bool,
+ }
+ 
+ /// Represents the status of how a window should be opened.
+@@ -1239,6 +1288,7 @@
+             window_min_size: None,
+             window_decorations: None,
+             tabbing_identifier: None,
++            topmost: false,
+         }
+     }
+ }
+diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/window.rs b/src/window.rs
+--- a/src/window.rs	2026-08-26 16:53:05.115040600 +0800
++++ b/src/window.rs	2026-08-26 16:53:05.157726800 +0800
+@@ -948,6 +948,8 @@
+             window_decorations,
+             #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+             tabbing_identifier,
++            #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
++            topmost,
+         } = options;
+ 
+         let bounds = window_bounds
+@@ -968,6 +970,8 @@
+                 window_min_size,
+                 #[cfg(target_os = "macos")]
+                 tabbing_identifier,
++                #[cfg(target_os = "windows")]
++                topmost,
+             },
+         )?;
+ 
+@@ -1791,6 +1795,36 @@
+             .set_background_appearance(background_appearance);
+     }
+ 
++    /// Sets or clears the DirectComposition freeze (background) swap chain.
++    ///
++    /// Pass `None` to detach freeze content. Requires DirectComposition.
++    #[cfg(target_os = "windows")]
++    pub fn set_background_swap_chain(
++        &self,
++        swap: Option<&windows::Win32::Graphics::Dxgi::IDXGISwapChain1>,
++    ) -> anyhow::Result<()> {
++        self.platform_window.set_background_swap_chain(swap)
++    }
++
++    /// Native Win32 HWND for this window.
++    #[cfg(target_os = "windows")]
++    pub fn win32_hwnd(&self) -> windows::Win32::Foundation::HWND {
++        self.platform_window.get_raw_handle()
++    }
++
++    /// Block until DirectComposition has finished the last `Commit`.
++    #[cfg(target_os = "windows")]
++    pub fn wait_for_commit_completion(&self) -> anyhow::Result<()> {
++        self.platform_window.wait_for_commit_completion()
++    }
++
++    /// Called when WndProc receives `WM_APP+32` (0x8020), used as the overlay ready sentinel.
++    #[cfg(target_os = "windows")]
++    pub fn on_app_ready_sentinel(&self, callback: impl FnMut() + 'static) {
++        self.platform_window
++            .on_app_ready_sentinel(Box::new(callback));
++    }
++
+     /// Mark the window as dirty at the platform level.
+     pub fn set_window_edited(&mut self, edited: bool) {
+         self.platform_window.set_edited(edited);

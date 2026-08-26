@@ -18,7 +18,6 @@ use windows::Win32::Graphics::Dxgi::{IDXGIDevice, IDXGIFactory1};
 use windows::Win32::System::WinRT::Direct3D11::CreateDirect3D11DeviceFromDXGIDevice;
 
 use crate::error::{Error, Result};
-use crate::hdr::REFERENCE_WHITE_NITS;
 
 const TONEMAP_HLSL: &str = r#"
 Texture2D<float4> g_tex : register(t0);
@@ -48,7 +47,9 @@ float4 ps_main(VSOut i) : SV_Target {
 }
 
 float4 ps_copy(VSOut i) : SV_Target {
-    return g_tex.Sample(g_samp, i.uv);
+    // Alpha is forced opaque: desktop sources can hand back 0 and the PNG encoder
+    // writes straight-alpha BGRA, which would save a fully transparent image.
+    return float4(g_tex.Sample(g_samp, i.uv).rgb, 1);
 }
 
 float4 ps_white_lift(VSOut i) : SV_Target {
@@ -125,7 +126,7 @@ pub fn drop_gpu_resources() {
     *FREEZE_TEXTURE.lock().unwrap_or_else(|p| p.into_inner()) = None;
 }
 
-pub(super) struct RestoreGpu<'a>(pub(super) &'a ID3D11DeviceContext);
+pub struct RestoreGpu<'a>(pub &'a ID3D11DeviceContext);
 
 impl Drop for RestoreGpu<'_> {
     fn drop(&mut self) {
@@ -290,7 +291,6 @@ impl Gpu {
                 windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             );
             ctx.Draw(3, 0);
-            let _ = REFERENCE_WHITE_NITS;
         }
         Ok(())
     }
@@ -355,12 +355,17 @@ impl Gpu {
         }
     }
 
+    /// BGRA8 only — every caller reads back `CapturedDesktop::sdr_display`, which
+    /// `to_sdr_bgra` has already tonemapped.
     pub fn read_bgra(
         &self,
         ctx: &ID3D11DeviceContext,
         src: &ID3D11Texture2D,
     ) -> Result<(Vec<u8>, u32, u32, u32)> {
         let desc = texture_desc(src);
+        if desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
+            return Err(Error::new("read_bgra expects a BGRA8 texture"));
+        }
         let staging = create_texture(
             &self.device,
             desc.Width,
@@ -377,16 +382,14 @@ impl Gpu {
             let stride = mapped.RowPitch;
             let size = stride * desc.Height;
             let slice = std::slice::from_raw_parts(mapped.pData as *const u8, size as usize);
-            let mut pixels = slice.to_vec();
+            let pixels = slice.to_vec();
             ctx.Unmap(&staging, 0);
-            if desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT {
-                pixels = fp16_to_bgra(&pixels, desc.Width, desc.Height, stride);
-                return Ok((pixels, desc.Width, desc.Height, desc.Width * 4));
-            }
             Ok((pixels, desc.Width, desc.Height, stride))
         }
     }
 
+    /// One staging texture, one copy. Called per mouse-move for the magnifier and
+    /// once per export for the full crop, so a second round-trip is not free.
     pub fn read_bgra_region(
         &self,
         ctx: &ID3D11DeviceContext,
@@ -396,79 +399,11 @@ impl Gpu {
         w: u32,
         h: u32,
     ) -> Result<(Vec<u8>, u32, u32, u32)> {
-        let desc = texture_desc(src);
-        let w = w.min(desc.Width.saturating_sub(x)).max(1);
-        let h = h.min(desc.Height.saturating_sub(y)).max(1);
-        let staging = create_texture(
-            &self.device,
-            w,
-            h,
-            desc.Format,
-            Default::default(),
-            D3D11_USAGE_STAGING,
-            D3D11_CPU_ACCESS_READ.0 as u32,
-        )?;
-        unsafe {
-            let box_ = D3D11_BOX {
-                left: x,
-                top: y,
-                front: 0,
-                right: x + w,
-                bottom: y + h,
-                back: 1,
-            };
-            ctx.CopySubresourceRegion(&staging, 0, 0, 0, 0, src, 0, Some(&box_));
+        if texture_desc(src).Format != DXGI_FORMAT_B8G8R8A8_UNORM {
+            return Err(Error::new("read_bgra_region expects a BGRA8 texture"));
         }
-        self.read_bgra(ctx, &staging)
+        self.read_raw_region(ctx, src, x, y, w, h)
     }
-}
-
-fn fp16_to_bgra(src: &[u8], width: u32, height: u32, stride: u32) -> Vec<u8> {
-    let mut out = vec![0u8; (width * height * 4) as usize];
-    for y in 0..height as usize {
-        for x in 0..width as usize {
-            let i = y * stride as usize + x * 8;
-            if i + 7 >= src.len() {
-                continue;
-            }
-            let r = half_to_f32(u16::from_le_bytes([src[i], src[i + 1]]));
-            let g = half_to_f32(u16::from_le_bytes([src[i + 2], src[i + 3]]));
-            let b = half_to_f32(u16::from_le_bytes([src[i + 4], src[i + 5]]));
-            let a = half_to_f32(u16::from_le_bytes([src[i + 6], src[i + 7]]));
-            let o = (y * width as usize + x) * 4;
-            // CPU path is export-only (PNG/DIB), not the overlay blit.
-            out[o] = crate::hdr::tonemap_srgb8(b, 80.0);
-            out[o + 1] = crate::hdr::tonemap_srgb8(g, 80.0);
-            out[o + 2] = crate::hdr::tonemap_srgb8(r, 80.0);
-            out[o + 3] = (a.clamp(0.0, 1.0) * 255.0) as u8;
-        }
-    }
-    out
-}
-
-fn half_to_f32(h: u16) -> f32 {
-    let sign = ((h >> 15) & 1) as u32;
-    let exp = ((h >> 10) & 0x1f) as u32;
-    let mant = (h & 0x3ff) as u32;
-    let fbits = if exp == 0 {
-        if mant == 0 {
-            sign << 31
-        } else {
-            let mut m = mant;
-            let mut e = 127 - 15;
-            while m & 0x400 == 0 {
-                m <<= 1;
-                e -= 1;
-            }
-            m &= 0x3ff;
-            (sign << 31) | ((e + 1) << 23) | (m << 13)
-        }
-    } else if exp == 31 {
-        (sign << 31) | 0x7f800000 | (mant << 13)
-    } else {
-        (sign << 31) | ((exp + (127 - 15)) << 23) | (mant << 13)
-    };
-    f32::from_bits(fbits)
 }
 
 pub fn texture_desc(tex: &ID3D11Texture2D) -> D3D11_TEXTURE2D_DESC {
@@ -601,12 +536,6 @@ mod golden {
     };
     use windows::Win32::Graphics::Dxgi::IDXGIAdapter;
 
-    #[test]
-    fn white_lift_shader_scales_sdr_white_over_80() {
-        assert!(TONEMAP_HLSL.contains("ps_white_lift"));
-        assert!(TONEMAP_HLSL.contains("sdrWhite / 80.0"));
-    }
-
     fn try_warp_device() -> Option<(ID3D11Device, ID3D11DeviceContext)> {
         let mut device = None;
         let mut ctx = None;
@@ -656,9 +585,9 @@ mod golden {
 
     #[test]
     fn gpu_golden_sdr_lift_channel_error_le_1() {
-        let Some((device, ctx)) = try_warp_device() else {
-            return;
-        };
+        // WARP ships with Windows; a silent `return` here would let this pass
+        // without ever running the shader.
+        let (device, ctx) = try_warp_device().expect("WARP device unavailable");
         let shaders = GpuShaders::compile(0, &device).expect("compile shaders");
         let gpu = Gpu::bind(&device, &shaders);
         let src = solid_bgra(&device, 40, 80, 200, 255).expect("src");

@@ -1,5 +1,4 @@
 use std::sync::mpsc;
-use std::time::Duration;
 
 use windows::core::{Interface, IInspectable};
 use windows::Foundation::TypedEventHandler;
@@ -18,6 +17,7 @@ use crate::error::{Error, Result};
 
 use super::d3d::Gpu;
 use super::monitors::MonitorInfo;
+use super::FRAME_WAIT;
 
 pub struct WgcFrame {
     pub texture: ID3D11Texture2D,
@@ -60,8 +60,8 @@ pub fn start_monitor(gpu: &Gpu, mon: &MonitorInfo, want_hdr: bool) -> Result<Wgc
 pub fn wait_frame(mut pending: WgcPending) -> Result<WgcReady> {
     let frame = pending
         .rx
-        .recv_timeout(Duration::from_secs(10))
-        .map_err(|_| Error::new("WGC timeout after 10 seconds"))?;
+        .recv_timeout(FRAME_WAIT)
+        .map_err(|_| Error::new("WGC produced no frame before the deadline"))?;
     let pool = pending.pool.take();
     let session = pending.session.take();
     let token = pending.token;

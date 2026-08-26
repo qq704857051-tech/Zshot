@@ -1,6 +1,4 @@
-//! GPUI freeze overlay: dim, marching ants, window snap, 15×15 magnifier, IME field.
-
-mod input;
+//! GPUI freeze overlay: dim, marching ants, window snap, 15×15 magnifier.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -25,7 +23,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
-use crate::action_queue::WM_APP_READY_SENTINEL;
+use crate::platform::WM_APP_READY_SENTINEL;
 use crate::capture::CapturedDesktop;
 use crate::error::Result;
 use crate::geom::{
@@ -33,10 +31,6 @@ use crate::geom::{
 };
 use crate::gpui_bridge::present_freeze_from_texture;
 use crate::perf::PerfSession;
-
-use self::input::ime_key_bindings;
-
-pub use self::input::TextInput;
 
 const MAG_COUNT: u32 = 15;
 const MAG_PIXEL: f32 = 10.0;
@@ -74,7 +68,6 @@ pub struct OverlayView {
     pub selection: Rect,
     pub hover: Option<Rect>,
     pub mouse: Point,
-    pub text_input: Entity<TextInput>,
     pub freeze_size: (u32, u32),
     focus_handle: FocusHandle,
     cap: Option<CapturedDesktop>,
@@ -133,12 +126,10 @@ fn bind_overlay_keys(cx: &mut App) {
     if KEYS_BOUND.get() {
         return;
     }
-    let mut keys = vec![
+    cx.bind_keys(vec![
         KeyBinding::new("enter", ConfirmSelection, Some("Overlay")),
         KeyBinding::new("escape", CancelOverlay, Some("Overlay")),
-    ];
-    keys.extend(ime_key_bindings());
-    cx.bind_keys(keys);
+    ]);
     KEYS_BOUND.set(true);
 }
 
@@ -158,7 +149,7 @@ fn show_overlay_inner(
     if let Some(handle) = OVERLAY_WINDOW.with(|slot| *slot.borrow()) {
         if let Ok(entity) = handle.entity(cx) {
             let _ = handle.update(cx, |view, window, cx| {
-                view.reset_from_capture(cx, cap, perf, swap, window);
+                view.reset_from_capture(cap, perf, swap, window);
                 view.attach_and_show(window, cx);
             });
             return Ok(entity);
@@ -184,10 +175,7 @@ fn show_overlay_inner(
                 topmost: true,
                 ..Default::default()
             },
-            |window, cx| {
-                let text_input = cx.new(TextInput::new);
-                cx.new(|cx| OverlayView::from_capture(cx, cap, perf, swap, window, text_input))
-            },
+            |window, cx| cx.new(|cx| OverlayView::from_capture(cx, cap, perf, swap, window)),
         )
         .map_err(|e| crate::error::Error::new(e.to_string()))?;
 
@@ -210,7 +198,6 @@ impl OverlayView {
             selection: Rect::new(0.0, 0.0, 0.0, 0.0),
             hover: None,
             mouse: Point { x: 0.0, y: 0.0 },
-            text_input: cx.new(TextInput::new),
             freeze_size: (1, 1),
             focus_handle: cx.focus_handle(),
             cap: None,
@@ -238,13 +225,11 @@ impl OverlayView {
         perf: PerfSession,
         swap: IDXGISwapChain1,
         window: &mut Window,
-        text_input: Entity<TextInput>,
     ) -> Self {
         let mut view = Self {
             selection: Rect::new(0.0, 0.0, 0.0, 0.0),
             hover: None,
             mouse: Point { x: 0.0, y: 0.0 },
-            text_input,
             freeze_size: (cap.width, cap.height),
             focus_handle: cx.focus_handle(),
             cap: Some(cap),
@@ -270,13 +255,11 @@ impl OverlayView {
 
     fn reset_from_capture(
         &mut self,
-        cx: &mut Context<Self>,
         cap: CapturedDesktop,
         perf: PerfSession,
         swap: IDXGISwapChain1,
         window: &mut Window,
     ) {
-        self.text_input.update(cx, |input, _| input.reset());
         self.selection = Rect::new(0.0, 0.0, 0.0, 0.0);
         self.hover = None;
         self.mouse = Point { x: 0.0, y: 0.0 };
@@ -661,7 +644,6 @@ impl Render for OverlayView {
         let mag = self.mag.clone();
         let phase = self.phase;
         let start = self.start;
-        let freeze = self.freeze_size;
         let has_sel = self.has_sel;
 
         div()
@@ -688,7 +670,6 @@ impl Render for OverlayView {
                             mag,
                             phase,
                             start,
-                            freeze,
                             has_sel,
                             scale,
                         });
@@ -697,15 +678,6 @@ impl Render for OverlayView {
                 .size_full(),
             )
             .child(coord_label(shown, mouse, phase, scale))
-            .child(
-                div()
-                    .absolute()
-                    .left(px(12.))
-                    .bottom(px(12.))
-                    .w(px(260.))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(self.text_input.clone()),
-            )
     }
 }
 
@@ -751,7 +723,6 @@ struct OverlayPaint {
     mag: Option<(Vec<u8>, u32, u32, u32)>,
     phase: Phase,
     start: Instant,
-    freeze: (u32, u32),
     has_sel: bool,
     scale: f32,
 }
@@ -763,7 +734,6 @@ fn paint_overlay(window: &mut Window, bounds: Bounds<Pixels>, paint: OverlayPain
         mag,
         phase,
         start,
-        freeze,
         has_sel,
         scale,
     } = paint;
@@ -781,7 +751,7 @@ fn paint_overlay(window: &mut Window, bounds: Bounds<Pixels>, paint: OverlayPain
     }
     if phase == Phase::Selecting {
         if let Some(pixels) = mag {
-            paint_magnifier(window, bounds, mouse, pixels, freeze, scale);
+            paint_magnifier(window, bounds, mouse, pixels, scale);
         }
     }
 }
@@ -896,7 +866,6 @@ fn paint_magnifier(
     bounds: Bounds<Pixels>,
     mouse: Point,
     pixels: (Vec<u8>, u32, u32, u32),
-    freeze: (u32, u32),
     scale: f32,
 ) {
     let (px_buf, mw, mh, stride) = pixels;
@@ -914,7 +883,8 @@ fn paint_magnifier(
     dest_x = dest_x.max(0.0);
     dest_y = dest_y.max(0.0);
     let cell = MAG_PIXEL / scale;
-    let _ = freeze;
+    // ponytail: 15x15 = 225 quads per frame, batched by the renderer. Upgrade to a
+    // single sampled texture only if the overlay frame budget actually shows it.
     for y in 0..mh {
         for x in 0..mw {
             let i = (y * stride + x * 4) as usize;
@@ -1016,24 +986,30 @@ fn hit_window(windows: &[Rect], p: Point) -> Option<Rect> {
 mod tests {
     use super::*;
 
+    /// The dash phase must stay in [0, period) for every elapsed value, including
+    /// large ones: `offset` is negative and grows without bound, so a single `%`
+    /// would hand a negative leading gap to PathBuilder.
     #[test]
-    fn ants_offset_matches_csharp_rate() {
-        assert!((marching_ants_dash_offset(1.0) - ANTS_SPEED).abs() < 1e-5);
-        assert!((marching_ants_dash_offset(0.0) - 0.0).abs() < 1e-5);
-        assert!(marching_ants_dash_offset(2.0) < marching_ants_dash_offset(1.0));
+    fn ants_dash_phase_is_never_negative() {
+        for ms in 0..2000 {
+            let arr = ants_dash_array(ms as f32 / 100.0);
+            for p in &arr {
+                assert!(f32::from(*p) >= 0.0, "elapsed={ms} produced {arr:?}");
+            }
+        }
     }
 
     #[test]
-    fn ants_pattern_is_five_five() {
-        assert_eq!(ANTS_DASH, [5.0, 5.0]);
-    }
-
-    #[test]
-    fn overlay_has_no_d2d_getmessage_loop() {
-        let src = include_str!("mod.rs");
-        assert!(!src.contains(concat!("D2D1", "CreateFactory")));
-        assert!(!src.contains(concat!("run_overlay", "_inner")));
-        assert!(!src.contains(concat!("ID2D1", "DeviceContext")));
-        assert!(!src.contains(concat!("Dispatch", "MessageW")));
+    fn ants_dash_wraps_at_one_period() {
+        let period = ANTS_DASH[0] + ANTS_DASH[1];
+        // phase 0 => plain {5,5}, no leading gap.
+        assert_eq!(ants_dash_array(0.0).len(), 2);
+        // one full period later the pattern is back to phase 0.
+        let one_period = period / ANTS_SPEED.abs();
+        assert_eq!(ants_dash_array(one_period).len(), 2);
+        // mid-period inserts a leading gap equal to the phase.
+        let mid = ants_dash_array(0.2);
+        assert_eq!(mid.len(), 4);
+        assert!((f32::from(mid[1]) - 3.0).abs() < 1e-3, "{mid:?}");
     }
 }

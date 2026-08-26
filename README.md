@@ -10,10 +10,7 @@ Default Release links the **GPUI Overlay** path: single HWND, dual DirectComposi
 cargo build --release
 ```
 
-Produces:
-
-- `target/release/Zshot.exe`
-- `target/release/Zshot_Ocr.exe` (placeholder worker; Phase 1 name avoids Cargo's `.` bin restriction)
+Produces `target/release/Zshot.exe`.
 
 ## Run
 
@@ -29,8 +26,6 @@ Flags:
 
 - `--once-capture [path]` capture the focused monitor to PNG and exit
 - `--self-test` init tray/hook under GPUI, print `zshot-ready hook=... tray=...`, exit 0
-- `--overlay-smoke` open a dual-visual smoke window briefly, then quit
-- `--ime-probe` PopUp window with a single-line IME `TextInput` (manual typing probe)
 - `--bench-overlay --mode first|warm --n N` T2→T7 overlay latency samples → `%LOCALAPPDATA%\Zshot\logs\perf-summary.json`
 - `--stress-overlay N` loop overlay show/hide; sample Private Working Set at iterations 10 and 100
 
@@ -38,9 +33,10 @@ PNGs go to `Pictures\Zshot`. Timing marks T0–T7 append to `%LOCALAPPDATA%\Zsho
 
 ## Phase 1 notes
 
-- Capture: WGC first, `DXGI DuplicateOutput1` on failure / timeout / near-black / exclusive fullscreen (same-adapter only)
+- Capture: WGC first, `DXGI DuplicateOutput1` on failure / timeout / near-black / exclusive fullscreen (same-adapter only). Each monitor gets 500 ms to hand back a frame.
 - Overlay freeze is a composition swapchain on DComp visual 0 (no full-frame CPU blit)
 - Exclusive-fullscreen region: grab the game frame, then force the freeze overlay
 - Not in this PoC: annotation editor, OCR, translation, long capture, AVIF/JXL/UHDR
+- The vendored GPUI delta is `patches/gpui-0.2.2-zshot-overlay.patch` (293 added lines / 8 files); see `patches/README.md` before upgrading gpui
 
 Decision record: `F:\own\Zshot\docs\Phase1-GPUI-Overlay决策记录.md`

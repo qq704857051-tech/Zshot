@@ -85,7 +85,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod is_hdr_color_space {
+mod color_space_tests {
     use super::*;
     use windows::Win32::Graphics::Dxgi::Common::{
         DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
@@ -110,15 +110,21 @@ mod is_hdr_color_space {
         assert!((white_level_adjust(1.0, 203.0, 80.0) - 203.0 / 80.0).abs() < 1e-5);
     }
 
+    /// Lifting SDR into scRGB at the display's white level and tonemapping back
+    /// must round-trip: this is the mixed HDR/SDR composite path.
     #[test]
-    fn golden_sdr_lift_channel_error_le_1() {
-        // Shared formula lives in golden.rs — keep this smoke check, do not fork math.
-        let sdr_white = 203.0;
-        for v in [0u8, 40, 80, 128, 200, 255] {
-            let got = crate::golden::mixed_lift_tonemap_channel(v, sdr_white);
-            let expected = tonemap_srgb8(v as f32 / 255.0, REFERENCE_WHITE_NITS);
-            let err = (got as i16 - expected as i16).abs();
-            assert!(err <= 1, "v={v} got={got} expected={expected} err={err}");
+    fn lift_then_tonemap_round_trips_to_input() {
+        for sdr_white in [80.0f32, 203.0, 400.0] {
+            for v in 0..=255u8 {
+                let x = v as f32 / 255.0;
+                let lifted = white_level_adjust(x, sdr_white, REFERENCE_WHITE_NITS);
+                let back = tonemap_srgb8(lifted, sdr_white);
+                let direct = tonemap_srgb8(x, REFERENCE_WHITE_NITS);
+                assert!(
+                    (back as i16 - direct as i16).abs() <= 1,
+                    "sdr_white={sdr_white} v={v} back={back} direct={direct}"
+                );
+            }
         }
     }
 }

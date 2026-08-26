@@ -4,9 +4,9 @@ use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreatePopupMenu, DestroyMenu, GetCursorPos, InsertMenuW, LoadIconW, SetForegroundWindow,
-    TrackPopupMenu, HICON, IDI_APPLICATION, MF_BYPOSITION, MF_STRING, TPM_LEFTALIGN,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_LBUTTONUP, WM_RBUTTONUP,
+    CreatePopupMenu, DestroyMenu, GetCursorPos, InsertMenuW, LoadIconW, RegisterWindowMessageW,
+    SetForegroundWindow, TrackPopupMenu, HICON, IDI_APPLICATION, MF_BYPOSITION, MF_STRING,
+    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_LBUTTONUP, WM_RBUTTONUP,
 };
 
 use crate::error::Result;
@@ -23,6 +23,16 @@ pub enum TrayCommand {
     Fullscreen,
     CopyOnly,
     Exit,
+}
+
+/// Explorer broadcasts this after a restart; every shell icon is gone by then and
+/// has to be re-added, otherwise the tray entry disappears for the process lifetime.
+pub fn taskbar_created_message() -> u32 {
+    static MSG: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MSG.get_or_init(|| unsafe {
+        let name: Vec<u16> = "TaskbarCreated".encode_utf16().chain(std::iter::once(0)).collect();
+        RegisterWindowMessageW(PCWSTR(name.as_ptr()))
+    })
 }
 
 pub fn add_tray_icon(hwnd: HWND) -> Result<()> {

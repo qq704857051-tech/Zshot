@@ -1,4 +1,3 @@
-pub mod action_queue;
 pub mod app;
 pub mod black;
 pub mod capture;
@@ -6,7 +5,6 @@ pub mod codec;
 pub mod error;
 pub mod exclusive;
 pub mod geom;
-pub mod golden;
 pub mod gpui_bridge;
 pub mod hdr;
 pub mod hotkey;

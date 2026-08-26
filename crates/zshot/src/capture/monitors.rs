@@ -1,14 +1,14 @@
 use windows::core::{BOOL, Interface};
 use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
-    DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL, DISPLAYCONFIG_DEVICE_INFO_HEADER,
-    DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SDR_WHITE_LEVEL,
-    QDC_ONLY_ACTIVE_PATHS,
+    DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+    DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+    DISPLAYCONFIG_SDR_WHITE_LEVEL, DISPLAYCONFIG_SOURCE_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
 };
 use windows::Win32::Foundation::{LPARAM, RECT};
 use windows::Win32::Graphics::Dxgi::{IDXGIAdapter1, IDXGIOutput, IDXGIOutput6, DXGI_OUTPUT_DESC1};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, HDC, HMONITOR,
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetSystemMetrics, GetWindowRect, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
@@ -38,13 +38,8 @@ pub struct MonitorInfo {
     pub adapter_luid: Option<(u32, i32)>,
 }
 
-pub fn luid_eq(a: (u32, i32), b: (u32, i32)) -> bool {
-    a == b
-}
-
 pub fn dxgi_allowed(mon: &MonitorInfo, overlay_luid: (u32, i32)) -> bool {
-    mon.adapter_luid
-        .is_some_and(|luid| luid_eq(luid, overlay_luid))
+    mon.adapter_luid == Some(overlay_luid)
 }
 
 pub struct VirtualDesktop {
@@ -112,6 +107,9 @@ pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>> {
         }
     }
 
+    // One QueryDisplayConfig for the whole enumeration, keyed by GDI device name.
+    let white_levels = sdr_white_by_device();
+
     let mut monitors = Vec::new();
     for (handle, rect) in raw {
         let w = rect.right - rect.left;
@@ -127,7 +125,14 @@ pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>> {
                 break;
             }
         }
-        let sdr_white_nits = sdr_white_for_paths().unwrap_or(REFERENCE_WHITE_NITS);
+        let sdr_white_nits = device_name(handle)
+            .and_then(|name| {
+                white_levels
+                    .iter()
+                    .find(|(dev, _)| *dev == name)
+                    .map(|(_, nits)| *nits)
+            })
+            .unwrap_or(REFERENCE_WHITE_NITS);
         monitors.push(MonitorInfo {
             handle,
             x: rect.left,
@@ -149,14 +154,38 @@ fn output_is_hdr(output: &IDXGIOutput) -> Result<bool> {
     Ok(is_hdr_color_space(desc.ColorSpace.0))
 }
 
-fn sdr_white_for_paths() -> Result<f32> {
+/// GDI device name (`\\.\DISPLAY1`) for an HMONITOR, used to pair it with a display path.
+fn device_name(handle: HMONITOR) -> Option<String> {
+    let mut info = MONITORINFOEXW {
+        monitorInfo: MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let ok = unsafe { GetMonitorInfoW(handle, &mut info as *mut _ as *mut MONITORINFO) };
+    if !ok.as_bool() {
+        return None;
+    }
+    Some(wide_to_string(&info.szDevice))
+}
+
+fn wide_to_string(buf: &[u16]) -> String {
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..end])
+}
+
+/// SDR white level per display path, keyed by GDI device name. A single level for
+/// the whole desktop is wrong once one monitor is HDR and another is not.
+fn sdr_white_by_device() -> Vec<(String, f32)> {
+    let mut out = Vec::new();
     unsafe {
         let mut path_count = 0u32;
         let mut mode_count = 0u32;
         if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count).0
             != 0
         {
-            return Ok(REFERENCE_WHITE_NITS);
+            return out;
         }
         let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
         let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
@@ -171,9 +200,21 @@ fn sdr_white_for_paths() -> Result<f32> {
         .0
             != 0
         {
-            return Ok(REFERENCE_WHITE_NITS);
+            return out;
         }
         for path in &paths[..path_count as usize] {
+            let mut src = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+                header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                    r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                    size: std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
+                    adapterId: path.sourceInfo.adapterId,
+                    id: path.sourceInfo.id,
+                },
+                ..Default::default()
+            };
+            if DisplayConfigGetDeviceInfo(&mut src.header) != 0 {
+                continue;
+            }
             let mut sdr = DISPLAYCONFIG_SDR_WHITE_LEVEL {
                 header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
                     r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL,
@@ -183,12 +224,15 @@ fn sdr_white_for_paths() -> Result<f32> {
                 },
                 SDRWhiteLevel: 1000,
             };
-            if DisplayConfigGetDeviceInfo(&mut sdr.header) == 0 && sdr.SDRWhiteLevel > 0 {
-                return Ok(sdr_white_nits_from_displayconfig(sdr.SDRWhiteLevel));
-            }
+            let nits = if DisplayConfigGetDeviceInfo(&mut sdr.header) == 0 && sdr.SDRWhiteLevel > 0 {
+                sdr_white_nits_from_displayconfig(sdr.SDRWhiteLevel)
+            } else {
+                REFERENCE_WHITE_NITS
+            };
+            out.push((wide_to_string(&src.viewGdiDeviceName), nits));
         }
     }
-    Ok(REFERENCE_WHITE_NITS)
+    out
 }
 
 unsafe extern "system" fn enum_proc(
@@ -216,7 +260,10 @@ pub fn foreground_covers_monitor(mon: &MonitorInfo) -> bool {
         }
         let w = rc.right - rc.left;
         let h = rc.bottom - rc.top;
-        (w - mon.w).abs() <= 4 && (h - mon.h).abs() <= 4 && (rc.left - mon.x).abs() <= 4
+        (w - mon.w).abs() <= 4
+            && (h - mon.h).abs() <= 4
+            && (rc.left - mon.x).abs() <= 4
+            && (rc.top - mon.y).abs() <= 4
     }
 }
 

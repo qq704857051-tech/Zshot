@@ -6,7 +6,7 @@ use std::path::Path;
 use std::ptr;
 use std::slice;
 
-use windows::Win32::Foundation::{HANDLE, HWND};
+use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND};
 use windows::Win32::Graphics::Gdi::{BI_RGB, BITMAPINFOHEADER};
 use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, GUID_ContainerFormatPng, GUID_WICPixelFormat32bppBGRA,
@@ -97,6 +97,7 @@ pub fn set_clipboard_dib(pixels: &[u8], width: u32, height: u32, stride: u32) ->
         let hg = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, total)?;
         let ptr = GlobalLock(hg) as *mut u8;
         if ptr.is_null() {
+            let _ = GlobalFree(Some(hg));
             return Err(Error::new("GlobalLock failed for DIB"));
         }
         let header = ptr as *mut BITMAPINFOHEADER;
@@ -118,22 +119,34 @@ pub fn set_clipboard_dib(pixels: &[u8], width: u32, height: u32, stride: u32) ->
             );
         }
         let _ = GlobalUnlock(hg);
-        OpenClipboard(Some(HWND::default()))?;
-        let _ = EmptyClipboard();
-        SetClipboardData(CF_DIB.0 as u32, Some(HANDLE(hg.0)))?;
-        CloseClipboard()?;
-    }
-    Ok(())
-}
 
-pub fn png_signature_ok(bytes: &[u8]) -> bool {
-    bytes.len() >= 8 && bytes[..8] == [137, 80, 78, 71, 13, 10, 26, 10]
+        if let Err(e) = OpenClipboard(Some(HWND::default())) {
+            let _ = GlobalFree(Some(hg));
+            return Err(e.into());
+        }
+        let _ = EmptyClipboard();
+        let handed_over = SetClipboardData(CF_DIB.0 as u32, Some(HANDLE(hg.0)));
+        // Close before reporting: an early return here would leave the whole
+        // system's clipboard locked by this process.
+        let _ = CloseClipboard();
+        match handed_over {
+            // On success the clipboard owns the block; freeing it would be a
+            // double free.
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let _ = GlobalFree(Some(hg));
+                Err(e.into())
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+
+    const SIG: &[u8] = &[137, 80, 78, 71, 13, 10, 26, 10];
 
     #[test]
     fn encode_png_has_signature_and_iend() {
@@ -144,7 +157,7 @@ mod tests {
             0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 255, 255, 255, 255,
         ];
         let bytes = encode_png_bgra(&pixels, 2, 2, 8).expect("png");
-        assert!(png_signature_ok(&bytes), "missing PNG signature");
+        assert_eq!(&bytes[..8], SIG, "missing PNG signature");
         assert!(bytes.windows(4).any(|w| w == b"IEND"));
         assert!(bytes.len() > 32);
     }

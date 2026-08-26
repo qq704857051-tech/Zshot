@@ -1,9 +1,6 @@
 //! Exclusive-fullscreen heuristic. Uncertain cases try WGC first; this only
 //! decides when DXGI duplication should be preferred / forced after a black WGC frame.
 
-/// `SHQueryUserNotificationState` value for a D3D exclusive-fullscreen app.
-pub const QUNS_RUNNING_D3D_FULL_SCREEN: i32 = 3;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExclusiveHints {
     pub foreground_covers_monitor: bool,
@@ -18,10 +15,6 @@ pub fn dxgi_output_is_exclusive(attached_to_desktop: bool, d3d_fullscreen_notifi
     !attached_to_desktop || d3d_fullscreen_notification
 }
 
-pub fn quns_is_d3d_fullscreen(quns: i32) -> bool {
-    quns == QUNS_RUNNING_D3D_FULL_SCREEN
-}
-
 /// True when DXGI reports exclusive ownership, or a covering foreground window
 /// plus a near-black WGC frame (typical exclusive-fullscreen miss).
 pub fn is_exclusive_fullscreen(h: ExclusiveHints) -> bool {
@@ -29,17 +22,6 @@ pub fn is_exclusive_fullscreen(h: ExclusiveHints) -> bool {
         return true;
     }
     h.foreground_covers_monitor && h.wgc_frame_near_black
-}
-
-/// After a WGC attempt: fall back to DuplicateOutput1 on create-failure,
-/// timeout, near-black, or already-known exclusive fullscreen.
-pub fn should_fallback_to_dxgi(
-    exclusive_already: bool,
-    wgc_failed: bool,
-    wgc_timeout: bool,
-    wgc_near_black: bool,
-) -> bool {
-    exclusive_already || wgc_failed || wgc_timeout || wgc_near_black
 }
 
 #[cfg(test)]
@@ -74,24 +56,9 @@ mod tests {
     }
 
     #[test]
-    fn fallback_rules() {
-        assert!(should_fallback_to_dxgi(true, false, false, false));
-        assert!(should_fallback_to_dxgi(false, true, false, false));
-        assert!(should_fallback_to_dxgi(false, false, true, false));
-        assert!(should_fallback_to_dxgi(false, false, false, true));
-        assert!(!should_fallback_to_dxgi(false, false, false, false));
-    }
-
-    #[test]
     fn dxgi_detached_output_is_exclusive() {
         assert!(dxgi_output_is_exclusive(false, false));
         assert!(!dxgi_output_is_exclusive(true, false));
         assert!(dxgi_output_is_exclusive(true, true));
-    }
-
-    #[test]
-    fn quns_d3d_fullscreen_value() {
-        assert!(quns_is_d3d_fullscreen(QUNS_RUNNING_D3D_FULL_SCREEN));
-        assert!(!quns_is_d3d_fullscreen(5));
     }
 }

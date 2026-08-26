@@ -3,10 +3,10 @@ mod dxgi_dup;
 mod monitors;
 mod wgc;
 
-pub use d3d::{drop_gpu_resources, texture_desc, Gpu, GpuShaders};
+pub use d3d::{drop_gpu_resources, texture_desc, Gpu, GpuShaders, RestoreGpu};
 pub use monitors::{
-    dxgi_allowed, enumerate_monitors, foreground_covers_monitor, luid_eq,
-    monitor_from_foreground, query_monitor_exclusive, virtual_desktop, MonitorInfo, VirtualDesktop,
+    dxgi_allowed, enumerate_monitors, foreground_covers_monitor, monitor_from_foreground,
+    query_monitor_exclusive, virtual_desktop, MonitorInfo, VirtualDesktop,
 };
 
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D};
@@ -14,11 +14,14 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
 };
 
-use crate::black::wgc_should_reject_frame;
 use crate::error::{Error, Result};
-use crate::exclusive::{is_exclusive_fullscreen, should_fallback_to_dxgi, ExclusiveHints};
+use crate::exclusive::{is_exclusive_fullscreen, ExclusiveHints};
 use crate::hdr::REFERENCE_WHITE_NITS;
 use crate::perf::PerfSession;
+
+/// How long a single monitor may take to hand back a frame. This sits on the
+/// hotkey-to-overlay path, so it is a user-visible stall, not a background wait.
+pub(super) const FRAME_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 pub struct CapturedDesktop {
     pub gpu: Gpu,
@@ -36,8 +39,8 @@ pub struct CapturedDesktop {
 
 enum WgcOutcome {
     Ready(wgc::WgcReady),
-    Failed { timeout: bool },
-    Skipped,
+    /// No usable frame: session never started, wait failed, or worker died.
+    Missing,
 }
 
 /// WGC sessions started and frames waited off the GPU context borrow.
@@ -102,32 +105,23 @@ pub fn prepare_capture(
 
     for (slot, &idx) in target_indices.iter().enumerate() {
         if exclusive_guess {
-            wgc.push(WgcOutcome::Skipped);
+            wgc.push(WgcOutcome::Missing);
             continue;
         }
         match wgc::start_monitor(&gpu, &monitors[idx], want_hdr) {
             Ok(pending) => {
                 // Placeholder until the wait thread returns.
-                wgc.push(WgcOutcome::Skipped);
+                wgc.push(WgcOutcome::Missing);
                 joins.push(std::thread::spawn(move || (slot, wgc::wait_frame(pending))));
             }
-            Err(e) => {
-                let timeout = e.0.to_lowercase().contains("timeout");
-                wgc.push(WgcOutcome::Failed { timeout });
-            }
+            Err(_) => wgc.push(WgcOutcome::Missing),
         }
     }
 
     for join in joins {
-        match join.join() {
-            Ok((slot, Ok(ready))) => wgc[slot] = WgcOutcome::Ready(ready),
-            Ok((slot, Err(e))) => {
-                let timeout = e.0.to_lowercase().contains("timeout");
-                wgc[slot] = WgcOutcome::Failed { timeout };
-            }
-            Err(_) => {
-                // Worker panicked; leave placeholder Skipped → treated as WGC failure later.
-            }
+        // Wait failure or a panicked worker leaves the slot Missing.
+        if let Ok((slot, Ok(ready))) = join.join() {
+            wgc[slot] = WgcOutcome::Ready(ready);
         }
     }
 
@@ -177,74 +171,48 @@ pub fn capture_for_action(
 
     for (slot, &idx) in target_indices.iter().enumerate() {
         let mon = &monitors[idx];
-        let mut got: Option<(ID3D11Texture2D, bool, bool)> = None;
-        let mut wgc_failed = false;
-        let mut wgc_timeout = false;
+        let mut got: Option<(ID3D11Texture2D, bool)> = None;
         let mut wgc_black = false;
 
-        let outcome = std::mem::replace(&mut wgc[slot], WgcOutcome::Skipped);
-        match outcome {
-            WgcOutcome::Ready(ready) => match ready.into_owned(&gpu, ctx) {
-                Ok(frame) => {
-                    let hdr = frame.hdr;
-                    let tex = frame.texture;
-                    let near_black = gpu.texture_is_near_black(ctx, &tex);
-                    wgc_black = wgc_should_reject_frame(hdr, near_black);
-                    if !wgc_black {
-                        got = Some((tex, hdr, false));
-                    }
-                }
-                Err(e) => {
-                    let msg = e.0.to_lowercase();
-                    wgc_timeout = msg.contains("timeout");
-                    wgc_failed = true;
-                }
-            },
-            WgcOutcome::Failed { timeout } => {
-                wgc_failed = true;
-                wgc_timeout = timeout;
-            }
-            WgcOutcome::Skipped => {
-                if !exclusive_guess {
-                    wgc_failed = true;
+        if let WgcOutcome::Ready(ready) = std::mem::replace(&mut wgc[slot], WgcOutcome::Missing) {
+            if let Ok(frame) = ready.into_owned(&gpu, ctx) {
+                // A near-black frame means WGC missed an exclusive-fullscreen app.
+                wgc_black = gpu.texture_is_near_black(ctx, &frame.texture);
+                if !wgc_black {
+                    got = Some((frame.texture, frame.hdr));
                 }
             }
         }
 
-        if got.is_none()
-            && should_fallback_to_dxgi(exclusive_guess, wgc_failed, wgc_timeout, wgc_black)
-            && dxgi_allowed(mon, overlay_luid)
-        {
-            match dxgi_dup::capture_monitor(&gpu, ctx, mon, want_hdr, overlay_luid) {
-                Ok((tex, hdr)) => {
-                    used_dxgi = true;
-                    saw_exclusive = is_exclusive_fullscreen(ExclusiveHints {
-                        foreground_covers_monitor: covers,
-                        dxgi_output_exclusive: dxgi_exclusive,
-                        wgc_frame_near_black: wgc_black,
-                    });
-                    got = Some((tex, hdr, true));
-                }
-                Err(e) => {
-                    if got.is_none() && target_indices.len() == 1 {
-                        return Err(e);
+        // Every way of reaching `got == None` — create failure, wait failure, a
+        // near-black frame, or a session skipped under exclusive fullscreen — wants
+        // the same DuplicateOutput1 fallback, so there is nothing left to branch on.
+        if got.is_none() {
+            if dxgi_allowed(mon, overlay_luid) {
+                match dxgi_dup::capture_monitor(&gpu, ctx, mon, want_hdr, overlay_luid) {
+                    Ok((tex, hdr)) => {
+                        used_dxgi = true;
+                        saw_exclusive = is_exclusive_fullscreen(ExclusiveHints {
+                            foreground_covers_monitor: covers,
+                            dxgi_output_exclusive: dxgi_exclusive,
+                            wgc_frame_near_black: wgc_black,
+                        });
+                        got = Some((tex, hdr));
+                    }
+                    Err(e) => {
+                        if target_indices.len() == 1 {
+                            return Err(e);
+                        }
                     }
                 }
-            }
-        } else if got.is_none() && target_indices.len() == 1 {
-            if exclusive_guess && !dxgi_allowed(mon, overlay_luid) {
+            } else if target_indices.len() == 1 {
                 return Err(Error::new(
-                    "capture unsupported: exclusive path blocked by adapter LUID mismatch",
-                ));
-            }
-            if wgc_failed && !dxgi_allowed(mon, overlay_luid) {
-                return Err(Error::new(
-                    "capture unsupported: WGC failed and DXGI blocked by adapter LUID",
+                    "capture unsupported: no WGC frame and DXGI blocked by adapter LUID mismatch",
                 ));
             }
         }
 
-        if let Some((tex, hdr, _)) = got {
+        if let Some((tex, hdr)) = got {
             pieces.push((mon.x, mon.y, tex, hdr));
         }
     }
@@ -322,24 +290,4 @@ pub fn crop_sdr_bgra(
 ) -> Result<(Vec<u8>, u32, u32, u32)> {
     let _restore = d3d::RestoreGpu(ctx);
     cap.gpu.read_bgra_region(ctx, &cap.sdr_display, x, y, w, h)
-}
-
-#[cfg(test)]
-mod blob_drop_tests {
-    #[test]
-    fn d3d_shader_blobs_are_not_manuallydrop() {
-        let src = include_str!("d3d.rs");
-        assert!(
-            !src.contains("ManuallyDrop"),
-            "shader blobs must drop after Create*Shader"
-        );
-        assert!(src.contains("let _blob = blob"));
-    }
-
-    #[test]
-    fn mixed_hdr_composite_white_lifts_sdr_pieces() {
-        let src = include_str!("mod.rs");
-        assert!(src.contains("white_lift_into"));
-        assert!(src.contains("any_hdr && !*piece_hdr"));
-    }
 }

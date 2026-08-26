@@ -97,11 +97,6 @@ fn f16_to_f32(h: u16) -> f32 {
     f32::from_bits(fbits)
 }
 
-/// HDR WGC frames are not exempt: a near-black frame is a failed exclusive capture.
-pub fn wgc_should_reject_frame(_hdr: bool, near_black: bool) -> bool {
-    near_black
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,12 +140,5 @@ mod tests {
         buf[4] = 0x00;
         buf[5] = 0x3C;
         assert!(!is_near_black_fp16(&buf, 1, 1, 8));
-    }
-
-    #[test]
-    fn hdr_near_black_is_rejected() {
-        assert!(wgc_should_reject_frame(true, true));
-        assert!(!wgc_should_reject_frame(true, false));
-        assert!(wgc_should_reject_frame(false, true));
     }
 }

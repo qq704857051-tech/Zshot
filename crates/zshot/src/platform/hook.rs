@@ -78,7 +78,7 @@ fn down(vk: u16) -> bool {
     unsafe { GetAsyncKeyState(vk as i32) as u16 & 0x8000 != 0 }
 }
 
-fn action_wparam(action: HotkeyAction) -> usize {
+pub fn action_wparam(action: HotkeyAction) -> usize {
     match action {
         HotkeyAction::Region => 1,
         HotkeyAction::CopyOnly => 2,
