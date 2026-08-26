@@ -364,7 +364,7 @@ impl EntityInputHandler for TextInput {
         self.selected_range = new_selected_range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .map(|new_range| new_range.start + range.start..new_range.end + range.end)
+            .map(|new_range| selection_in_replaced(range.start, new_range))
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
         cx.notify();
     }
@@ -624,6 +624,11 @@ impl Focusable for TextInput {
     }
 }
 
+/// IME caret/selection is relative to the replacement start, not the old range end.
+fn selection_in_replaced(replacement_start: usize, new_range: Range<usize>) -> Range<usize> {
+    new_range.start + replacement_start..new_range.end + replacement_start
+}
+
 #[cfg(test)]
 mod tests {
     fn offset_from_utf16(content: &str, offset: usize) -> usize {
@@ -663,5 +668,15 @@ mod tests {
         assert_eq!("中".len(), 3);
         assert_eq!(offset_to_utf16("中", 3), 1);
         assert_eq!(offset_from_utf16("中", 1), 3);
+    }
+
+    #[test]
+    fn ime_marked_selection_is_offset_from_replacement_start() {
+        let replacement = 2..5;
+        let new_range = 0..2;
+        let got = super::selection_in_replaced(replacement.start, new_range.clone());
+        assert_eq!(got, 2..4);
+        let from_end = new_range.start + replacement.start..new_range.end + replacement.end;
+        assert_ne!(got, from_end);
     }
 }
