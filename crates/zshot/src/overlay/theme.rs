@@ -58,8 +58,8 @@ pub fn transparent() -> Hsla {
     hsla(0.0, 0.0, 0.0, 0.0)
 }
 
-/// ARGB for annotation strokes; matches `accent`.
-pub const ACCENT_ARGB: u32 = 0xFF54_8CFF;
+/// ARGB for annotation strokes.
+pub const STROKE_ARGB: u32 = 0xFFFA_3C3C;
 
 #[cfg(test)]
 mod tests {

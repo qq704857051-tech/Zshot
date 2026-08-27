@@ -55,9 +55,7 @@ fn draw_element(buf: &mut Bgra<'_>, el: &Element) {
         Shape::Rect => draw_rect_outline(buf, el.bounds, color, thick),
         Shape::Arrow { start, end, .. } => {
             if let Some(g) = crate::overlay::editor::filled_arrow(*start, *end, thick) {
-                for (a, b, c) in g.triangles() {
-                    fill_triangle(buf, a, b, c, color);
-                }
+                fill_triangles(buf, &g.triangles(), color);
             }
         }
         Shape::Pen { points } => {
@@ -99,6 +97,24 @@ impl Bgra<'_> {
         self.pixels[i + 1] = c[1];
         self.pixels[i + 2] = c[2];
         self.pixels[i + 3] = c[3];
+    }
+
+    /// Source-over `c` at `coverage` (0..=1) opacity.
+    fn blend(&mut self, x: i32, y: i32, c: [u8; 4], coverage: f64) {
+        let a = coverage * c[3] as f64 / 255.0;
+        if a >= 1.0 {
+            self.put(x, y, c);
+            return;
+        }
+        let dst = self.get(x, y);
+        let mix = |s: u8, d: u8| (s as f64 * a + d as f64 * (1.0 - a)).round() as u8;
+        let out = [
+            mix(c[0], dst[0]),
+            mix(c[1], dst[1]),
+            mix(c[2], dst[2]),
+            mix(c[3], dst[3]),
+        ];
+        self.put(x, y, out);
     }
 
     fn get(&self, x: i32, y: i32) -> [u8; 4] {
@@ -184,15 +200,48 @@ fn draw_rect_outline(buf: &mut Bgra<'_>, r: Rect, c: [u8; 4], thick: f64) {
     draw_line(buf, p3, p0, c, thick);
 }
 
-fn fill_triangle(buf: &mut Bgra<'_>, a: Point, b: Point, c: Point, color: [u8; 4]) {
-    let min_x = a.x.min(b.x).min(c.x).floor() as i32;
-    let max_x = a.x.max(b.x).max(c.x).ceil() as i32;
-    let min_y = a.y.min(b.y).min(c.y).floor() as i32;
-    let max_y = a.y.max(b.y).max(c.y).ceil() as i32;
-    for y in min_y..=max_y {
-        for x in min_x..=max_x {
-            if point_in_triangle(x as f64 + 0.5, y as f64 + 0.5, a, b, c) {
-                buf.put(x, y, color);
+/// Antialiased fill of the *union* of `tris`, one blend per pixel.
+/// Sampling the union (rather than each triangle in turn) keeps shared edges seamless.
+fn fill_triangles(buf: &mut Bgra<'_>, tris: &[(Point, Point, Point)], color: [u8; 4]) {
+    // ponytail: 4x4 box supersampling. Enough for straight edges; go analytic only if 16
+    // samples ever show banding on a near-horizontal edge.
+    const S: i32 = 4;
+    let mut min = Point {
+        x: f64::MAX,
+        y: f64::MAX,
+    };
+    let mut max = Point {
+        x: f64::MIN,
+        y: f64::MIN,
+    };
+    for (a, b, c) in tris {
+        for p in [a, b, c] {
+            min.x = min.x.min(p.x);
+            min.y = min.y.min(p.y);
+            max.x = max.x.max(p.x);
+            max.y = max.y.max(p.y);
+        }
+    }
+    if min.x > max.x {
+        return;
+    }
+    for y in (min.y.floor() as i32)..=(max.y.ceil() as i32) {
+        for x in (min.x.floor() as i32)..=(max.x.ceil() as i32) {
+            let mut hits = 0;
+            for sy in 0..S {
+                for sx in 0..S {
+                    let px = x as f64 + (sx as f64 + 0.5) / S as f64;
+                    let py = y as f64 + (sy as f64 + 0.5) / S as f64;
+                    if tris
+                        .iter()
+                        .any(|(a, b, c)| point_in_triangle(px, py, *a, *b, *c))
+                    {
+                        hits += 1;
+                    }
+                }
+            }
+            if hits > 0 {
+                buf.blend(x, y, color, hits as f64 / (S * S) as f64);
             }
         }
     }
@@ -465,6 +514,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn filled_arrow_edges_are_antialiased() {
+        let (mut px, stride) = solid(64, 32, [0, 0, 0, 255]);
+        let el = Element {
+            id: 4,
+            bounds: Rect::new(2.0, 2.0, 58.0, 28.0),
+            stroke: 0xFFFF_FFFF,
+            stroke_width: 3.0,
+            shape: Shape::Arrow {
+                // Slanted, so every edge crosses pixels partially.
+                start: crate::geom::Point { x: 4.0, y: 4.0 },
+                end: crate::geom::Point { x: 60.0, y: 28.0 },
+                head: 12.0,
+            },
+        };
+        apply_annotations(&mut px, 64, 32, stride, 0.0, 0.0, &[el]);
+        let partial = px
+            .chunks_exact(4)
+            .filter(|p| p[0] > 0 && p[0] < 255)
+            .count();
+        assert!(partial > 20, "expected soft edge pixels, got {partial}");
     }
 
     #[test]

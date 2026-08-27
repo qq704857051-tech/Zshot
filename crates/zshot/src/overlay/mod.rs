@@ -1314,59 +1314,20 @@ fn paint_arrow(
     let Some(g) = filled_arrow(start, end, stroke_w) else {
         return;
     };
-    for (a, b, c) in g.triangles() {
-        paint_filled_triangle(window, a, b, c, scale, color);
-    }
-}
-
-fn paint_filled_triangle(
-    window: &mut Window,
-    a: Point,
-    b: Point,
-    c: Point,
-    scale: f32,
-    color: gpui::Rgba,
-) {
-    let ax = a.x as f32 / scale;
-    let ay = a.y as f32 / scale;
-    let bx = b.x as f32 / scale;
-    let by = b.y as f32 / scale;
-    let cx = c.x as f32 / scale;
-    let cy = c.y as f32 / scale;
-    let min_y = ay.min(by).min(cy).floor() as i32;
-    let max_y = ay.max(by).max(cy).ceil() as i32;
-    let edges = [(ax, ay, bx, by), (bx, by, cx, cy), (cx, cy, ax, ay)];
-    for y_i in min_y..=max_y {
-        let y = y_i as f32 + 0.5;
-        let mut xs = [f32::NAN; 4];
-        let mut n = 0;
-        for (x0, y0, x1, y1) in edges {
-            if n < 4 && ((y0 <= y && y1 > y) || (y1 <= y && y0 > y)) {
-                let t = (y - y0) / (y1 - y0);
-                xs[n] = x0 + t * (x1 - x0);
-                n += 1;
-            }
-        }
-        if n < 2 {
-            continue;
-        }
-        let (x_min, x_max) = if n == 2 {
-            (xs[0].min(xs[1]), xs[0].max(xs[1]))
+    // One filled path, not two triangles: the GPU tessellator antialiases the
+    // outline and the shared neck edge never shows as a seam.
+    let mut path = PathBuilder::fill();
+    for (i, p) in g.outline().into_iter().enumerate() {
+        let p = point(px(p.x as f32 / scale), px(p.y as f32 / scale));
+        if i == 0 {
+            path.move_to(p);
         } else {
-            let lo = xs[0].min(xs[1]).min(xs[2]);
-            let hi = xs[0].max(xs[1]).max(xs[2]);
-            (lo, hi)
-        };
-        if x_max - x_min < 0.5 {
-            continue;
+            path.line_to(p);
         }
-        window.paint_quad(fill(
-            Bounds {
-                origin: point(px(x_min), px(y_i as f32)),
-                size: size(px(x_max - x_min), px(1.0)),
-            },
-            color,
-        ));
+    }
+    path.close();
+    if let Ok(p) = path.build() {
+        window.paint_path(p, color);
     }
 }
 

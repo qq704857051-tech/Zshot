@@ -3,8 +3,8 @@
 
 use crate::geom::{Point, Rect};
 
-pub const DEFAULT_STROKE: u32 = super::theme::ACCENT_ARGB;
-pub const DEFAULT_STROKE_WIDTH: f64 = 3.0;
+pub const DEFAULT_STROKE: u32 = super::theme::STROKE_ARGB;
+pub const DEFAULT_STROKE_WIDTH: f64 = 4.0;
 pub const DEFAULT_MOSAIC_BLOCK: i32 = 16;
 const MIN_KEEP: f64 = 2.0;
 
@@ -486,6 +486,19 @@ pub struct FilledArrow {
 }
 
 impl FilledArrow {
+    /// The arrow as one closed polygon, wound tail -> left flank -> tip -> right flank.
+    /// Rasterizing this instead of `triangles()` avoids a seam at the neck.
+    pub fn outline(self) -> [Point; 6] {
+        [
+            self.tail,
+            self.neck_left,
+            self.left,
+            self.tip,
+            self.right,
+            self.neck_right,
+        ]
+    }
+
     pub fn triangles(self) -> [(Point, Point, Point); 2] {
         [
             (self.tail, self.neck_left, self.neck_right),
