@@ -1381,21 +1381,99 @@ fn paint_arrow(
     let Some(g) = filled_arrow(start, end, stroke_w) else {
         return;
     };
-    // One filled path, not two triangles: the GPU tessellator antialiases the
-    // outline and the shared neck edge never shows as a seam.
-    let mut path = PathBuilder::fill();
-    for (i, p) in g.outline().into_iter().enumerate() {
-        let p = point(px(p.x as f32 / scale), px(p.y as f32 / scale));
-        if i == 0 {
-            path.move_to(p);
-        } else {
-            path.line_to(p);
+    paint_filled_triangles(window, &g.triangles(), scale, color);
+}
+
+/// Scanline fill of the union of `tris`, one alpha-weighted quad per pixel row.
+///
+/// Quads are how everything else in this overlay draws, and gpui antialiases each
+/// quad's own left/right edges. What it cannot do is soften the top and bottom:
+/// rows are integer-aligned, so a plain opaque row per scanline stair-steps down a
+/// slanted edge. Sampling `SUB` sub-rows and folding the covered fraction into the
+/// alpha recovers the vertical gradient. Sampling the union in one pass (rather
+/// than each triangle in turn) keeps the shared neck edge from blending twice.
+fn paint_filled_triangles(
+    window: &mut Window,
+    tris: &[(Point, Point, Point)],
+    scale: f32,
+    color: gpui::Rgba,
+) {
+    let pt = |p: Point| (p.x as f32 / scale, p.y as f32 / scale);
+    let tris: Vec<[(f32, f32); 3]> = tris.iter().map(|(a, b, c)| [pt(*a), pt(*b), pt(*c)]).collect();
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for t in &tris {
+        for v in t {
+            min_y = min_y.min(v.1);
+            max_y = max_y.max(v.1);
         }
     }
-    path.close();
-    if let Ok(p) = path.build() {
-        window.paint_path(p, color);
+    if max_y <= min_y {
+        return;
     }
+    for row in (min_y.floor() as i32)..=(max_y.ceil() as i32) {
+        let Some((lo, hi, alpha)) = scan_row(&tris, row) else {
+            continue;
+        };
+        let mut c = color;
+        c.a *= alpha;
+        window.paint_quad(fill(
+            Bounds {
+                origin: point(px(lo), px(row as f32)),
+                size: size(px(hi - lo), px(1.0)),
+            },
+            c,
+        ));
+    }
+}
+
+/// One pixel row of the fill: its x extent and how much of that extent the shape
+/// actually covers, from `SUB` sub-scanlines. None when the row misses entirely.
+fn scan_row(tris: &[[(f32, f32); 3]], row: i32) -> Option<(f32, f32, f32)> {
+    const SUB: i32 = 4;
+    let mut lo = f32::INFINITY;
+    let mut hi = f32::NEG_INFINITY;
+    let mut covered = 0.0f32;
+    for sub in 0..SUB {
+        let y = row as f32 + (sub as f32 + 0.5) / SUB as f32;
+        // Each triangle is convex, so a scanline crosses it in one span.
+        let mut span: Option<(f32, f32)> = None;
+        for t in tris {
+            let Some((a, b)) = triangle_span(t, y) else {
+                continue;
+            };
+            span = Some(match span {
+                None => (a, b),
+                Some((c, d)) => (c.min(a), d.max(b)),
+            });
+        }
+        if let Some((a, b)) = span {
+            covered += b - a;
+            lo = lo.min(a);
+            hi = hi.max(b);
+        }
+    }
+    if hi <= lo {
+        return None;
+    }
+    Some((lo, hi, (covered / SUB as f32 / (hi - lo)).clamp(0.0, 1.0)))
+}
+
+/// Where scanline `y` enters and leaves a triangle, or None if it misses.
+fn triangle_span(t: &[(f32, f32); 3], y: f32) -> Option<(f32, f32)> {
+    let mut lo = f32::INFINITY;
+    let mut hi = f32::NEG_INFINITY;
+    for i in 0..3 {
+        let (x0, y0) = t[i];
+        let (x1, y1) = t[(i + 1) % 3];
+        if (y0 <= y) == (y1 <= y) {
+            continue;
+        }
+        let x = x0 + (y - y0) / (y1 - y0) * (x1 - x0);
+        lo = lo.min(x);
+        hi = hi.max(x);
+    }
+    (hi > lo).then_some((lo, hi))
 }
 
 fn paint_polyline(
@@ -1802,6 +1880,31 @@ mod tests {
         let (write_file, copy) = complete_export_flags();
         assert!(!write_file);
         assert!(copy);
+    }
+
+    /// The AA that `paint_path` was supposed to provide: a slanted edge has to
+    /// produce rows that are neither empty nor fully opaque.
+    #[test]
+    fn scan_row_softens_a_slanted_edge() {
+        let tri = [[(0.0f32, 0.0f32), (40.0, 20.0), (0.0, 20.0)]];
+        let mut partial = 0;
+        for row in 0..20 {
+            let (lo, hi, alpha) = scan_row(&tri, row).expect("row {row} inside the triangle");
+            assert!(hi > lo);
+            assert!((0.0..=1.0).contains(&alpha));
+            if alpha < 0.999 {
+                partial += 1;
+            }
+        }
+        assert!(partial >= 15, "expected soft rows, got {partial}");
+        assert_eq!(scan_row(&tri, 40), None, "rows below the triangle are empty");
+    }
+
+    #[test]
+    fn scan_row_keeps_a_flat_row_opaque() {
+        let tri = [[(0.0f32, 0.0f32), (40.0, 0.0), (40.0, 20.0)]];
+        let (_, _, alpha) = scan_row(&tri, 10).unwrap();
+        assert!(alpha > 0.9, "vertical/flat edges should stay solid: {alpha}");
     }
 
     #[test]
