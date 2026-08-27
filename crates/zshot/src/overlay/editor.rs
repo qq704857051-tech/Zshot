@@ -363,7 +363,7 @@ impl Session {
             bounds: Rect::new(
                 pt.x,
                 pt.y,
-                (trimmed.len() as f64 * 12.0).max(40.0),
+                (trimmed.chars().count() as f64 * 12.0).max(40.0),
                 28.0,
             ),
             stroke: DEFAULT_STROKE,
@@ -662,6 +662,18 @@ mod tests {
         assert!(s.elements.is_empty());
         s.undo();
         assert_eq!(s.elements.len(), 1);
+    }
+
+    #[test]
+    fn text_bounds_count_characters_not_bytes() {
+        let mut s = Session::new();
+        s.add_text(pt(0.0, 0.0), "你好");
+        let ascii = {
+            let mut t = Session::new();
+            t.add_text(pt(0.0, 0.0), "ab");
+            t.elements[0].bounds.width
+        };
+        assert_eq!(s.elements[0].bounds.width, ascii);
     }
 
     #[test]
