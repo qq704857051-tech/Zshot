@@ -533,7 +533,9 @@ pub fn filled_arrow(start: Point, end: Point, stroke: f64) -> Option<FilledArrow
     let px = -uy;
     let py = ux;
     let stroke = stroke.max(1.0);
-    let neck_half = (stroke * 1.6 + 1.5).max(4.0);
+    // Cap the girth against the length, or a short drag yields a head that is far
+    // wider than it is long -- a T-bar rather than an arrow.
+    let neck_half = ((stroke * 1.6 + 1.5).max(4.0)).min(len * 0.12);
     let head_half = neck_half * 1.85;
     let mut head_len = (neck_half * 2.4).min(len * 0.28);
     head_len = head_len.max(10.0_f64.min(len * 0.45));
@@ -694,6 +696,17 @@ mod tests {
         let half_at_mid = g.neck_width() / 2.0 * t;
         assert!(half_at_mid < g.neck_width() / 2.0 - 1.0);
         assert!(g.tail.x < g.neck_left.x && g.neck_left.x < g.tip.x);
+    }
+
+    #[test]
+    fn short_arrow_head_is_not_wider_than_it_is_long() {
+        let g = filled_arrow(pt(0.0, 0.0), pt(10.0, 0.0), 4.0).unwrap();
+        let head_len = g.tip.x - g.left.x;
+        assert!(
+            g.head_width() <= head_len * 2.0,
+            "head {} wide but only {head_len} long",
+            g.head_width()
+        );
     }
 
     #[test]
