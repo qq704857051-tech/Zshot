@@ -66,6 +66,26 @@ pub fn icon_path(id: &str) -> Option<&'static str> {
     })
 }
 
+/// Hover label. Every `PHASE1_ITEMS` entry needs one; the rest are unreachable
+/// until they ship, so they fall back to the id.
+pub fn label(id: &str) -> &'static str {
+    match id {
+        SELECT => "选择",
+        RECT => "矩形",
+        ARROW => "箭头",
+        PEN => "画笔",
+        MOSAIC => "马赛克",
+        TEXT => "文字",
+        UNDO => "撤销",
+        REDO => "重做",
+        CLEAR => "清空",
+        SAVE => "保存",
+        COMPLETE => "完成",
+        CANCEL => "取消",
+        _ => "",
+    }
+}
+
 pub fn parse_hidden(stored: Option<&str>) -> Vec<String> {
     match stored {
         None => DEFAULT_HIDDEN.iter().map(|s| (*s).to_string()).collect(),
@@ -194,6 +214,13 @@ mod tests {
     fn every_phase1_item_has_an_icon() {
         for id in PHASE1_ITEMS {
             assert!(icon_path(id).is_some(), "{id}");
+        }
+    }
+
+    #[test]
+    fn every_phase1_item_has_a_label() {
+        for id in PHASE1_ITEMS {
+            assert!(!label(id).is_empty(), "{id}");
         }
     }
 }

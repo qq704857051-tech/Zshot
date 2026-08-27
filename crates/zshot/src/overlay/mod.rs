@@ -16,7 +16,7 @@ use gpui::{
     actions, black, canvas, div, fill, hsla, outline, point, prelude::*, px, rgb, size, svg, white,
     App, BorderStyle, Bounds, BoxShadow, Context, CursorStyle, Entity, FocusHandle, Focusable,
     InteractiveElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PathBuilder, Pixels, Point as GpuiPoint, Timer, Window,
+    AnyView, MouseUpEvent, PathBuilder, Pixels, Point as GpuiPoint, SharedString, Timer, Window,
     WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions,
 };
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
@@ -1132,6 +1132,25 @@ impl Render for OverlayView {
     }
 }
 
+/// Hover label for a toolbar button. gpui owns the show delay and placement; this
+/// only has to render the bubble.
+struct ToolLabel(SharedString);
+
+impl Render for ToolLabel {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(6.))
+            .py(px(3.))
+            .rounded_md()
+            .bg(theme::surface())
+            .border_1()
+            .border_color(theme::border())
+            .text_color(theme::primary_fg())
+            .text_size(px(12.))
+            .child(self.0.clone())
+    }
+}
+
 fn toolbar_button(
     id: &'static str,
     active: bool,
@@ -1178,6 +1197,10 @@ fn toolbar_button(
                 .h(px(toolbar::ICON))
                 .text_color(fg),
         )
+        .tooltip(move |_, cx| {
+            let view: AnyView = cx.new(|_| ToolLabel(toolbar::label(id).into())).into();
+            view
+        })
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |view, _, window, cx| {
