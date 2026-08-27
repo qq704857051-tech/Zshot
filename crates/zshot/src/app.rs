@@ -13,6 +13,7 @@ fn gpui_app() -> Application {
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::ProcessStatus::{
     GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
@@ -133,8 +134,20 @@ fn crop_from_app(
     }
 }
 
+/// Release builds are Windows-subsystem, so a shell-launched process starts with
+/// no standard handles and every `println!` goes nowhere. The CLI subcommands
+/// document their output, so borrow the parent's console before producing any.
+fn attach_parent_console() {
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
 pub fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 {
+        attach_parent_console();
+    }
     match args.get(1).map(String::as_str) {
         Some("--once-capture") => {
             let path = args
