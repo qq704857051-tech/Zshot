@@ -36,7 +36,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::platform::WM_APP_READY_SENTINEL;
 use crate::capture::{crop_sdr_bgra, enumerate_monitors, CapturedDesktop};
 use crate::error::Result;
-use crate::overlay::editor::{filled_arrow, Element, PressKind, Session, Shape, Tool};
+use crate::overlay::composite::{element_mask, CoverageMask};
+use crate::overlay::editor::{Element, PressKind, Session, Shape, Tool};
 use crate::overlay::toolbar::PHASE1_ITEMS;
 use crate::geom::{
     hit_test, move_rect, physical_source_rect, resize_rect, Point, Rect, SelectionHitKind,
@@ -106,6 +107,9 @@ struct MosaicTiles {
     covered: Vec<u64>,
 }
 
+/// Cached coverage masks aligned 1:1 with the element list that produced them.
+type MarkMasks = (Vec<Element>, Vec<Option<Rc<CoverageMask>>>);
+
 struct TextDraft {
     pt: Point,
     buf: String,
@@ -139,6 +143,10 @@ pub struct OverlayView {
     /// Last mosaic readback, keyed by the elements that produced it. The overlay
     /// repaints every frame; without this each mosaic costs a GPU readback per frame.
     mosaic_cache: RefCell<Option<(MosaicKey, MosaicTiles)>>,
+    /// Coverage masks for the annotation elements, keyed by the exact element list.
+    /// The overlay repaints every frame for the marching ants; rasterizing the
+    /// strokes again only happens when the annotations actually change.
+    mask_cache: RefCell<Option<MarkMasks>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -263,6 +271,7 @@ impl OverlayView {
             editor: Session::new(),
             text_edit: None,
             mosaic_cache: RefCell::new(None),
+            mask_cache: RefCell::new(None),
         }
     }
 
@@ -298,6 +307,7 @@ impl OverlayView {
             editor: Session::new(),
             text_edit: None,
             mosaic_cache: RefCell::new(None),
+            mask_cache: RefCell::new(None),
         };
         view.sync_from_cap(window);
         view
@@ -327,6 +337,7 @@ impl OverlayView {
         self.mag = None;
         self.editor = Session::new();
         self.text_edit = None;
+        self.mask_cache = RefCell::new(None);
         self.sync_from_cap(window);
     }
 
@@ -902,6 +913,24 @@ impl OverlayView {
         }
     }
 
+    /// Per-element coverage masks, cached against the exact element list. Preview
+    /// and export rasterize from the same masks (`composite::element_mask`), so
+    /// this cache is the only thing standing between the ants animation and
+    /// re-rasterizing every stroke at 60 fps.
+    fn mark_masks(&self, marks: &[Element]) -> Vec<Option<Rc<CoverageMask>>> {
+        if let Some((key, masks)) = self.mask_cache.borrow().as_ref() {
+            if key.as_slice() == marks {
+                return masks.clone();
+            }
+        }
+        let masks: Vec<Option<Rc<CoverageMask>>> = marks
+            .iter()
+            .map(|el| element_mask(el).map(Rc::new))
+            .collect();
+        *self.mask_cache.borrow_mut() = Some((marks.to_vec(), masks.clone()));
+        masks
+    }
+
     /// Pixelated tiles plus the ids of the elements that produced them; an element
     /// missing from that list still needs a placeholder drawn for it.
     /// Pixelated tiles plus the ids of the elements that produced them; an element
@@ -1137,6 +1166,7 @@ impl Render for OverlayView {
         let start = self.start;
         let has_sel = self.has_sel;
         let marks: Vec<Element> = self.editor.visible().cloned().collect();
+        let masks = self.mark_masks(&marks);
         let mosaic = self.mosaic_tiles(cx);
         let tool = self.editor.tool;
         let cursor = match (phase, tool, self.text_edit.is_some()) {
@@ -1186,6 +1216,7 @@ impl Render for OverlayView {
                                     has_sel,
                                     scale,
                                     marks,
+                                    masks,
                                     mosaic,
                                 },
                             );
@@ -1346,6 +1377,7 @@ struct OverlayPaint {
     has_sel: bool,
     scale: f32,
     marks: Vec<Element>,
+    masks: Vec<Option<Rc<CoverageMask>>>,
     mosaic: MosaicTiles,
 }
 
@@ -1359,6 +1391,7 @@ fn paint_overlay(window: &mut Window, bounds: Bounds<Pixels>, paint: OverlayPain
         has_sel,
         scale,
         marks,
+        masks,
         mosaic,
     } = paint;
     let hole = shown.map(|r| rect_to_bounds(r, scale));
@@ -1382,10 +1415,10 @@ fn paint_overlay(window: &mut Window, bounds: Bounds<Pixels>, paint: OverlayPain
                 bounds: rect_to_bounds(r, scale),
             };
             window.with_content_mask(Some(mask), |window| {
-                paint_marks(window, &marks, &mosaic, scale);
+                paint_marks(window, &marks, &masks, &mosaic, scale);
             });
         }
-        None => paint_marks(window, &marks, &mosaic, scale),
+        None => paint_marks(window, &marks, &masks, &mosaic, scale),
     }
     if phase == Phase::Selecting {
         if let Some(pixels) = mag {
@@ -1397,18 +1430,15 @@ fn paint_overlay(window: &mut Window, bounds: Bounds<Pixels>, paint: OverlayPain
 fn paint_marks(
     window: &mut Window,
     marks: &[Element],
+    masks: &[Option<Rc<CoverageMask>>],
     mosaic: &MosaicTiles,
     scale: f32,
 ) {
     for (r, color) in &mosaic.tiles {
         window.paint_quad(fill(rect_to_bounds(*r, scale), rgb(*color)));
     }
-    for el in marks {
-        let stroke = rgb(el.stroke & 0x00FF_FFFF);
+    for (el, mask) in marks.iter().zip(masks.iter()) {
         match &el.shape {
-            Shape::Rect => {
-                paint_rect_outline(window, el.bounds, el.stroke_width, scale, stroke);
-            }
             Shape::Mosaic { .. } => {
                 if !mosaic.covered.contains(&el.id) {
                     window.paint_quad(fill(
@@ -1417,232 +1447,41 @@ fn paint_marks(
                     ));
                 }
             }
-            Shape::Arrow { start, end, head } => {
-                paint_arrow(window, *start, *end, *head, el.stroke_width, scale, stroke);
-            }
-            Shape::Pen { points } => {
-                paint_polyline(window, points, el.stroke_width, scale, stroke);
-            }
-            Shape::Text { text, font_size } => {
-                let _ = (text, font_size);
-                // Text is a GPUI div in the overlay tree; CPU composite handles export.
+            // Text is a GPUI div in the overlay tree; CPU composite handles export.
+            Shape::Text { .. } => {}
+            _ => {
+                if let Some(mask) = mask {
+                    paint_mask(window, mask, scale, rgb(el.stroke & 0x00FF_FFFF));
+                }
             }
         }
     }
 }
 
-fn paint_rect_outline(
-    window: &mut Window,
-    r: Rect,
-    stroke_w: f64,
-    scale: f32,
-    color: gpui::Rgba,
-) {
-    let t = (stroke_w as f32 / scale).max(2.0);
-    let x = r.x as f32 / scale;
-    let y = r.y as f32 / scale;
-    let w = r.width as f32 / scale;
-    let h = r.height as f32 / scale;
-    window.paint_quad(fill(
-        Bounds {
-            origin: point(px(x), px(y)),
-            size: size(px(w.max(t)), px(t)),
-        },
-        color,
-    ));
-    window.paint_quad(fill(
-        Bounds {
-            origin: point(px(x), px(y + h - t)),
-            size: size(px(w.max(t)), px(t)),
-        },
-        color,
-    ));
-    window.paint_quad(fill(
-        Bounds {
-            origin: point(px(x), px(y)),
-            size: size(px(t), px(h.max(t))),
-        },
-        color,
-    ));
-    window.paint_quad(fill(
-        Bounds {
-            origin: point(px(x + w - t), px(y)),
-            size: size(px(t), px(h.max(t))),
-        },
-        color,
-    ));
-}
-
-fn paint_arrow(
-    window: &mut Window,
-    start: Point,
-    end: Point,
-    _head: f64,
-    stroke_w: f64,
-    scale: f32,
-    color: gpui::Rgba,
-) {
-    let Some(g) = filled_arrow(start, end, stroke_w) else {
-        return;
-    };
-    paint_filled_triangles(window, &g.triangles(), scale, color);
-}
-
-/// Scanline fill of the union of `tris`, one alpha-weighted quad per pixel row.
+/// Paint one element's coverage mask as alpha-weighted quads, one per
+/// constant-coverage run of physical pixels.
 ///
-/// Quads are how everything else in this overlay draws, and gpui antialiases each
-/// quad's own left/right edges. What it cannot do is soften the top and bottom:
-/// rows are integer-aligned, so a plain opaque row per scanline stair-steps down a
-/// slanted edge. Sampling `SUB` sub-rows and folding the covered fraction into the
-/// alpha recovers the vertical gradient. Sampling the union in one pass (rather
-/// than each triangle in turn) keeps the shared neck edge from blending twice.
-fn paint_filled_triangles(
-    window: &mut Window,
-    tris: &[(Point, Point, Point)],
-    scale: f32,
-    color: gpui::Rgba,
-) {
-    // Scan in PHYSICAL pixels, not logical ones. Rows converted to logical late keep
-    // every quad edge on an integer physical pixel; scanning logical rows puts the
-    // boundary between adjacent rows on a half pixel at any scale factor that is not
-    // 1, where each row's own edge antialiasing claims half of it and the two only
-    // sum to 0.75 -- a dark seam per row, which reads as the stair-stepping this
-    // whole routine exists to remove.
-    let tris: Vec<[(f32, f32); 3]> = tris
-        .iter()
-        .map(|(a, b, c)| {
-            let pt = |p: Point| (p.x as f32, p.y as f32);
-            [pt(*a), pt(*b), pt(*c)]
-        })
-        .collect();
-    let mut min_y = f32::INFINITY;
-    let mut max_y = f32::NEG_INFINITY;
-    for t in &tris {
-        for v in t {
-            min_y = min_y.min(v.1);
-            max_y = max_y.max(v.1);
-        }
-    }
-    if max_y <= min_y {
-        return;
-    }
-    for row in (min_y.floor() as i32)..=(max_y.ceil() as i32) {
-        let Some((lo, hi, alpha)) = scan_row(&tris, row) else {
-            continue;
-        };
+/// The mask IS the per-pixel coverage the export composite blends
+/// (`composite::element_mask`), so the preview cannot drift from the saved
+/// image. Each run becomes a quad whose logical coordinates are physical/scale,
+/// which `paint_quad` multiplies back by `scale_factor`: at 100%/125%/.../200%
+/// DPI every quad lands exactly on whole device pixels, and the coverage alpha
+/// supplies the antialiasing the quad pipeline itself does not have (plain
+/// filled quads take a hard-edged fast path in the DirectX shader). Runs are
+/// disjoint, so overlapping segments never double-blend -- the mask already
+/// resolved them with max.
+fn paint_mask(window: &mut Window, mask: &CoverageMask, scale: f32, color: gpui::Rgba) {
+    for run in mask.runs() {
         let mut c = color;
-        c.a *= alpha;
+        c.a *= run.alpha as f32 / 255.0;
         window.paint_quad(fill(
             Bounds {
-                origin: point(px(lo / scale), px(row as f32 / scale)),
-                size: size(px((hi - lo) / scale), px(1.0 / scale)),
+                origin: point(px(run.x0 as f32 / scale), px(run.y as f32 / scale)),
+                size: size(px((run.x1 - run.x0) as f32 / scale), px(1.0 / scale)),
             },
             c,
         ));
     }
-}
-
-/// One pixel row of the fill: its x extent and how much of that extent the shape
-/// actually covers, from `SUB` sub-scanlines. None when the row misses entirely.
-fn scan_row(tris: &[[(f32, f32); 3]], row: i32) -> Option<(f32, f32, f32)> {
-    const SUB: i32 = 4;
-    let mut lo = f32::INFINITY;
-    let mut hi = f32::NEG_INFINITY;
-    let mut covered = 0.0f32;
-    for sub in 0..SUB {
-        let y = row as f32 + (sub as f32 + 0.5) / SUB as f32;
-        // Each triangle is convex, so a scanline crosses it in one span.
-        let mut span: Option<(f32, f32)> = None;
-        for t in tris {
-            let Some((a, b)) = triangle_span(t, y) else {
-                continue;
-            };
-            span = Some(match span {
-                None => (a, b),
-                Some((c, d)) => (c.min(a), d.max(b)),
-            });
-        }
-        if let Some((a, b)) = span {
-            covered += b - a;
-            lo = lo.min(a);
-            hi = hi.max(b);
-        }
-    }
-    if hi <= lo {
-        return None;
-    }
-    Some((lo, hi, (covered / SUB as f32 / (hi - lo)).clamp(0.0, 1.0)))
-}
-
-/// Where scanline `y` enters and leaves a triangle, or None if it misses.
-fn triangle_span(t: &[(f32, f32); 3], y: f32) -> Option<(f32, f32)> {
-    let mut lo = f32::INFINITY;
-    let mut hi = f32::NEG_INFINITY;
-    for i in 0..3 {
-        let (x0, y0) = t[i];
-        let (x1, y1) = t[(i + 1) % 3];
-        if (y0 <= y) == (y1 <= y) {
-            continue;
-        }
-        let x = x0 + (y - y0) / (y1 - y0) * (x1 - x0);
-        lo = lo.min(x);
-        hi = hi.max(x);
-    }
-    (hi > lo).then_some((lo, hi))
-}
-
-fn paint_polyline(
-    window: &mut Window,
-    points: &[Point],
-    stroke_w: f64,
-    scale: f32,
-    color: gpui::Rgba,
-) {
-    let hw = (stroke_w / 2.0).max(1.5);
-    if points.len() == 1 {
-        let p = points[0];
-        let a = Point { x: p.x - hw, y: p.y };
-        let b = Point { x: p.x + hw, y: p.y };
-        paint_segment(window, a, b, stroke_w, scale, color);
-        return;
-    }
-    for w in points.windows(2) {
-        paint_segment(window, w[0], w[1], stroke_w, scale, color);
-    }
-}
-
-/// One stroke segment as a quad, fed through the same coverage fill the arrow uses.
-/// Caps overhang by half a width so a bend between two segments has no notch. The
-/// old version stamped an axis-aligned square every half width, which is what left
-/// pen strokes looking blocky no matter how fine the sampling.
-fn paint_segment(
-    window: &mut Window,
-    a: Point,
-    b: Point,
-    stroke_w: f64,
-    scale: f32,
-    color: gpui::Rgba,
-) {
-    let dx = b.x - a.x;
-    let dy = b.y - a.y;
-    let len = (dx * dx + dy * dy).sqrt();
-    let hw = (stroke_w / 2.0).max(1.5);
-    let (ux, uy) = if len > f64::EPSILON {
-        (dx / len, dy / len)
-    } else {
-        (1.0, 0.0)
-    };
-    let (nx, ny) = (-uy * hw, ux * hw);
-    let (ex, ey) = (ux * hw * 0.5, uy * hw * 0.5);
-    let corner = |p: Point, sx: f64, sy: f64, side: f64| Point {
-        x: p.x + sx + nx * side,
-        y: p.y + sy + ny * side,
-    };
-    let a0 = corner(a, -ex, -ey, 1.0);
-    let a1 = corner(a, -ex, -ey, -1.0);
-    let b0 = corner(b, ex, ey, 1.0);
-    let b1 = corner(b, ex, ey, -1.0);
-    paint_filled_triangles(window, &[(a0, a1, b1), (a0, b1, b0)], scale, color);
 }
 
 fn rect_to_bounds(r: Rect, scale: f32) -> Bounds<Pixels> {
@@ -1994,31 +1833,6 @@ mod tests {
         let (write_file, copy) = complete_export_flags();
         assert!(!write_file);
         assert!(copy);
-    }
-
-    /// The AA that `paint_path` was supposed to provide: a slanted edge has to
-    /// produce rows that are neither empty nor fully opaque.
-    #[test]
-    fn scan_row_softens_a_slanted_edge() {
-        let tri = [[(0.0f32, 0.0f32), (40.0, 20.0), (0.0, 20.0)]];
-        let mut partial = 0;
-        for row in 0..20 {
-            let (lo, hi, alpha) = scan_row(&tri, row).expect("row {row} inside the triangle");
-            assert!(hi > lo);
-            assert!((0.0..=1.0).contains(&alpha));
-            if alpha < 0.999 {
-                partial += 1;
-            }
-        }
-        assert!(partial >= 15, "expected soft rows, got {partial}");
-        assert_eq!(scan_row(&tri, 40), None, "rows below the triangle are empty");
-    }
-
-    #[test]
-    fn scan_row_keeps_a_flat_row_opaque() {
-        let tri = [[(0.0f32, 0.0f32), (40.0, 0.0), (40.0, 20.0)]];
-        let (_, _, alpha) = scan_row(&tri, 10).unwrap();
-        assert!(alpha > 0.9, "vertical/flat edges should stay solid: {alpha}");
     }
 
     #[test]

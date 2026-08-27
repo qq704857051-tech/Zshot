@@ -1,4 +1,6 @@
-//! CPU composite of annotations onto a BGRA8 crop. Overlay paint and export share this.
+//! CPU composite of annotations onto a BGRA8 crop. Export blends each element's
+//! coverage mask into the crop; the overlay preview turns the SAME mask into
+//! alpha-weighted quads, so live preview and saved image share one rasterization.
 
 use crate::geom::{Point, Rect};
 use crate::overlay::editor::{Element, Shape};
@@ -50,18 +52,17 @@ pub fn apply_annotations(
 
 fn draw_element(buf: &mut Bgra<'_>, el: &Element) {
     let color = argb_to_bgra(el.stroke);
-    let thick = el.stroke_width.max(1.0);
     match &el.shape {
-        Shape::Rect => draw_rect_outline(buf, el.bounds, color, thick),
-        Shape::Arrow { start, end, .. } => {
-            if let Some(g) = crate::overlay::editor::filled_arrow(*start, *end, thick) {
-                fill_triangles(buf, &g.triangles(), color);
-            }
-        }
-        Shape::Pen { points } => draw_polyline(buf, points, color, thick),
         Shape::Mosaic { points, block_size } => draw_mosaic(buf, points, *block_size),
         Shape::Text { text, font_size } => {
             draw_text(buf, el.bounds, text, *font_size, color);
+        }
+        // Rect, Arrow and Pen all rasterize through the shared coverage mask, so
+        // what the overlay preview shows is what this export writes.
+        _ => {
+            if let Some(mask) = element_mask(el) {
+                blend_mask(buf, &mask, color);
+            }
         }
     }
 }
@@ -124,7 +125,76 @@ impl Bgra<'_> {
     }
 }
 
-fn draw_rect_outline(buf: &mut Bgra<'_>, r: Rect, c: [u8; 4], thick: f64) {
+/// Per-pixel coverage of one element, in the physical-pixel space the export
+/// composite samples. The overlay preview converts this same mask into
+/// alpha-weighted quads, one per constant-coverage run, so the live preview and
+/// the exported crop are the same rasterization on different output targets.
+pub struct CoverageMask {
+    pub x0: i32,
+    pub y0: i32,
+    pub width: usize,
+    pub height: usize,
+    /// Row-major coverage: 0 = untouched, 255 = fully covered.
+    pub data: Vec<u8>,
+}
+
+/// One horizontal span of equal coverage on a physical pixel row. Merging
+/// equal-coverage neighbours keeps the preview's quad count proportional to the
+/// edge length, not the filled area.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoverageRun {
+    pub y: i32,
+    pub x0: i32,
+    pub x1: i32,
+    pub alpha: u8,
+}
+
+impl CoverageMask {
+    /// Runs of equal coverage, row by row. Runs never overlap and every pixel
+    /// they cover lies on the mask's integer pixel grid.
+    pub fn runs(&self) -> Vec<CoverageRun> {
+        let mut out = Vec::new();
+        for row in 0..self.height {
+            let base = row * self.width;
+            let y = self.y0 + row as i32;
+            let mut x = 0;
+            while x < self.width {
+                let a = self.data[base + x];
+                if a == 0 {
+                    x += 1;
+                    continue;
+                }
+                let start = x;
+                while x < self.width && self.data[base + x] == a {
+                    x += 1;
+                }
+                out.push(CoverageRun {
+                    y,
+                    x0: self.x0 + start as i32,
+                    x1: self.x0 + x as i32,
+                    alpha: a,
+                });
+            }
+        }
+        out
+    }
+}
+
+/// Coverage of a single element, or None for shapes with no vector coverage
+/// (mosaic smudges pixels, text is a GPU-side div in the overlay).
+pub fn element_mask(el: &Element) -> Option<CoverageMask> {
+    match &el.shape {
+        Shape::Rect => stroke_mask(&rect_outline_points(el.bounds), el.stroke_width),
+        Shape::Arrow { start, end, .. } => {
+            let g = crate::overlay::editor::filled_arrow(*start, *end, el.stroke_width)?;
+            triangles_mask(&g.triangles())
+        }
+        Shape::Pen { points } => stroke_mask(points, el.stroke_width),
+        Shape::Mosaic { .. } | Shape::Text { .. } => None,
+    }
+}
+
+fn rect_outline_points(r: Rect) -> [Point; 5] {
     let p0 = Point { x: r.x, y: r.y };
     let p1 = Point {
         x: r.x + r.width,
@@ -138,18 +208,19 @@ fn draw_rect_outline(buf: &mut Bgra<'_>, r: Rect, c: [u8; 4], thick: f64) {
         x: r.x,
         y: r.y + r.height,
     };
-    draw_polyline(buf, &[p0, p1, p2, p3, p0], c, thick);
+    [p0, p1, p2, p3, p0]
 }
 
-/// Antialiased polyline: round-capped capsules, coverage from the distance to each
-/// segment. Coverage is accumulated into a mask and blended once per pixel, so
-/// overlapping segments (a pen stroke samples far denser than its own width) do not
-/// darken each other's soft edges.
-fn draw_polyline(buf: &mut Bgra<'_>, pts: &[Point], c: [u8; 4], thick: f64) {
-    let Some(first) = pts.first() else {
-        return;
-    };
-    let r = (thick / 2.0).max(0.5);
+/// Antialiased stroke coverage: round-capped capsules, coverage from the distance
+/// to each segment, so caps and joints come out round. Coverage is accumulated
+/// into the mask with max, so overlapping segments (a pen stroke samples far
+/// denser than its own width) do not darken each other's soft edges.
+///
+/// A lone point is a segment of zero length -- `dist_to_segment` handles that,
+/// so a single dot needs no separate case.
+pub fn stroke_mask(pts: &[Point], thick: f64) -> Option<CoverageMask> {
+    let first = pts.first()?;
+    let r = (thick.max(1.0) / 2.0).max(0.5);
     let pad = r + 1.0;
     let mut min_x = f64::MAX;
     let mut min_y = f64::MAX;
@@ -161,17 +232,16 @@ fn draw_polyline(buf: &mut Bgra<'_>, pts: &[Point], c: [u8; 4], thick: f64) {
         max_x = max_x.max(p.x);
         max_y = max_y.max(p.y);
     }
-    let x0 = ((min_x - pad).floor() as i32).clamp(0, buf.width as i32);
-    let y0 = ((min_y - pad).floor() as i32).clamp(0, buf.height as i32);
-    let x1 = ((max_x + pad).ceil() as i32).clamp(0, buf.width as i32);
-    let y1 = ((max_y + pad).ceil() as i32).clamp(0, buf.height as i32);
+    let x0 = (min_x - pad).floor() as i32;
+    let y0 = (min_y - pad).floor() as i32;
+    let x1 = (max_x + pad).ceil() as i32;
+    let y1 = (max_y + pad).ceil() as i32;
     if x1 <= x0 || y1 <= y0 {
-        return;
+        return None;
     }
-    let w = (x1 - x0) as usize;
-    let mut mask = vec![0u8; w * (y1 - y0) as usize];
-    // A lone point is a segment of zero length -- `dist_to_segment` handles that,
-    // so a single dot needs no separate case.
+    let width = (x1 - x0) as usize;
+    let height = (y1 - y0) as usize;
+    let mut data = vec![0u8; width * height];
     let segments: Vec<(Point, Point)> = if pts.len() == 1 {
         vec![(*first, *first)]
     } else {
@@ -193,25 +263,29 @@ fn draw_polyline(buf: &mut Bgra<'_>, pts: &[Point], c: [u8; 4], thick: f64) {
                 if cov <= 0.0 {
                     continue;
                 }
-                let i = (y - y0) as usize * w + (x - x0) as usize;
-                mask[i] = mask[i].max((cov * 255.0).round() as u8);
+                let i = (y - y0) as usize * width + (x - x0) as usize;
+                data[i] = data[i].max((cov * 255.0).round() as u8);
             }
         }
     }
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let m = mask[(y - y0) as usize * w + (x - x0) as usize];
-            if m > 0 {
-                buf.blend(x, y, c, m as f64 / 255.0);
-            }
-        }
-    }
+    Some(CoverageMask {
+        x0,
+        y0,
+        width,
+        height,
+        data,
+    })
 }
 
-fn fill_triangles(buf: &mut Bgra<'_>, tris: &[(Point, Point, Point)], color: [u8; 4]) {
-    // ponytail: 4x4 box supersampling. Enough for straight edges; go analytic only if 16
-    // samples ever show banding on a near-horizontal edge.
+/// Coverage of the union of `tris` from a 4x4 box supersample. Enough for
+/// straight edges; go analytic only if 16 samples ever show banding on a
+/// near-horizontal edge. Sampling the union in one pass keeps the arrow's
+/// shared neck edge from blending twice.
+pub fn triangles_mask(tris: &[(Point, Point, Point)]) -> Option<CoverageMask> {
     const S: i32 = 4;
+    if tris.is_empty() {
+        return None;
+    }
     let mut min = Point {
         x: f64::MAX,
         y: f64::MAX,
@@ -229,10 +303,17 @@ fn fill_triangles(buf: &mut Bgra<'_>, tris: &[(Point, Point, Point)], color: [u8
         }
     }
     if min.x > max.x {
-        return;
+        return None;
     }
-    for y in (min.y.floor() as i32)..=(max.y.ceil() as i32) {
-        for x in (min.x.floor() as i32)..=(max.x.ceil() as i32) {
+    let x0 = min.x.floor() as i32;
+    let y0 = min.y.floor() as i32;
+    let x1 = max.x.ceil() as i32;
+    let y1 = max.y.ceil() as i32;
+    let width = (x1 - x0 + 1) as usize;
+    let height = (y1 - y0 + 1) as usize;
+    let mut data = vec![0u8; width * height];
+    for y in y0..=y1 {
+        for x in x0..=x1 {
             let mut hits = 0;
             for sy in 0..S {
                 for sx in 0..S {
@@ -247,7 +328,33 @@ fn fill_triangles(buf: &mut Bgra<'_>, tris: &[(Point, Point, Point)], color: [u8
                 }
             }
             if hits > 0 {
-                buf.blend(x, y, color, hits as f64 / (S * S) as f64);
+                let cov = hits as f64 / (S * S) as f64;
+                data[(y - y0) as usize * width + (x - x0) as usize] =
+                    (cov * 255.0).round() as u8;
+            }
+        }
+    }
+    Some(CoverageMask {
+        x0,
+        y0,
+        width,
+        height,
+        data,
+    })
+}
+
+/// Source-over blend of a coverage mask into the crop. One blend per pixel,
+/// matching the max-accumulated mask the preview draws as disjoint quads.
+fn blend_mask(buf: &mut Bgra<'_>, mask: &CoverageMask, c: [u8; 4]) {
+    for row in 0..mask.height {
+        let y = mask.y0 + row as i32;
+        if y < 0 || y >= buf.height as i32 {
+            continue;
+        }
+        for col in 0..mask.width {
+            let m = mask.data[row * mask.width + col];
+            if m > 0 {
+                buf.blend(mask.x0 + col as i32, y, c, m as f64 / 255.0);
             }
         }
     }
@@ -606,6 +713,109 @@ mod tests {
             for x in 0..32u32 {
                 let i = (y * stride + x * 4) as usize;
                 assert_eq!(px[i + 3], 255, "pixel {x},{y} went transparent");
+            }
+        }
+    }
+
+    #[test]
+    fn mask_runs_merge_equal_coverage_and_skip_gaps() {
+        let mask = CoverageMask {
+            x0: 10,
+            y0: 20,
+            width: 4,
+            height: 2,
+            data: vec![0, 7, 7, 0, 3, 0, 9, 9],
+        };
+        assert_eq!(
+            mask.runs(),
+            vec![
+                CoverageRun {
+                    y: 20,
+                    x0: 11,
+                    x1: 13,
+                    alpha: 7,
+                },
+                CoverageRun {
+                    y: 21,
+                    x0: 10,
+                    x1: 11,
+                    alpha: 3,
+                },
+                CoverageRun {
+                    y: 21,
+                    x0: 12,
+                    x1: 14,
+                    alpha: 9,
+                },
+            ]
+        );
+    }
+
+    /// The preview draws `element_mask` as quads; the export blends the same mask.
+    /// A slanted stroke must therefore have partial coverage at its edges -- the
+    /// exact pixels that used to stair-step when the preview scanlined instead.
+    #[test]
+    fn slanted_arrow_mask_has_soft_edges_in_both_axes() {
+        for angle_deg in [0.0_f64, 15.0, 30.0, 45.0, 60.0, 75.0] {
+            let rad = angle_deg.to_radians();
+            let el = Element {
+                id: 5,
+                bounds: Rect::new(0.0, 0.0, 64.0, 64.0),
+                stroke: 0xFFFF_FFFF,
+                stroke_width: 3.0,
+                shape: Shape::Arrow {
+                    start: crate::geom::Point { x: 8.0, y: 32.0 },
+                    end: crate::geom::Point {
+                        x: 8.0 + 48.0 * rad.cos(),
+                        y: 32.0 + 48.0 * rad.sin(),
+                    },
+                    head: 12.0,
+                },
+            };
+            let mask = element_mask(&el).expect("arrow mask");
+            let partial = mask.data.iter().filter(|&&m| m > 0 && m < 255).count();
+            let solid = mask.data.iter().filter(|&&m| m == 255).count();
+            assert!(solid > 10, "{angle_deg}°: no solid interior");
+            assert!(
+                partial > 20,
+                "{angle_deg}°: expected soft edge pixels, got {partial}"
+            );
+            let runs = mask.runs();
+            for w in runs.windows(2) {
+                if w[0].y == w[1].y {
+                    assert!(w[0].x1 <= w[1].x0, "runs overlap: {:?} {:?}", w[0], w[1]);
+                }
+            }
+        }
+    }
+
+    /// Preview and export rasterize from one mask: white-on-black export pixels
+    /// must equal the mask value the preview turns into quad alpha, per pixel.
+    #[test]
+    fn preview_mask_matches_export_pixels() {
+        let el = Element {
+            id: 6,
+            bounds: Rect::new(0.0, 0.0, 64.0, 64.0),
+            stroke: 0xFFFF_FFFF,
+            stroke_width: 4.0,
+            shape: Shape::Pen {
+                points: vec![
+                    crate::geom::Point { x: 6.0, y: 6.0 },
+                    crate::geom::Point { x: 40.0, y: 30.0 },
+                    crate::geom::Point { x: 20.0, y: 56.0 },
+                ],
+            },
+        };
+        let (mut px, stride) = solid(64, 64, [0, 0, 0, 255]);
+        apply_annotations(&mut px, 64, 64, stride, 0.0, 0.0, &[el.clone()]);
+        let mask = element_mask(&el).expect("pen mask");
+        for row in 0..mask.height {
+            for col in 0..mask.width {
+                let m = mask.data[row * mask.width + col];
+                let x = (mask.x0 + col as i32) as u32;
+                let y = (mask.y0 + row as i32) as u32;
+                let i = (y * stride + x * 4) as usize;
+                assert_eq!(px[i], m, "pixel {x},{y}: export vs preview mask");
             }
         }
     }
