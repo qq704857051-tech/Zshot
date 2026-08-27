@@ -700,12 +700,18 @@ impl OverlayView {
     }
 
     fn undo_action(&mut self, _: &UndoEdit, _: &mut Window, cx: &mut Context<Self>) {
-        self.editor.undo();
+        // The draft is not in history, so undoing past it would silently drop the
+        // previous annotation while the text field stayed on screen.
+        if self.text_edit.take().is_none() {
+            self.editor.undo();
+        }
         cx.notify();
     }
 
     fn redo_action(&mut self, _: &RedoEdit, _: &mut Window, cx: &mut Context<Self>) {
-        self.editor.redo();
+        if self.text_edit.is_none() {
+            self.editor.redo();
+        }
         cx.notify();
     }
 
@@ -831,7 +837,13 @@ impl OverlayView {
 
     fn handle_toolbar(&mut self, id: &'static str, window: &mut Window, cx: &mut Context<Self>) {
         // Buttons stop propagation, so `on_mouse_down` never runs for these clicks.
-        if id != toolbar::CANCEL {
+        // Undo/redo/cancel discard the draft instead, matching their keyboard paths.
+        if matches!(id, toolbar::UNDO | toolbar::REDO | toolbar::CANCEL) {
+            if self.text_edit.take().is_some() {
+                cx.notify();
+                return;
+            }
+        } else {
             self.commit_text_draft();
         }
         if let Some(tool) = Tool::from_id(id) {
