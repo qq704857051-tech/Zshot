@@ -16,7 +16,8 @@ use gpui::{
     actions, black, canvas, div, fill, hsla, outline, point, prelude::*, px, rgb, size, svg, white,
     App, BorderStyle, Bounds, BoxShadow, Context, CursorStyle, Entity, FocusHandle, Focusable,
     InteractiveElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    AnyView, MouseUpEvent, PathBuilder, Pixels, Point as GpuiPoint, SharedString, Timer, Window,
+    AnyView, ContentMask, MouseUpEvent, PathBuilder, Pixels, Point as GpuiPoint, SharedString,
+    Timer, Window,
     WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions,
 };
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
@@ -514,6 +515,12 @@ impl OverlayView {
                         self.hit = SelectionHitKind::None;
                     }
                 }
+            }
+            // Drawing tools only start inside the crop. Clipping alone would let a
+            // stroke begin off-frame and appear out of nowhere, and a text caret
+            // placed outside would be invisible while the user typed into it.
+            _ if !self.selection.contains(self.mouse) => {
+                self.down = false;
             }
             _ => match self.editor.pointer_pressed(self.mouse) {
                 PressKind::RequestText => {
@@ -1032,39 +1039,43 @@ impl OverlayView {
         )
     }
 
-    fn committed_text_elements(&self, scale: f32) -> impl IntoIterator<Item = impl IntoElement> {
-        self.editor
+    /// Text annotations live in the element tree, not the canvas, so the paint-time
+    /// content mask does not reach them. Same clip, done with a container: positioned
+    /// on the selection, children placed relative to it, overflow hidden.
+    fn text_layer(&self, scale: f32) -> Option<impl IntoElement> {
+        if !self.has_sel {
+            return None;
+        }
+        let sel = self.selection;
+        let committed: Vec<_> = self
+            .editor
             .elements
             .iter()
-            .filter_map(move |el| {
+            .filter_map(|el| {
                 let Shape::Text { text, font_size } = &el.shape else {
                     return None;
                 };
                 Some(
                     div()
                         .absolute()
-                        .left(px(el.bounds.x as f32 / scale))
-                        .top(px(el.bounds.y as f32 / scale))
+                        .left(px((el.bounds.x - sel.x) as f32 / scale))
+                        .top(px((el.bounds.y - sel.y) as f32 / scale))
                         .text_color(rgb(el.stroke & 0x00FF_FFFF))
                         .text_size(px(*font_size as f32 / scale))
                         .child(text.clone()),
                 )
             })
-            .collect::<Vec<_>>()
-    }
-
-    fn text_field_element(&self, scale: f32) -> Option<impl IntoElement> {
-        let edit = self.text_edit.as_ref()?;
-        let shown = if edit.buf.is_empty() {
-            "|".to_string()
-        } else {
-            format!("{}|", edit.buf)
-        };
-        Some(
+            .collect();
+        let draft = self.text_edit.as_ref().map(|edit| {
+            let shown = if edit.buf.is_empty() {
+                "|".to_string()
+            } else {
+                format!("{}|", edit.buf)
+            };
             div()
                 .absolute()
-                .left(px(edit.pt.x as f32 / scale))
-                .top(px(edit.pt.y as f32 / scale))
+                .left(px((edit.pt.x - sel.x) as f32 / scale))
+                .top(px((edit.pt.y - sel.y) as f32 / scale))
                 .min_w(px(80.))
                 .px(px(4.))
                 .py(px(2.))
@@ -1072,7 +1083,18 @@ impl OverlayView {
                 .text_color(black())
                 .text_sm()
                 .occlude()
-                .child(shown),
+                .child(shown)
+        });
+        Some(
+            div()
+                .absolute()
+                .left(px(sel.x as f32 / scale))
+                .top(px(sel.y as f32 / scale))
+                .w(px(sel.width as f32 / scale))
+                .h(px(sel.height as f32 / scale))
+                .overflow_hidden()
+                .children(committed)
+                .children(draft),
         )
     }
 }
@@ -1148,8 +1170,7 @@ impl Render for OverlayView {
             )
             .child(coord_label(shown, mouse, phase, scale))
             .children(self.toolbar_element(scale, cx))
-            .children(self.text_field_element(scale))
-            .children(self.committed_text_elements(scale))
+            .children(self.text_layer(scale))
     }
 }
 
@@ -1326,7 +1347,20 @@ fn paint_overlay(window: &mut Window, bounds: Bounds<Pixels>, paint: OverlayPain
             paint_handles(window, dest, scale);
         }
     }
-    paint_marks(window, &marks, &mosaic, scale);
+    // Annotations are clipped to the selection: the export composites onto a buffer
+    // that IS the crop, so anything outside it never reaches the saved image. Without
+    // the same clip here the overlay would promise strokes the file does not have.
+    match shown {
+        Some(r) => {
+            let mask = ContentMask {
+                bounds: rect_to_bounds(r, scale),
+            };
+            window.with_content_mask(Some(mask), |window| {
+                paint_marks(window, &marks, &mosaic, scale);
+            });
+        }
+        None => paint_marks(window, &marks, &mosaic, scale),
+    }
     if phase == Phase::Selecting {
         if let Some(pixels) = mag {
             paint_magnifier(window, bounds, mouse, pixels, scale);
