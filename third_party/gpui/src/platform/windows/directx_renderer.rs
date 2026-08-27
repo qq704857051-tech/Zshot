@@ -819,8 +819,17 @@ impl DirectComposition {
         let ui_visual = unsafe { comp_device.CreateVisual() }?;
 
         unsafe {
+            // Z-order, with an explicit reference visual so the intent reads
+            // literally: the UI goes IN FRONT OF the freeze.
+            //
+            // Do not pass None here. With referenceVisual = NULL the meaning of
+            // insertAbove inverts -- per AddVisual's docs, TRUE means "above no
+            // sibling, therefore rendered BELOW all of them". Passing
+            // (freeze, false, None) + (ui, true, None) reads like "freeze behind,
+            // UI on top" but actually puts the opaque freeze frame on top, hiding
+            // every piece of overlay UI.
             root_visual.AddVisual(&freeze_visual, false, None)?;
-            root_visual.AddVisual(&ui_visual, true, None)?;
+            root_visual.AddVisual(&ui_visual, true, Some(&freeze_visual))?;
             comp_target.SetRoot(&root_visual)?;
             comp_device.Commit()?;
         }

@@ -4,7 +4,7 @@
 through `[patch.crates-io]` in the workspace `Cargo.toml`. The vendored tree is
 3.3 MB, but the actual delta is small — keep it that way.
 
-`gpui-0.2.2-zshot-overlay.patch` is that delta: **293 added lines, 17 removed,
+`gpui-0.2.2-zshot-overlay.patch` is that delta: **302 added lines, 17 removed,
 across 8 source files**. Everything else in `third_party/gpui` is pristine
 upstream (with `examples/` and `UPSTREAM.md` excluded from the diff).
 
@@ -20,6 +20,12 @@ upstream (with `examples/` and `UPSTREAM.md` excluded from the diff).
 | `src/platform/windows/directx_devices.rs` | `adapter_luid()` on the device set |
 | `src/platform/windows/directx_renderer.rs` | Second DirectComposition visual + `set_freeze_swap_chain` |
 | `src/platform/windows/events.rs` | `WM_APP+32` ready sentinel and the GPU-reset-begin notification |
+
+`AddVisual` z-order in `directx_renderer.rs` is load-bearing and easy to get
+backwards: with `referenceVisual = NULL` the meaning of `insertAbove` inverts, so
+the UI visual is added with an explicit reference to the freeze visual instead.
+Getting this wrong puts the opaque freeze frame on top and hides every piece of
+overlay UI while every automated gate still passes.
 
 Zshot depends on all of it: the freeze frame is DComp visual 0 under GPUI's own
 UI visual, capture shares GPUI's `ID3D11Device`, and the T7 perf mark is the

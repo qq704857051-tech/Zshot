@@ -1,6 +1,6 @@
 diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/app.rs b/src/app.rs
---- a/src/app.rs	2026-08-26 16:53:05.056235500 +0800
-+++ b/src/app.rs	2026-08-26 16:53:05.142688600 +0800
+--- a/src/app.rs	2026-08-27 09:23:31.492799000 +0800
++++ b/src/app.rs	2026-08-27 09:23:31.639695900 +0800
 @@ -1149,6 +1149,46 @@
          self.platform.should_auto_hide_scrollbars()
      }
@@ -49,8 +49,8 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
      pub fn restart(&mut self) {
          self.restart_observers
 diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/platform/windows/directx_devices.rs b/src/platform/windows/directx_devices.rs
---- a/src/platform/windows/directx_devices.rs	2026-08-26 16:53:05.098708200 +0800
-+++ b/src/platform/windows/directx_devices.rs	2026-08-26 16:53:05.198425700 +0800
+--- a/src/platform/windows/directx_devices.rs	2026-08-27 09:23:31.577475200 +0800
++++ b/src/platform/windows/directx_devices.rs	2026-08-27 09:23:31.705356100 +0800
 @@ -87,6 +87,15 @@
              device_context,
          })
@@ -68,8 +68,8 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
  
  #[inline]
 diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/platform/windows/directx_renderer.rs b/src/platform/windows/directx_renderer.rs
---- a/src/platform/windows/directx_renderer.rs	2026-08-26 16:53:05.099809400 +0800
-+++ b/src/platform/windows/directx_renderer.rs	2026-08-26 16:53:05.199436600 +0800
+--- a/src/platform/windows/directx_renderer.rs	2026-08-27 09:23:31.578474900 +0800
++++ b/src/platform/windows/directx_renderer.rs	2026-08-27 09:23:31.705356100 +0800
 @@ -92,8 +92,13 @@
  
  struct DirectComposition {
@@ -110,7 +110,7 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
      fn pre_draw(&self) -> Result<()> {
          update_buffer(
              &self.devices.device_context,
-@@ -791,19 +814,40 @@
+@@ -791,19 +814,49 @@
      pub fn new(dxgi_device: &IDXGIDevice, hwnd: HWND) -> Result<Self> {
          let comp_device = get_comp_device(dxgi_device)?;
          let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, true) }?;
@@ -120,8 +120,17 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
 +        let ui_visual = unsafe { comp_device.CreateVisual() }?;
 +
 +        unsafe {
++            // Z-order, with an explicit reference visual so the intent reads
++            // literally: the UI goes IN FRONT OF the freeze.
++            //
++            // Do not pass None here. With referenceVisual = NULL the meaning of
++            // insertAbove inverts -- per AddVisual's docs, TRUE means "above no
++            // sibling, therefore rendered BELOW all of them". Passing
++            // (freeze, false, None) + (ui, true, None) reads like "freeze behind,
++            // UI on top" but actually puts the opaque freeze frame on top, hiding
++            // every piece of overlay UI.
 +            root_visual.AddVisual(&freeze_visual, false, None)?;
-+            root_visual.AddVisual(&ui_visual, true, None)?;
++            root_visual.AddVisual(&ui_visual, true, Some(&freeze_visual))?;
 +            comp_target.SetRoot(&root_visual)?;
 +            comp_device.Commit()?;
 +        }
@@ -156,8 +165,8 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
          }
          Ok(())
 diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/platform/windows/events.rs b/src/platform/windows/events.rs
---- a/src/platform/windows/events.rs	2026-08-26 16:53:05.100802600 +0800
-+++ b/src/platform/windows/events.rs	2026-08-26 16:53:05.200910600 +0800
+--- a/src/platform/windows/events.rs	2026-08-27 09:23:31.581011300 +0800
++++ b/src/platform/windows/events.rs	2026-08-27 09:23:31.706881000 +0800
 @@ -26,6 +26,7 @@
  pub(crate) const WM_GPUI_FORCE_UPDATE_WINDOW: u32 = WM_USER + 5;
  pub(crate) const WM_GPUI_KEYBOARD_LAYOUT_CHANGED: u32 = WM_USER + 6;
@@ -193,8 +202,8 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
          &self,
          handle: HWND,
 diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/platform/windows/platform.rs b/src/platform/windows/platform.rs
---- a/src/platform/windows/platform.rs	2026-08-26 16:53:05.101741700 +0800
-+++ b/src/platform/windows/platform.rs	2026-08-26 16:53:05.201479700 +0800
+--- a/src/platform/windows/platform.rs	2026-08-27 09:23:31.582883300 +0800
++++ b/src/platform/windows/platform.rs	2026-08-27 09:23:31.708027300 +0800
 @@ -4,7 +4,10 @@
      mem::ManuallyDrop,
      path::{Path, PathBuf},
@@ -335,8 +344,8 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
              log::error!("Failed to recover DirectX devices after multiple attempts.");
              // Do something here?
 diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/platform/windows/window.rs b/src/platform/windows/window.rs
---- a/src/platform/windows/window.rs	2026-08-26 16:53:05.103921700 +0800
-+++ b/src/platform/windows/window.rs	2026-08-26 16:53:05.203074400 +0800
+--- a/src/platform/windows/window.rs	2026-08-27 09:23:31.586888000 +0800
++++ b/src/platform/windows/window.rs	2026-08-27 09:23:31.709752700 +0800
 @@ -337,6 +337,7 @@
      pub(crate) close: Option<Box<dyn FnOnce()>>,
      pub(crate) hit_test_window_control: Option<Box<dyn FnMut() -> Option<WindowControlArea>>>,
@@ -389,8 +398,8 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
          self.0.state.borrow().renderer.gpu_specs().log_err()
      }
 diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/platform.rs b/src/platform.rs
---- a/src/platform.rs	2026-08-26 16:53:05.116695300 +0800
-+++ b/src/platform.rs	2026-08-26 16:53:05.150702100 +0800
+--- a/src/platform.rs	2026-08-27 09:23:31.611367000 +0800
++++ b/src/platform.rs	2026-08-27 09:23:31.647706600 +0800
 @@ -273,6 +273,30 @@
      fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout>;
      fn keyboard_mapper(&self) -> Rc<dyn PlatformKeyboardMapper>;
@@ -477,8 +486,8 @@ diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json
      }
  }
 diff -ruN --strip-trailing-cr -x Cargo.lock -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.toml.orig -x examples -x UPSTREAM.md a/src/window.rs b/src/window.rs
---- a/src/window.rs	2026-08-26 16:53:05.115040600 +0800
-+++ b/src/window.rs	2026-08-26 16:53:05.157726800 +0800
+--- a/src/window.rs	2026-08-27 09:23:31.608268600 +0800
++++ b/src/window.rs	2026-08-27 09:23:31.653705800 +0800
 @@ -948,6 +948,8 @@
              window_decorations,
              #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
