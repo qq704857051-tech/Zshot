@@ -32,7 +32,8 @@ pub const CUSTOMIZABLE: &[&str] = &[
 pub const DEFAULT_HIDDEN: &[&str] = &[ELLIPSE, TEXT, NUMBER, REDO];
 
 pub const PHASE1_ITEMS: &[&str] = &[
-    SELECT, RECT, ARROW, PEN, MOSAIC, TEXT, UNDO, REDO, CLEAR, SAVE, COMPLETE, CANCEL,
+    SELECT, RECT, ARROW, PEN, MOSAIC, TEXT, UNDO, REDO, CLEAR, OCR, TRANSLATE, SAVE, COMPLETE,
+    CANCEL,
 ];
 
 pub const BTN: f64 = 36.0;
@@ -59,6 +60,8 @@ pub fn icon_path(id: &str) -> Option<&'static str> {
         UNDO => "toolbar/undo.svg",
         REDO => "toolbar/redo.svg",
         CLEAR => "toolbar/clear.svg",
+        OCR => "toolbar/ocr.svg",
+        TRANSLATE => "toolbar/translate.svg",
         SAVE => "toolbar/save.svg",
         COMPLETE => "toolbar/complete.svg",
         CANCEL => "toolbar/cancel.svg",
@@ -79,6 +82,8 @@ pub fn label(id: &str) -> &'static str {
         UNDO => "撤销",
         REDO => "重做",
         CLEAR => "清空",
+        OCR => "取字",
+        TRANSLATE => "翻译",
         SAVE => "保存",
         COMPLETE => "完成",
         CANCEL => "取消",

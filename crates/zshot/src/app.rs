@@ -120,7 +120,7 @@ fn capture_from_app(
     }
 }
 
-fn crop_from_app(
+pub(crate) fn crop_from_app(
     cx: &mut App,
     cap: &CapturedDesktop,
     x: u32,

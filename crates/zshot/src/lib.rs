@@ -2,15 +2,18 @@ pub mod app;
 pub mod black;
 pub mod capture;
 pub mod codec;
+pub mod config;
 pub mod error;
 pub mod exclusive;
 pub mod geom;
 pub mod gpui_bridge;
 pub mod hdr;
 pub mod hotkey;
+pub mod ocr;
 pub mod overlay;
 pub mod perf;
 pub mod platform;
+pub mod translate;
 
 pub use app::{once_capture, run};
 pub use error::{Error, Result};
