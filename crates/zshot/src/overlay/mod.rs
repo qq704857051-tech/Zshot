@@ -125,6 +125,9 @@ pub struct OverlayView {
     mag: Option<(Vec<u8>, u32, u32, u32)>,
     editor: Session,
     text_edit: Option<TextDraft>,
+    /// Last mosaic readback, keyed by the elements that produced it. The overlay
+    /// repaints every frame; without this each mosaic costs a GPU readback per frame.
+    mosaic_cache: RefCell<Option<(Vec<(u64, Rect, i32)>, Vec<(Rect, u32)>)>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -248,6 +251,7 @@ impl OverlayView {
             mag: None,
             editor: Session::new(),
             text_edit: None,
+            mosaic_cache: RefCell::new(None),
         }
     }
 
@@ -282,6 +286,7 @@ impl OverlayView {
             mag: None,
             editor: Session::new(),
             text_edit: None,
+            mosaic_cache: RefCell::new(None),
         };
         view.sync_from_cap(window);
         view
@@ -854,6 +859,19 @@ impl OverlayView {
         let Some(cap) = self.cap.as_ref() else {
             return out;
         };
+        let key: Vec<(u64, Rect, i32)> = self
+            .editor
+            .visible()
+            .filter_map(|el| match el.shape {
+                Shape::Mosaic { block_size } => Some((el.id, el.bounds, block_size)),
+                _ => None,
+            })
+            .collect();
+        if let Some((cached_key, tiles)) = self.mosaic_cache.borrow().as_ref() {
+            if *cached_key == key {
+                return tiles.clone();
+            }
+        }
         for el in self.editor.visible() {
             let Shape::Mosaic { block_size } = el.shape else {
                 continue;
@@ -908,6 +926,7 @@ impl OverlayView {
                 cy += block;
             }
         }
+        *self.mosaic_cache.borrow_mut() = Some((key, out.clone()));
         out
     }
 
