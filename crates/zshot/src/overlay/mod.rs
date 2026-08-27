@@ -858,10 +858,13 @@ impl OverlayView {
             let Shape::Mosaic { block_size } = el.shape else {
                 continue;
             };
-            let x = el.bounds.x.max(0.0) as u32;
-            let y = el.bounds.y.max(0.0) as u32;
-            let w = el.bounds.width.max(1.0) as u32;
-            let h = el.bounds.height.max(1.0) as u32;
+            // Clamping the origin has to shrink the extent too, or the preview
+            // renders the mosaic shifted relative to what the export produces.
+            let x = el.bounds.x.max(0.0);
+            let y = el.bounds.y.max(0.0);
+            let w = (el.bounds.x + el.bounds.width - x).max(0.0) as u32;
+            let h = (el.bounds.y + el.bounds.height - y).max(0.0) as u32;
+            let (x, y) = (x as u32, y as u32);
             let w = w.min(cap.width.saturating_sub(x));
             let h = h.min(cap.height.saturating_sub(y));
             if w < 2 || h < 2 {

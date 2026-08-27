@@ -274,10 +274,14 @@ pub fn pixelate(
 }
 
 fn pixelate_buf(buf: &mut Bgra<'_>, bounds: Rect, block: i32) {
-    let x0 = bounds.x.round() as i32;
-    let y0 = bounds.y.round() as i32;
-    let x1 = (bounds.x + bounds.width).round() as i32;
-    let y1 = (bounds.y + bounds.height).round() as i32;
+    // Clamp to the buffer: sampling a block whose top-left is outside it would
+    // seed the whole block with the transparent black `get` returns for misses.
+    let w = buf.width as i32;
+    let h = buf.height as i32;
+    let x0 = (bounds.x.round() as i32).clamp(0, w);
+    let y0 = (bounds.y.round() as i32).clamp(0, h);
+    let x1 = ((bounds.x + bounds.width).round() as i32).clamp(0, w);
+    let y1 = ((bounds.y + bounds.height).round() as i32).clamp(0, h);
     if x1 <= x0 || y1 <= y0 {
         return;
     }
@@ -512,6 +516,25 @@ mod tests {
                         assert_eq!(&marked_px[i..i + 4], sample.as_slice());
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn mosaic_reaching_past_the_crop_leaves_pixels_opaque() {
+        let (mut px, stride) = solid(32, 32, [10, 20, 30, 255]);
+        let el = Element {
+            id: 9,
+            bounds: Rect::new(-8.0, 8.0, 16.0, 16.0),
+            stroke: DEFAULT_STROKE,
+            stroke_width: 1.0,
+            shape: Shape::Mosaic { block_size: 16 },
+        };
+        apply_annotations(&mut px, 32, 32, stride, 0.0, 0.0, &[el]);
+        for y in 0..32u32 {
+            for x in 0..32u32 {
+                let i = (y * stride + x * 4) as usize;
+                assert_eq!(px[i + 3], 255, "pixel {x},{y} went transparent");
             }
         }
     }
