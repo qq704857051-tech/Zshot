@@ -468,9 +468,7 @@ impl OverlayView {
                 return;
             }
         }
-        if let Some(edit) = self.text_edit.take() {
-            self.editor.add_text(edit.pt, &edit.buf);
-        }
+        self.commit_text_draft();
         self.down = true;
         self.down_pt = self.mouse;
         self.hit = SelectionHitKind::None;
@@ -478,6 +476,14 @@ impl OverlayView {
             self.on_active_press();
         }
         cx.notify();
+    }
+
+    /// Fold a pending text draft into the document. Any click that leaves the text
+    /// field -- canvas or toolbar -- has to run this or the typed text is lost.
+    fn commit_text_draft(&mut self) {
+        if let Some(edit) = self.text_edit.take() {
+            self.editor.add_text(edit.pt, &edit.buf);
+        }
     }
 
     fn on_active_press(&mut self) {
@@ -666,8 +672,8 @@ impl OverlayView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(edit) = self.text_edit.take() {
-            self.editor.add_text(edit.pt, &edit.buf);
+        if self.text_edit.is_some() {
+            self.commit_text_draft();
             cx.notify();
             return;
         }
@@ -813,6 +819,10 @@ impl OverlayView {
     }
 
     fn handle_toolbar(&mut self, id: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        // Buttons stop propagation, so `on_mouse_down` never runs for these clicks.
+        if id != toolbar::CANCEL {
+            self.commit_text_draft();
+        }
         if let Some(tool) = Tool::from_id(id) {
             self.editor.cancel_draft();
             self.editor.tool = tool;
