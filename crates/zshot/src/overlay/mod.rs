@@ -1172,16 +1172,27 @@ fn toolbar_button(
         )
 }
 
+/// Mirror the rendered layout -- `PAD`, then one `BTN` every `BTN + ITEM_GAP`.
+/// Splitting `geom.width` into equal slots instead drifts by the padding and can
+/// land a click on Cancel in Complete's slot.
 fn toolbar_item_at(p: Point, geom: Rect, items: &[&'static str]) -> Option<&'static str> {
     if items.is_empty() || !geom.contains(p) {
         return None;
     }
-    let slot = geom.width / items.len() as f64;
-    if slot <= 0.0 {
+    let s = geom.width / toolbar::bar_size(items.len()).0;
+    let pitch = (toolbar::BTN + toolbar::ITEM_GAP) * s;
+    if pitch <= 0.0 {
         return None;
     }
-    let i = ((p.x - geom.x) / slot).floor() as usize;
-    items.get(i.min(items.len() - 1)).copied()
+    let rel = p.x - geom.x - toolbar::PAD * s;
+    if rel < 0.0 {
+        return None;
+    }
+    let i = (rel / pitch).floor();
+    if rel - i * pitch > toolbar::BTN * s {
+        return None;
+    }
+    items.get(i as usize).copied()
 }
 
 fn coord_label(
@@ -1780,13 +1791,37 @@ mod tests {
 
     #[test]
     fn toolbar_item_at_picks_slot_under_pointer() {
-        let geom = Rect::new(100.0, 200.0, 400.0, 40.0);
         let items = ["select", "rect", "arrow", "pen"];
-        assert_eq!(toolbar_item_at(Point { x: 110.0, y: 210.0 }, geom, &items), Some("select"));
-        assert_eq!(toolbar_item_at(Point { x: 210.0, y: 210.0 }, geom, &items), Some("rect"));
-        assert_eq!(toolbar_item_at(Point { x: 310.0, y: 210.0 }, geom, &items), Some("arrow"));
-        assert_eq!(toolbar_item_at(Point { x: 450.0, y: 210.0 }, geom, &items), Some("pen"));
-        assert_eq!(toolbar_item_at(Point { x: 50.0, y: 210.0 }, geom, &items), None);
+        let (w, h) = toolbar::bar_size(items.len());
+        let geom = Rect::new(100.0, 200.0, w, h);
+        // Button i spans [100 + PAD + i*38, +BTN] = [104,140] [142,178] [180,216] [218,254].
+        let at = |x: f64| toolbar_item_at(Point { x, y: 210.0 }, geom, &items);
+        assert_eq!(at(104.0), Some("select"));
+        assert_eq!(at(139.0), Some("select"));
+        assert_eq!(at(142.0), Some("rect"));
+        assert_eq!(at(215.0), Some("arrow"));
+        assert_eq!(at(253.0), Some("pen"));
+        assert_eq!(at(101.0), None, "left padding is not a button");
+        assert_eq!(at(141.0), None, "gap between buttons is not a button");
+        assert_eq!(at(50.0), None);
         assert_eq!(toolbar_item_at(Point { x: 210.0, y: 10.0 }, geom, &items), None);
+    }
+
+    /// The whole point of the rewrite: the last slot must not steal Cancel's clicks.
+    #[test]
+    fn toolbar_item_at_matches_rendered_buttons_for_the_full_bar() {
+        let items: Vec<&'static str> = PHASE1_ITEMS.to_vec();
+        let (w, h) = toolbar::bar_size(items.len());
+        let geom = Rect::new(0.0, 0.0, w, h);
+        for (i, id) in items.iter().enumerate() {
+            let left = toolbar::PAD + i as f64 * (toolbar::BTN + toolbar::ITEM_GAP);
+            for x in [left, left + toolbar::BTN / 2.0, left + toolbar::BTN - 0.1] {
+                assert_eq!(
+                    toolbar_item_at(Point { x, y: 20.0 }, geom, &items),
+                    Some(*id),
+                    "x={x} should hit {id}"
+                );
+            }
+        }
     }
 }
