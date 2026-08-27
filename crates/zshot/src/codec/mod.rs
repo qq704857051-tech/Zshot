@@ -20,7 +20,7 @@ use windows::Win32::System::DataExchange::{
 use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT,
 };
-use windows::Win32::System::Ole::CF_DIB;
+use windows::Win32::System::Ole::{CF_DIB, CF_UNICODETEXT};
 
 use crate::error::{Error, Result};
 
@@ -132,6 +132,38 @@ pub fn set_clipboard_dib(pixels: &[u8], width: u32, height: u32, stride: u32) ->
         match handed_over {
             // On success the clipboard owns the block; freeing it would be a
             // double free.
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let _ = GlobalFree(Some(hg));
+                Err(e.into())
+            }
+        }
+    }
+}
+
+/// Copies OCR / translation output. Mirrors `set_clipboard_dib`, including its
+/// close-before-reporting rule.
+pub fn set_clipboard_text(text: &str) -> Result<()> {
+    let mut utf16: Vec<u16> = text.encode_utf16().collect();
+    utf16.push(0);
+    unsafe {
+        let hg = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, utf16.len() * 2)?;
+        let ptr = GlobalLock(hg) as *mut u16;
+        if ptr.is_null() {
+            let _ = GlobalFree(Some(hg));
+            return Err(Error::new("GlobalLock failed for text"));
+        }
+        std::ptr::copy_nonoverlapping(utf16.as_ptr(), ptr, utf16.len());
+        let _ = GlobalUnlock(hg);
+
+        if let Err(e) = OpenClipboard(Some(HWND::default())) {
+            let _ = GlobalFree(Some(hg));
+            return Err(e.into());
+        }
+        let _ = EmptyClipboard();
+        let handed_over = SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(hg.0)));
+        let _ = CloseClipboard();
+        match handed_over {
             Ok(_) => Ok(()),
             Err(e) => {
                 let _ = GlobalFree(Some(hg));

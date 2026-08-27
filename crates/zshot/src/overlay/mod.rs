@@ -139,7 +139,21 @@ pub struct OverlayView {
     /// Last mosaic readback, keyed by the elements that produced it. The overlay
     /// repaints every frame; without this each mosaic costs a GPU readback per frame.
     mosaic_cache: RefCell<Option<(MosaicKey, MosaicTiles)>>,
+    panel: Option<Panel>,
 }
+
+/// OCR / translation output: read-only text plus copy, same as the C# panel.
+struct Panel {
+    title: SharedString,
+    body: SharedString,
+    busy: bool,
+}
+
+const OCR_TITLE: &str = "文字识别";
+const TRANSLATE_TITLE: &str = "翻译";
+const COPIED_TITLE: &str = "已复制";
+const PANEL_W: f32 = 320.;
+const PANEL_MAX_H: f32 = 260.;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -263,6 +277,7 @@ impl OverlayView {
             editor: Session::new(),
             text_edit: None,
             mosaic_cache: RefCell::new(None),
+            panel: None,
         }
     }
 
@@ -298,6 +313,7 @@ impl OverlayView {
             editor: Session::new(),
             text_edit: None,
             mosaic_cache: RefCell::new(None),
+            panel: None,
         };
         view.sync_from_cap(window);
         view
@@ -327,6 +343,7 @@ impl OverlayView {
         self.mag = None;
         self.editor = Session::new();
         self.text_edit = None;
+        self.panel = None;
         self.sync_from_cap(window);
     }
 
@@ -895,11 +912,112 @@ impl OverlayView {
                 self.editor.clear();
                 cx.notify();
             }
+            toolbar::OCR => self.run_ocr(cx),
+            toolbar::TRANSLATE => self.run_translate(cx),
             toolbar::SAVE => self.save(cx),
             toolbar::COMPLETE => self.confirm(window, cx),
             toolbar::CANCEL => self.cancel(window, cx),
             _ => {}
         }
+    }
+
+    /// What OCR reads is the annotated crop, same as the C# `FlattenSelection`:
+    /// a mosaic over a password must hide it from the recognizer too.
+    fn selection_pixels(&self, cx: &mut Context<Self>) -> Option<(Vec<u8>, u32, u32, u32)> {
+        let result = self.result_from_current()?;
+        let cap = self.cap.as_ref()?;
+        let (mut px, w, h, stride) =
+            crate::app::crop_from_app(cx, cap, result.x, result.y, result.w, result.h).ok()?;
+        composite::apply_annotations(
+            &mut px,
+            w,
+            h,
+            stride,
+            result.x as f64,
+            result.y as f64,
+            &result.marks,
+        );
+        Some((px, w, h, stride))
+    }
+
+    fn busy(&self) -> bool {
+        self.panel.as_ref().is_some_and(|p| p.busy)
+    }
+
+    fn show_panel(&mut self, title: &str, body: String, busy: bool, cx: &mut Context<Self>) {
+        self.panel = Some(Panel {
+            title: title.to_string().into(),
+            body: body.into(),
+            busy,
+        });
+        cx.notify();
+    }
+
+    fn run_ocr(&mut self, cx: &mut Context<Self>) {
+        // Inference is ~130 ms; without this a double click queues two of them.
+        if self.busy() {
+            return;
+        }
+        let Some((px, w, h, stride)) = self.selection_pixels(cx) else {
+            return;
+        };
+        self.show_panel(OCR_TITLE, "识别中…".into(), true, cx);
+        let task = cx.background_spawn(async move { crate::ocr::recognize(&px, w, h, stride) });
+        cx.spawn(async move |this, cx| {
+            let recognized = task.await;
+            let _ = this.update(cx, |this, cx| {
+                match recognized {
+                    Ok(text) if text.trim().is_empty() => {
+                        this.show_panel(OCR_TITLE, "未识别到文字".into(), false, cx)
+                    }
+                    Ok(text) => this.show_panel(OCR_TITLE, text, false, cx),
+                    Err(e) => this.show_panel("识别失败", e.to_string(), false, cx),
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Recognizes first, like the C# button. It does not reuse the last OCR:
+    /// inference is ~130 ms, and a cache keyed on nothing would translate the
+    /// previous selection after the user reframes.
+    fn run_translate(&mut self, cx: &mut Context<Self>) {
+        if self.busy() {
+            return;
+        }
+        let Some((px, w, h, stride)) = self.selection_pixels(cx) else {
+            return;
+        };
+        self.show_panel(TRANSLATE_TITLE, "翻译中…".into(), true, cx);
+        let task = cx.background_spawn(async move {
+            let source = crate::ocr::recognize(&px, w, h, stride)?;
+            if source.trim().is_empty() {
+                return Err(crate::error::Error::new("未识别到文字"));
+            }
+            crate::translate::translate(&source)
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = task.await;
+            let _ = this.update(cx, |this, cx| match outcome {
+                Ok(translated) => this.show_panel(TRANSLATE_TITLE, translated, false, cx),
+                Err(e) => this.show_panel("翻译失败", e.to_string(), false, cx),
+            });
+        })
+        .detach();
+    }
+
+    fn copy_panel(&mut self, cx: &mut Context<Self>) {
+        let Some(panel) = self.panel.as_ref() else {
+            return;
+        };
+        if panel.busy {
+            return;
+        }
+        if let Err(e) = crate::codec::set_clipboard_text(&panel.body) {
+            eprintln!("clipboard text failed: {e}");
+            return;
+        }
+        self.show_panel(COPIED_TITLE, panel.body.to_string(), false, cx);
     }
 
     /// Pixelated tiles plus the ids of the elements that produced them; an element
@@ -1058,6 +1176,82 @@ impl OverlayView {
         )
     }
 
+    fn panel_element(&self, scale: f32, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let panel = self.panel.as_ref()?;
+        let bar = self.toolbar_geom(scale)?;
+        let bar_x = bar.x as f32 / scale;
+        let bar_y = bar.y as f32 / scale;
+        let bar_h = bar.height as f32 / scale;
+        // ponytail: the panel follows the toolbar, which already flipped to stay
+        // on the monitor. A tall panel can still run off the bottom — clamp it
+        // against the monitor rect if that shows up in use.
+        let top = bar_y + bar_h + toolbar::ANCHOR_GAP as f32;
+        let copyable = !panel.busy && !panel.body.is_empty();
+        Some(
+            div()
+                .id("overlay-panel")
+                .absolute()
+                .left(px(bar_x))
+                .top(px(top))
+                .w(px(PANEL_W))
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .p(px(10.))
+                .rounded_xl()
+                .bg(theme::surface())
+                .border_1()
+                .border_color(theme::border())
+                .shadow(vec![BoxShadow {
+                    color: theme::base().opacity(0.18),
+                    offset: point(px(0.), px(4.)),
+                    blur_radius: px(16.),
+                    spread_radius: px(0.),
+                }])
+                .occlude()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme::secondary_fg())
+                        .child(panel.title.clone()),
+                )
+                .child(
+                    div()
+                        .id("overlay-panel-body")
+                        .max_h(px(PANEL_MAX_H))
+                        .overflow_y_scroll()
+                        .text_size(px(13.))
+                        .text_color(theme::primary_fg())
+                        .child(panel.body.clone()),
+                )
+                .children(copyable.then(|| {
+                    div().flex().flex_row().justify_end().child(
+                    div()
+                        .id("overlay-panel-copy")
+                        .px(px(10.))
+                        .py(px(4.))
+                        .rounded_md()
+                        .text_size(px(12.))
+                        .text_color(theme::primary_fg())
+                        .bg(theme::active_background())
+                        .hover(|s| s.bg(theme::accent_hover()))
+                        .cursor(CursorStyle::PointingHand)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.copy_panel(cx);
+                            }),
+                        )
+                        .child("复制"),
+                    )
+                })),
+        )
+    }
+
     /// Text annotations live in the element tree, not the canvas, so the paint-time
     /// content mask does not reach them. Same clip, done with a container: positioned
     /// on the selection, children placed relative to it, overflow hidden.
@@ -1195,6 +1389,7 @@ impl Render for OverlayView {
                 )
                 .child(coord_label(shown, mouse, phase, scale))
                 .children(self.toolbar_element(scale, cx))
+                .children(self.panel_element(scale, cx))
                 .children(self.text_layer(scale))
             })
     }
