@@ -58,15 +58,7 @@ fn draw_element(buf: &mut Bgra<'_>, el: &Element) {
                 fill_triangles(buf, &g.triangles(), color);
             }
         }
-        Shape::Pen { points } => {
-            if points.len() == 1 {
-                fill_disk(buf, points[0].x, points[0].y, thick / 2.0, color);
-            } else {
-                for w in points.windows(2) {
-                    draw_line(buf, w[0], w[1], color, thick);
-                }
-            }
-        }
+        Shape::Pen { points } => draw_polyline(buf, points, color, thick),
         Shape::Mosaic { block_size } => {
             pixelate_buf(buf, el.bounds, (*block_size).max(2));
         }
@@ -134,52 +126,6 @@ impl Bgra<'_> {
     }
 }
 
-fn fill_disk(buf: &mut Bgra<'_>, cx: f64, cy: f64, radius: f64, c: [u8; 4]) {
-    let r = radius.max(0.5);
-    let min_x = (cx - r).floor() as i32;
-    let max_x = (cx + r).ceil() as i32;
-    let min_y = (cy - r).floor() as i32;
-    let max_y = (cy + r).ceil() as i32;
-    let r2 = r * r;
-    for y in min_y..=max_y {
-        for x in min_x..=max_x {
-            let dx = x as f64 + 0.5 - cx;
-            let dy = y as f64 + 0.5 - cy;
-            if dx * dx + dy * dy <= r2 {
-                buf.put(x, y, c);
-            }
-        }
-    }
-}
-
-fn draw_line(buf: &mut Bgra<'_>, a: Point, b: Point, c: [u8; 4], thick: f64) {
-    let mut x0 = a.x.round() as i32;
-    let mut y0 = a.y.round() as i32;
-    let x1 = b.x.round() as i32;
-    let y1 = b.y.round() as i32;
-    let dx = (x1 - x0).abs();
-    let sx = if x0 < x1 { 1 } else { -1 };
-    let dy = -(y1 - y0).abs();
-    let sy = if y0 < y1 { 1 } else { -1 };
-    let mut err = dx + dy;
-    let r = thick / 2.0;
-    loop {
-        fill_disk(buf, x0 as f64, y0 as f64, r, c);
-        if x0 == x1 && y0 == y1 {
-            break;
-        }
-        let e2 = 2 * err;
-        if e2 >= dy {
-            err += dy;
-            x0 += sx;
-        }
-        if e2 <= dx {
-            err += dx;
-            y0 += sy;
-        }
-    }
-}
-
 fn draw_rect_outline(buf: &mut Bgra<'_>, r: Rect, c: [u8; 4], thick: f64) {
     let p0 = Point { x: r.x, y: r.y };
     let p1 = Point {
@@ -194,14 +140,76 @@ fn draw_rect_outline(buf: &mut Bgra<'_>, r: Rect, c: [u8; 4], thick: f64) {
         x: r.x,
         y: r.y + r.height,
     };
-    draw_line(buf, p0, p1, c, thick);
-    draw_line(buf, p1, p2, c, thick);
-    draw_line(buf, p2, p3, c, thick);
-    draw_line(buf, p3, p0, c, thick);
+    draw_polyline(buf, &[p0, p1, p2, p3, p0], c, thick);
 }
 
-/// Antialiased fill of the *union* of `tris`, one blend per pixel.
-/// Sampling the union (rather than each triangle in turn) keeps shared edges seamless.
+/// Antialiased polyline: round-capped capsules, coverage from the distance to each
+/// segment. Coverage is accumulated into a mask and blended once per pixel, so
+/// overlapping segments (a pen stroke samples far denser than its own width) do not
+/// darken each other's soft edges.
+fn draw_polyline(buf: &mut Bgra<'_>, pts: &[Point], c: [u8; 4], thick: f64) {
+    let Some(first) = pts.first() else {
+        return;
+    };
+    let r = (thick / 2.0).max(0.5);
+    let pad = r + 1.0;
+    let mut min_x = f64::MAX;
+    let mut min_y = f64::MAX;
+    let mut max_x = f64::MIN;
+    let mut max_y = f64::MIN;
+    for p in pts {
+        min_x = min_x.min(p.x);
+        min_y = min_y.min(p.y);
+        max_x = max_x.max(p.x);
+        max_y = max_y.max(p.y);
+    }
+    let x0 = ((min_x - pad).floor() as i32).clamp(0, buf.width as i32);
+    let y0 = ((min_y - pad).floor() as i32).clamp(0, buf.height as i32);
+    let x1 = ((max_x + pad).ceil() as i32).clamp(0, buf.width as i32);
+    let y1 = ((max_y + pad).ceil() as i32).clamp(0, buf.height as i32);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let w = (x1 - x0) as usize;
+    let mut mask = vec![0u8; w * (y1 - y0) as usize];
+    // A lone point is a segment of zero length -- `dist_to_segment` handles that,
+    // so a single dot needs no separate case.
+    let segments: Vec<(Point, Point)> = if pts.len() == 1 {
+        vec![(*first, *first)]
+    } else {
+        pts.windows(2).map(|s| (s[0], s[1])).collect()
+    };
+    for (a, b) in segments {
+        let sx0 = ((a.x.min(b.x) - pad).floor() as i32).clamp(x0, x1);
+        let sy0 = ((a.y.min(b.y) - pad).floor() as i32).clamp(y0, y1);
+        let sx1 = ((a.x.max(b.x) + pad).ceil() as i32).clamp(x0, x1);
+        let sy1 = ((a.y.max(b.y) + pad).ceil() as i32).clamp(y0, y1);
+        for y in sy0..sy1 {
+            for x in sx0..sx1 {
+                let p = Point {
+                    x: x as f64 + 0.5,
+                    y: y as f64 + 0.5,
+                };
+                let d = crate::overlay::editor::dist_to_segment(p, a, b);
+                let cov = (r + 0.5 - d).clamp(0.0, 1.0);
+                if cov <= 0.0 {
+                    continue;
+                }
+                let i = (y - y0) as usize * w + (x - x0) as usize;
+                mask[i] = mask[i].max((cov * 255.0).round() as u8);
+            }
+        }
+    }
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let m = mask[(y - y0) as usize * w + (x - x0) as usize];
+            if m > 0 {
+                buf.blend(x, y, c, m as f64 / 255.0);
+            }
+        }
+    }
+}
+
 fn fill_triangles(buf: &mut Bgra<'_>, tris: &[(Point, Point, Point)], color: [u8; 4]) {
     // ponytail: 4x4 box supersampling. Enough for straight edges; go analytic only if 16
     // samples ever show banding on a near-horizontal edge.
@@ -537,6 +545,32 @@ mod tests {
                 assert_eq!(px[i + 3], 255, "pixel {x},{y} went transparent");
             }
         }
+    }
+
+    #[test]
+    fn pen_stroke_edges_are_antialiased() {
+        let (mut px, stride) = solid(64, 64, [0, 0, 0, 255]);
+        let el = Element {
+            id: 7,
+            bounds: Rect::new(0.0, 0.0, 64.0, 64.0),
+            stroke: 0xFFFF_FFFF,
+            stroke_width: 4.0,
+            shape: Shape::Pen {
+                points: vec![
+                    crate::geom::Point { x: 6.0, y: 6.0 },
+                    crate::geom::Point { x: 40.0, y: 30.0 },
+                    crate::geom::Point { x: 20.0, y: 56.0 },
+                ],
+            },
+        };
+        apply_annotations(&mut px, 64, 64, stride, 0.0, 0.0, &[el]);
+        let partial = px
+            .chunks_exact(4)
+            .filter(|p| p[0] > 0 && p[0] < 255)
+            .count();
+        let solid_px = px.chunks_exact(4).filter(|p| p[0] == 255).count();
+        assert!(solid_px > 50, "stroke barely drawn: {solid_px}");
+        assert!(partial > 40, "expected soft edge pixels, got {partial}");
     }
 
     #[test]

@@ -1494,18 +1494,12 @@ fn paint_polyline(
     scale: f32,
     color: gpui::Rgba,
 ) {
+    let hw = (stroke_w / 2.0).max(1.5);
     if points.len() == 1 {
-        let r = (stroke_w / 2.0).max(1.0) as f32 / scale;
-        window.paint_quad(fill(
-            Bounds {
-                origin: point(
-                    px(points[0].x as f32 / scale - r),
-                    px(points[0].y as f32 / scale - r),
-                ),
-                size: size(px(r * 2.), px(r * 2.)),
-            },
-            color,
-        ));
+        let p = points[0];
+        let a = Point { x: p.x - hw, y: p.y };
+        let b = Point { x: p.x + hw, y: p.y };
+        paint_segment(window, a, b, stroke_w, scale, color);
         return;
     }
     for w in points.windows(2) {
@@ -1513,6 +1507,10 @@ fn paint_polyline(
     }
 }
 
+/// One stroke segment as a quad, fed through the same coverage fill the arrow uses.
+/// Caps overhang by half a width so a bend between two segments has no notch. The
+/// old version stamped an axis-aligned square every half width, which is what left
+/// pen strokes looking blocky no matter how fine the sampling.
 fn paint_segment(
     window: &mut Window,
     a: Point,
@@ -1523,23 +1521,24 @@ fn paint_segment(
 ) {
     let dx = b.x - a.x;
     let dy = b.y - a.y;
-    let len = (dx * dx + dy * dy).sqrt().max(1.0);
+    let len = (dx * dx + dy * dy).sqrt();
     let hw = (stroke_w / 2.0).max(1.5);
-    let step = hw.max(1.0);
-    let n = (len / step).ceil() as i32;
-    let s = (hw as f32 / scale).max(1.0);
-    for i in 0..=n {
-        let t = i as f64 / n.max(1) as f64;
-        let x = (a.x + dx * t) as f32 / scale;
-        let y = (a.y + dy * t) as f32 / scale;
-        window.paint_quad(fill(
-            Bounds {
-                origin: point(px(x - s), px(y - s)),
-                size: size(px(s * 2.), px(s * 2.)),
-            },
-            color,
-        ));
-    }
+    let (ux, uy) = if len > f64::EPSILON {
+        (dx / len, dy / len)
+    } else {
+        (1.0, 0.0)
+    };
+    let (nx, ny) = (-uy * hw, ux * hw);
+    let (ex, ey) = (ux * hw * 0.5, uy * hw * 0.5);
+    let corner = |p: Point, sx: f64, sy: f64, side: f64| Point {
+        x: p.x + sx + nx * side,
+        y: p.y + sy + ny * side,
+    };
+    let a0 = corner(a, -ex, -ey, 1.0);
+    let a1 = corner(a, -ex, -ey, -1.0);
+    let b0 = corner(b, ex, ey, 1.0);
+    let b1 = corner(b, ex, ey, -1.0);
+    paint_filled_triangles(window, &[(a0, a1, b1), (a0, b1, b0)], scale, color);
 }
 
 fn rect_to_bounds(r: Rect, scale: f32) -> Bounds<Pixels> {

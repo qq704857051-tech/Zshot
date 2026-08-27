@@ -83,7 +83,7 @@ impl Element {
     }
 }
 
-fn dist_to_segment(p: Point, a: Point, b: Point) -> f64 {
+pub(super) fn dist_to_segment(p: Point, a: Point, b: Point) -> f64 {
     let vx = b.x - a.x;
     let vy = b.y - a.y;
     let len2 = vx * vx + vy * vy;
@@ -486,19 +486,6 @@ pub struct FilledArrow {
 }
 
 impl FilledArrow {
-    /// The arrow as one closed polygon, wound tail -> left flank -> tip -> right flank.
-    /// Rasterizing this instead of `triangles()` avoids a seam at the neck.
-    pub fn outline(self) -> [Point; 6] {
-        [
-            self.tail,
-            self.neck_left,
-            self.left,
-            self.tip,
-            self.right,
-            self.neck_right,
-        ]
-    }
-
     pub fn triangles(self) -> [(Point, Point, Point); 2] {
         [
             (self.tail, self.neck_left, self.neck_right),
