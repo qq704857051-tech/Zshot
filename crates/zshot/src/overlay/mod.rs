@@ -784,7 +784,26 @@ impl OverlayView {
 
     fn finish(&mut self, result: OverlayResult, window: &mut Window, cx: &mut Context<Self>) {
         self.visible = false;
-        Self::hide_window(window);
+        // Hide only once the now-empty frame has been committed, so nothing of this
+        // capture survives in gpui's swap chain for the next one to flash. Hiding is
+        // idempotent, and a full-screen topmost window that never goes away would be
+        // far worse than a flash, so a timer hides it regardless if that frame never
+        // arrives.
+        window.on_next_frame(|window, _cx| {
+            let _ = window.wait_for_commit_completion();
+            Self::hide_window(window);
+        });
+        cx.spawn(async move |_this, cx| {
+            Timer::after(Duration::from_millis(80)).await;
+            let _ = cx.update(|cx| {
+                if let Some(handle) = OVERLAY_WINDOW.with(|s| *s.borrow()) {
+                    let _ = handle.update(cx, |_view, window, _cx| {
+                        Self::hide_window(window);
+                    });
+                }
+            });
+        })
+        .detach();
         let cap = self.cap.take();
         let perf = self.perf.borrow_mut().take();
         crate::app::complete_region_shot(result, cap, perf, cx);
@@ -1145,32 +1164,39 @@ impl Render for OverlayView {
             .on_action(cx.listener(Self::cancel_action))
             .on_action(cx.listener(Self::undo_action))
             .on_action(cx.listener(Self::redo_action))
-            .child(
-                canvas(
-                    move |_, _, _| (),
-                    move |bounds, _, window, _cx| {
-                        paint_overlay(
-                            window,
-                            bounds,
-                            OverlayPaint {
-                                shown,
-                                mouse,
-                                mag,
-                                phase,
-                                start,
-                                has_sel,
-                                scale,
-                                marks,
-                                mosaic,
-                            },
-                        );
-                    },
+            // Everything visible hangs off `visible`, so the frame drawn on the way
+            // out is empty. gpui's layer is a separate swap chain from the freeze
+            // frame and keeps its last frame while the window is hidden; leaving the
+            // finished overlay in it means the next capture shows those pixels until
+            // the first repaint lands.
+            .when(self.visible, |el| {
+                el.child(
+                    canvas(
+                        move |_, _, _| (),
+                        move |bounds, _, window, _cx| {
+                            paint_overlay(
+                                window,
+                                bounds,
+                                OverlayPaint {
+                                    shown,
+                                    mouse,
+                                    mag,
+                                    phase,
+                                    start,
+                                    has_sel,
+                                    scale,
+                                    marks,
+                                    mosaic,
+                                },
+                            );
+                        },
+                    )
+                    .size_full(),
                 )
-                .size_full(),
-            )
-            .child(coord_label(shown, mouse, phase, scale))
-            .children(self.toolbar_element(scale, cx))
-            .children(self.text_layer(scale))
+                .child(coord_label(shown, mouse, phase, scale))
+                .children(self.toolbar_element(scale, cx))
+                .children(self.text_layer(scale))
+            })
     }
 }
 
