@@ -95,6 +95,12 @@ fn empty_result() -> OverlayResult {
     }
 }
 
+#[derive(Clone, Default)]
+struct MosaicTiles {
+    tiles: Vec<(Rect, u32)>,
+    covered: Vec<u64>,
+}
+
 struct TextDraft {
     pt: Point,
     buf: String,
@@ -127,7 +133,7 @@ pub struct OverlayView {
     text_edit: Option<TextDraft>,
     /// Last mosaic readback, keyed by the elements that produced it. The overlay
     /// repaints every frame; without this each mosaic costs a GPU readback per frame.
-    mosaic_cache: RefCell<Option<(Vec<(u64, Rect, i32)>, Vec<(Rect, u32)>)>>,
+    mosaic_cache: RefCell<Option<(Vec<(u64, Rect, i32)>, MosaicTiles)>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -854,8 +860,10 @@ impl OverlayView {
         }
     }
 
-    fn mosaic_tiles(&self, cx: &mut App) -> Vec<(Rect, u32)> {
-        let mut out = Vec::new();
+    /// Pixelated tiles plus the ids of the elements that produced them; an element
+    /// missing from that list still needs a placeholder drawn for it.
+    fn mosaic_tiles(&self, cx: &mut App) -> MosaicTiles {
+        let mut out = MosaicTiles::default();
         let Some(cap) = self.cap.as_ref() else {
             return out;
         };
@@ -916,7 +924,7 @@ impl OverlayView {
                             | px[i] as u32;
                         let bw = block.min(cw - cxb) as f64;
                         let bh = block.min(ch - cy) as f64;
-                        out.push((
+                        out.tiles.push((
                             Rect::new((x + cxb) as f64, (y + cy) as f64, bw, bh),
                             rgb,
                         ));
@@ -925,6 +933,7 @@ impl OverlayView {
                 }
                 cy += block;
             }
+            out.covered.push(el.id);
         }
         *self.mosaic_cache.borrow_mut() = Some((key, out.clone()));
         out
@@ -1220,7 +1229,7 @@ struct OverlayPaint {
     has_sel: bool,
     scale: f32,
     marks: Vec<Element>,
-    mosaic: Vec<(Rect, u32)>,
+    mosaic: MosaicTiles,
 }
 
 fn paint_overlay(window: &mut Window, bounds: Bounds<Pixels>, paint: OverlayPaint) {
@@ -1258,10 +1267,10 @@ fn paint_overlay(window: &mut Window, bounds: Bounds<Pixels>, paint: OverlayPain
 fn paint_marks(
     window: &mut Window,
     marks: &[Element],
-    mosaic: &[(Rect, u32)],
+    mosaic: &MosaicTiles,
     scale: f32,
 ) {
-    for (r, color) in mosaic {
+    for (r, color) in &mosaic.tiles {
         window.paint_quad(fill(rect_to_bounds(*r, scale), rgb(*color)));
     }
     for el in marks {
@@ -1271,7 +1280,7 @@ fn paint_marks(
                 paint_rect_outline(window, el.bounds, el.stroke_width, scale, stroke);
             }
             Shape::Mosaic { .. } => {
-                if mosaic.is_empty() {
+                if !mosaic.covered.contains(&el.id) {
                     window.paint_quad(fill(
                         rect_to_bounds(el.bounds, scale),
                         hsla(0., 0., 0.5, 0.35),
