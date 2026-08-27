@@ -1398,8 +1398,19 @@ fn paint_filled_triangles(
     scale: f32,
     color: gpui::Rgba,
 ) {
-    let pt = |p: Point| (p.x as f32 / scale, p.y as f32 / scale);
-    let tris: Vec<[(f32, f32); 3]> = tris.iter().map(|(a, b, c)| [pt(*a), pt(*b), pt(*c)]).collect();
+    // Scan in PHYSICAL pixels, not logical ones. Rows converted to logical late keep
+    // every quad edge on an integer physical pixel; scanning logical rows puts the
+    // boundary between adjacent rows on a half pixel at any scale factor that is not
+    // 1, where each row's own edge antialiasing claims half of it and the two only
+    // sum to 0.75 -- a dark seam per row, which reads as the stair-stepping this
+    // whole routine exists to remove.
+    let tris: Vec<[(f32, f32); 3]> = tris
+        .iter()
+        .map(|(a, b, c)| {
+            let pt = |p: Point| (p.x as f32, p.y as f32);
+            [pt(*a), pt(*b), pt(*c)]
+        })
+        .collect();
     let mut min_y = f32::INFINITY;
     let mut max_y = f32::NEG_INFINITY;
     for t in &tris {
@@ -1419,8 +1430,8 @@ fn paint_filled_triangles(
         c.a *= alpha;
         window.paint_quad(fill(
             Bounds {
-                origin: point(px(lo), px(row as f32)),
-                size: size(px(hi - lo), px(1.0)),
+                origin: point(px(lo / scale), px(row as f32 / scale)),
+                size: size(px((hi - lo) / scale), px(1.0 / scale)),
             },
             c,
         ));
