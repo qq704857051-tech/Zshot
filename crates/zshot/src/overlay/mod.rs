@@ -95,6 +95,9 @@ fn empty_result() -> OverlayResult {
     }
 }
 
+/// Identity of a mosaic readback: which elements, where, at what block size.
+type MosaicKey = Vec<(u64, Rect, i32)>;
+
 #[derive(Clone, Default)]
 struct MosaicTiles {
     tiles: Vec<(Rect, u32)>,
@@ -133,7 +136,7 @@ pub struct OverlayView {
     text_edit: Option<TextDraft>,
     /// Last mosaic readback, keyed by the elements that produced it. The overlay
     /// repaints every frame; without this each mosaic costs a GPU readback per frame.
-    mosaic_cache: RefCell<Option<(Vec<(u64, Rect, i32)>, MosaicTiles)>>,
+    mosaic_cache: RefCell<Option<(MosaicKey, MosaicTiles)>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -879,7 +882,7 @@ impl OverlayView {
         let Some(cap) = self.cap.as_ref() else {
             return out;
         };
-        let key: Vec<(u64, Rect, i32)> = self
+        let key: MosaicKey = self
             .editor
             .visible()
             .filter_map(|el| match el.shape {
