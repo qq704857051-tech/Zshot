@@ -6,6 +6,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use gpui::{App, Application, Timer};
+
+fn gpui_app() -> Application {
+    Application::new().with_assets(crate::overlay::ToolbarAssets)
+}
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
@@ -29,13 +33,14 @@ use crate::codec::{set_clipboard_dib, write_png_file};
 use crate::error::{Error, Result};
 use crate::gpui_bridge::drop_freeze_swapchain;
 use crate::hotkey::{HotkeyAction, HotkeyBindings};
+use crate::overlay::composite::apply_annotations;
 use crate::overlay::{show_overlay, OverlayResult};
 use crate::perf::{write_perf_summary, PerfSession};
 use crate::platform::{
-    action_from_wparam, action_wparam, add_tray_icon, handle_tray, install_ll_hook,
-    register_fallback_hotkeys,
-    remove_tray_icon, set_dpi_aware, set_hook_target, taskbar_created_message, uninstall_ll_hook,
-    unregister_fallback_hotkeys, SingleInstance, TrayCommand, WM_TRAYICON, WM_ZSHOT_HOTKEY,
+    action_from_wparam, action_wparam, add_tray_icon, handle_tray, install_ll_hook, load_app_icon,
+    register_fallback_hotkeys, remove_tray_icon, set_dpi_aware, set_hook_target,
+    taskbar_created_message, uninstall_ll_hook, unregister_fallback_hotkeys, SingleInstance,
+    TrayCommand, WM_TRAYICON, WM_ZSHOT_HOTKEY,
 };
 
 static BUSY: AtomicBool = AtomicBool::new(false);
@@ -175,7 +180,7 @@ pub fn once_capture(path: PathBuf) -> Result<()> {
     }
     set_dpi_aware();
     let outcome = std::rc::Rc::new(RefCell::new(None::<Result<(u32, u32)>>));
-    Application::new().run({
+    gpui_app().run({
         let outcome = outcome.clone();
         let path = path.clone();
         move |cx: &mut App| {
@@ -216,7 +221,7 @@ fn self_test() -> Result<()> {
     let boot_error = Rc::new(RefCell::new(None::<Error>));
     let ready = Rc::new(Cell::new(false));
 
-    Application::new().run({
+    gpui_app().run({
         let cleanup_hwnd = cleanup_hwnd.clone();
         let boot_error = boot_error.clone();
         let ready = ready.clone();
@@ -278,7 +283,7 @@ fn bench_once() -> Result<()> {
             stress_ws100: None,
         });
     });
-    Application::new().run(|cx: &mut App| {
+    gpui_app().run(|cx: &mut App| {
         install_gpu_lifecycle(cx);
         start_bench_iteration(cx);
     });
@@ -333,7 +338,7 @@ fn bench_overlay_warm(n: usize) -> Result<()> {
             stress_ws100: None,
         });
     });
-    Application::new().run(|cx: &mut App| {
+    gpui_app().run(|cx: &mut App| {
         install_gpu_lifecycle(cx);
         start_bench_iteration(cx);
     });
@@ -369,7 +374,7 @@ fn stress_overlay(n: usize) -> Result<()> {
             stress_ws100: None,
         });
     });
-    Application::new().run(|cx: &mut App| {
+    gpui_app().run(|cx: &mut App| {
         install_gpu_lifecycle(cx);
         start_bench_iteration(cx);
     });
@@ -497,7 +502,7 @@ fn run_tray() -> Result<()> {
     let cleanup_hwnd = std::rc::Rc::new(std::cell::RefCell::new(None::<HWND>));
     let boot_error = std::rc::Rc::new(std::cell::RefCell::new(None::<Error>));
 
-    Application::new().run({
+    gpui_app().run({
         let cleanup_hwnd = cleanup_hwnd.clone();
         let boot_error = boot_error.clone();
         move |cx: &mut App| {
@@ -562,11 +567,14 @@ fn post_action(hwnd: HWND, action: HotkeyAction) {
 
 fn create_hidden_overlapped_window() -> Result<HWND> {
     let name = wide("ZshotHidden\0");
+    let icon = load_app_icon().unwrap_or_default();
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
         style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(hidden_proc),
         hInstance: unsafe { GetModuleHandleW(None)?.into() },
+        hIcon: icon,
+        hIconSm: icon,
         lpszClassName: PCWSTR(name.as_ptr()),
         ..Default::default()
     };
@@ -700,14 +708,7 @@ pub(crate) fn complete_region_shot(
     let bench = crate::overlay::bench_auto_hide_enabled();
     if result.confirmed && !bench {
         if let Some(cap) = cap {
-            match crop_from_app(cx, &cap, result.x, result.y, result.w, result.h) {
-                Ok((px, cw, ch, stride)) => {
-                    if let Err(e) = export_pixels(px, cw, ch, stride, true, true) {
-                        eprintln!("export failed: {e}");
-                    }
-                }
-                Err(e) => eprintln!("crop failed: {e}"),
-            }
+            export_annotated_region(cx, &cap, &result);
         }
     }
     let mut sample = None;
@@ -726,6 +727,30 @@ pub(crate) fn complete_region_shot(
             Some(ms) => on_bench_sample(cx, ms),
             None => cx.quit(),
         }
+    }
+}
+
+pub(crate) fn export_annotated_region(
+    cx: &mut App,
+    cap: &CapturedDesktop,
+    result: &OverlayResult,
+) {
+    match crop_from_app(cx, cap, result.x, result.y, result.w, result.h) {
+        Ok((mut px, cw, ch, stride)) => {
+            apply_annotations(
+                &mut px,
+                cw,
+                ch,
+                stride,
+                result.x as f64,
+                result.y as f64,
+                &result.marks,
+            );
+            if let Err(e) = export_pixels(px, cw, ch, stride, result.write_file, result.copy) {
+                eprintln!("export failed: {e}");
+            }
+        }
+        Err(e) => eprintln!("crop failed: {e}"),
     }
 }
 
@@ -749,9 +774,8 @@ fn export_pixels(
                     windows::Win32::System::Com::COINIT_MULTITHREADED,
                 );
             }
-            match write_png_file(&path, &px_file, cw, ch, stride) {
-                Ok(()) => println!("saved {}", path.display()),
-                Err(e) => eprintln!("png write failed: {e}"),
+            if let Err(e) = write_png_file(&path, &px_file, cw, ch, stride) {
+                eprintln!("png write failed: {e}");
             }
         });
     }

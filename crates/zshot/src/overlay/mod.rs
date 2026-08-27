@@ -1,31 +1,42 @@
 //! GPUI freeze overlay: dim, marching ants, window snap, 15×15 magnifier.
 
+mod assets;
+pub(crate) mod composite;
+mod editor;
+mod theme;
+mod toolbar;
+
+pub use assets::ToolbarAssets;
+
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    actions, black, canvas, div, fill, hsla, outline, point, prelude::*, px, rgb, size, white, App,
-    BorderStyle, Bounds, Context, CursorStyle, Entity, FocusHandle, Focusable, InteractiveElement,
-    KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels,
-    Point as GpuiPoint, Timer, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
-    WindowKind, WindowOptions,
+    actions, black, canvas, div, fill, hsla, outline, point, prelude::*, px, rgb, size, svg, white,
+    App, BorderStyle, Bounds, BoxShadow, Context, CursorStyle, Entity, FocusHandle, Focusable,
+    InteractiveElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PathBuilder, Pixels, Point as GpuiPoint, Timer, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions,
 };
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
 use windows::Win32::Graphics::Dxgi::IDXGISwapChain1;
+use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetCursorPos, GetWindowLongPtrW, GetWindowRect, IsIconic, IsWindowVisible,
-    PostMessageW, SetForegroundWindow, SetWindowDisplayAffinity, SetWindowPos, ShowWindow,
-    GWL_EXSTYLE, HWND_TOPMOST, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, WDA_EXCLUDEFROMCAPTURE,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    EnumWindows, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect, IsIconic,
+    IsWindowVisible, PostMessageW, SetForegroundWindow, SetWindowDisplayAffinity, SetWindowPos,
+    ShowWindow, GWL_EXSTYLE, HWND_TOPMOST, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW,
+    WDA_EXCLUDEFROMCAPTURE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
 use crate::platform::WM_APP_READY_SENTINEL;
-use crate::capture::CapturedDesktop;
+use crate::capture::{crop_sdr_bgra, enumerate_monitors, CapturedDesktop};
 use crate::error::Result;
+use crate::overlay::editor::{filled_arrow, Element, PressKind, Session, Shape, Tool};
+use crate::overlay::toolbar::PHASE1_ITEMS;
 use crate::geom::{
     hit_test, move_rect, physical_source_rect, resize_rect, Point, Rect, SelectionHitKind,
 };
@@ -35,6 +46,11 @@ use crate::perf::PerfSession;
 const MAG_COUNT: u32 = 15;
 const MAG_PIXEL: f32 = 10.0;
 const MIN_RECT: f64 = 5.0;
+
+/// Complete / Enter: clipboard only. Save writes a file.
+fn complete_export_flags() -> (bool, bool) {
+    (false, true)
+}
 
 /// C# RegionCaptureWindow: dash {5,5}, offset = elapsed * -15.
 pub const ANTS_DASH: [f32; 2] = [5.0, 5.0];
@@ -48,19 +64,40 @@ pub fn bench_auto_hide_enabled() -> bool {
     std::env::var_os("ZSHOT_BENCH").is_some()
 }
 
-actions!(overlay, [ConfirmSelection, CancelOverlay]);
+actions!(overlay, [ConfirmSelection, CancelOverlay, UndoEdit, RedoEdit]);
 
 thread_local! {
     static OVERLAY_WINDOW: RefCell<Option<WindowHandle<OverlayView>>> = const { RefCell::new(None) };
     static KEYS_BOUND: Cell<bool> = const { Cell::new(false) };
 }
 
-pub struct OverlayResult {
+pub(crate) struct OverlayResult {
     pub confirmed: bool,
+    pub write_file: bool,
+    pub copy: bool,
     pub x: u32,
     pub y: u32,
     pub w: u32,
     pub h: u32,
+    pub marks: Vec<Element>,
+}
+
+fn empty_result() -> OverlayResult {
+    OverlayResult {
+        confirmed: false,
+        write_file: false,
+        copy: false,
+        x: 0,
+        y: 0,
+        w: 0,
+        h: 0,
+        marks: Vec::new(),
+    }
+}
+
+struct TextDraft {
+    pt: Point,
+    buf: String,
 }
 
 /// Region overlay root view. Freeze is DComp visual 0; this paints UI visual 1.
@@ -86,6 +123,8 @@ pub struct OverlayView {
     start: Instant,
     visible: bool,
     mag: Option<(Vec<u8>, u32, u32, u32)>,
+    editor: Session,
+    text_edit: Option<TextDraft>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -105,18 +144,7 @@ pub fn show_overlay(
         Ok(entity) => entity,
         Err(e) => {
             eprintln!("overlay: {e}");
-            crate::app::complete_region_shot(
-                OverlayResult {
-                    confirmed: false,
-                    x: 0,
-                    y: 0,
-                    w: 0,
-                    h: 0,
-                },
-                None,
-                None,
-                cx,
-            );
+            crate::app::complete_region_shot(empty_result(), None, None, cx);
             cx.new(OverlayView::placeholder)
         }
     }
@@ -129,6 +157,8 @@ fn bind_overlay_keys(cx: &mut App) {
     cx.bind_keys(vec![
         KeyBinding::new("enter", ConfirmSelection, Some("Overlay")),
         KeyBinding::new("escape", CancelOverlay, Some("Overlay")),
+        KeyBinding::new("ctrl-z", UndoEdit, Some("Overlay")),
+        KeyBinding::new("ctrl-y", RedoEdit, Some("Overlay")),
     ]);
     KEYS_BOUND.set(true);
 }
@@ -216,6 +246,8 @@ impl OverlayView {
             start: Instant::now(),
             visible: false,
             mag: None,
+            editor: Session::new(),
+            text_edit: None,
         }
     }
 
@@ -248,6 +280,8 @@ impl OverlayView {
             start: Instant::now(),
             visible: true,
             mag: None,
+            editor: Session::new(),
+            text_edit: None,
         };
         view.sync_from_cap(window);
         view
@@ -275,6 +309,8 @@ impl OverlayView {
         self.start = Instant::now();
         self.visible = true;
         self.mag = None;
+        self.editor = Session::new();
+        self.text_edit = None;
         self.sync_from_cap(window);
     }
 
@@ -308,15 +344,22 @@ impl OverlayView {
             }
         }
         let hwnd = window.win32_hwnd();
+        let desired = RECT {
+            left: self.origin_x,
+            top: self.origin_y,
+            right: self.origin_x + self.freeze_size.0 as i32,
+            bottom: self.origin_y + self.freeze_size.1 as i32,
+        };
+        let outer = window_rect_for_client_area(hwnd, desired);
         unsafe {
             let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
             let _ = SetWindowPos(
                 hwnd,
                 Some(HWND_TOPMOST),
-                self.origin_x,
-                self.origin_y,
-                self.freeze_size.0 as i32,
-                self.freeze_size.1 as i32,
+                outer.left,
+                outer.top,
+                outer.right - outer.left,
+                outer.bottom - outer.top,
                 SWP_SHOWWINDOW,
             );
             let _ = ShowWindow(hwnd, SW_SHOW);
@@ -407,22 +450,61 @@ impl OverlayView {
             return;
         }
         if event.button == MouseButton::Right {
+            if self.text_edit.take().is_some() {
+                cx.notify();
+                return;
+            }
             self.cancel(window, cx);
             return;
         }
         if event.button != MouseButton::Left {
             return;
         }
-        self.mouse = Self::pointer_to_capture(event.position, window.scale_factor());
+        let scale = window.scale_factor();
+        self.mouse = Self::pointer_to_capture(event.position, scale);
+        if self.phase == Phase::Active {
+            if let Some(id) = self.hit_toolbar_item(self.mouse, scale) {
+                self.handle_toolbar(id, window, cx);
+                return;
+            }
+        }
+        if let Some(edit) = self.text_edit.take() {
+            self.editor.add_text(edit.pt, &edit.buf);
+        }
         self.down = true;
         self.down_pt = self.mouse;
+        self.hit = SelectionHitKind::None;
         if self.phase == Phase::Active && self.has_sel {
-            self.hit = hit_test(self.selection, self.mouse, 8.0);
-            self.sel_at_press = self.selection;
-        } else {
-            self.hit = SelectionHitKind::None;
+            self.on_active_press();
         }
         cx.notify();
+    }
+
+    fn on_active_press(&mut self) {
+        match self.editor.tool {
+            Tool::Select => {
+                self.hit = hit_test(self.selection, self.mouse, 8.0);
+                self.sel_at_press = self.selection;
+                let on_handle =
+                    self.hit != SelectionHitKind::None && self.hit != SelectionHitKind::Inside;
+                if !on_handle {
+                    self.editor.pointer_pressed(self.mouse);
+                    if self.editor.selected_id.is_some() {
+                        self.hit = SelectionHitKind::None;
+                    }
+                }
+            }
+            _ => match self.editor.pointer_pressed(self.mouse) {
+                PressKind::RequestText => {
+                    self.down = false;
+                    self.text_edit = Some(TextDraft {
+                        pt: self.mouse,
+                        buf: String::new(),
+                    });
+                }
+                PressKind::Capture => {}
+            },
+        }
     }
 
     fn on_mouse_move(
@@ -447,6 +529,10 @@ impl OverlayView {
             return;
         }
         if event.button == MouseButton::Right {
+            if self.text_edit.take().is_some() {
+                cx.notify();
+                return;
+            }
             self.cancel(window, cx);
             return;
         }
@@ -454,12 +540,8 @@ impl OverlayView {
             return;
         }
         self.mouse = Self::pointer_to_capture(event.position, window.scale_factor());
-        let confirm = self.on_up();
-        if confirm {
-            self.confirm(window, cx);
-        } else {
-            cx.notify();
-        }
+        self.on_up();
+        cx.notify();
     }
 
     fn on_move(&mut self) {
@@ -473,6 +555,17 @@ impl OverlayView {
                 self.has_sel = true;
             }
         } else if self.down && self.phase == Phase::Active {
+            if self.editor.tool != Tool::Select && self.editor.tool != Tool::Text {
+                if !self.editor.is_dragging() {
+                    let _ = self.editor.pointer_pressed(self.down_pt);
+                }
+                self.editor.pointer_moved(self.mouse);
+                return;
+            }
+            if self.editor.is_dragging() && self.editor.selected_id.is_some() {
+                self.editor.pointer_moved(self.mouse);
+                return;
+            }
             let bounds = Rect::new(
                 0.0,
                 0.0,
@@ -495,11 +588,15 @@ impl OverlayView {
         }
     }
 
-    fn on_up(&mut self) -> bool {
+    fn on_up(&mut self) {
         if !self.down {
-            return false;
+            return;
         }
         self.down = false;
+        if self.phase == Phase::Active {
+            self.editor.pointer_released();
+            return;
+        }
         if self.phase == Phase::Selecting {
             let dx = (self.mouse.x - self.down_pt.x).abs();
             let dy = (self.mouse.y - self.down_pt.y).abs();
@@ -508,7 +605,7 @@ impl OverlayView {
                     self.selection = h;
                     self.from_drag = false;
                     self.has_sel = true;
-                    return true;
+                    self.phase = Phase::Active;
                 }
             } else if self.has_sel
                 && self.selection.width > MIN_RECT
@@ -517,7 +614,6 @@ impl OverlayView {
                 self.phase = Phase::Active;
             }
         }
-        false
     }
 
     fn current_rect(&self) -> Option<Rect> {
@@ -551,12 +647,16 @@ impl OverlayView {
         if w < 2 || h < 2 {
             return None;
         }
+        let (write_file, copy) = complete_export_flags();
         Some(OverlayResult {
             confirmed: true,
+            write_file,
+            copy,
             x: x as u32,
             y: y as u32,
             w: w as u32,
             h: h as u32,
+            marks: self.editor.elements.clone(),
         })
     }
 
@@ -566,11 +666,58 @@ impl OverlayView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(edit) = self.text_edit.take() {
+            self.editor.add_text(edit.pt, &edit.buf);
+            cx.notify();
+            return;
+        }
         self.confirm(window, cx);
     }
 
     fn cancel_action(&mut self, _: &CancelOverlay, window: &mut Window, cx: &mut Context<Self>) {
+        if self.text_edit.take().is_some() {
+            cx.notify();
+            return;
+        }
         self.cancel(window, cx);
+    }
+
+    fn undo_action(&mut self, _: &UndoEdit, _: &mut Window, cx: &mut Context<Self>) {
+        self.editor.undo();
+        cx.notify();
+    }
+
+    fn redo_action(&mut self, _: &RedoEdit, _: &mut Window, cx: &mut Context<Self>) {
+        self.editor.redo();
+        cx.notify();
+    }
+
+    fn on_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(edit) = self.text_edit.as_mut() else {
+            return;
+        };
+        if event.keystroke.key == "backspace" {
+            edit.buf.pop();
+            cx.notify();
+            return;
+        }
+        if event.keystroke.modifiers.control
+            || event.keystroke.modifiers.alt
+            || event.keystroke.modifiers.platform
+        {
+            return;
+        }
+        if let Some(ch) = event.keystroke.key_char.as_ref() {
+            if !ch.is_empty() && ch != "\r" && ch != "\n" && ch != "\u{1b}" {
+                edit.buf.push_str(ch);
+                cx.notify();
+            }
+        }
     }
 
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -583,21 +730,22 @@ impl OverlayView {
         self.finish(result, window, cx);
     }
 
+    fn save(&mut self, cx: &mut Context<Self>) {
+        let Some(mut result) = self.result_from_current() else {
+            return;
+        };
+        result.copy = false;
+        result.write_file = true;
+        if let Some(cap) = self.cap.as_ref() {
+            crate::app::export_annotated_region(cx, cap, &result);
+        }
+    }
+
     fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.visible {
             return;
         }
-        self.finish(
-            OverlayResult {
-                confirmed: false,
-                x: 0,
-                y: 0,
-                w: 0,
-                h: 0,
-            },
-            window,
-            cx,
-        );
+        self.finish(empty_result(), window, cx);
     }
 
     fn finish(&mut self, result: OverlayResult, window: &mut Window, cx: &mut Context<Self>) {
@@ -607,6 +755,147 @@ impl OverlayView {
         let perf = self.perf.borrow_mut().take();
         crate::app::complete_region_shot(result, cap, perf, cx);
         cx.notify();
+    }
+
+    fn active_monitor_rect(&self) -> Rect {
+        let cx = self.origin_x as f64 + self.selection.x + self.selection.width / 2.0;
+        let cy = self.origin_y as f64 + self.selection.y + self.selection.height / 2.0;
+        if let Ok(mons) = enumerate_monitors() {
+            for m in mons {
+                if cx >= m.x as f64
+                    && cx < (m.x + m.w) as f64
+                    && cy >= m.y as f64
+                    && cy < (m.y + m.h) as f64
+                {
+                    return Rect::new(
+                        (m.x - self.origin_x) as f64,
+                        (m.y - self.origin_y) as f64,
+                        m.w as f64,
+                        m.h as f64,
+                    );
+                }
+            }
+        }
+        Rect::new(
+            0.0,
+            0.0,
+            self.freeze_size.0 as f64,
+            self.freeze_size.1 as f64,
+        )
+    }
+
+    fn toolbar_geom(&self, scale: f32) -> Option<Rect> {
+        if self.phase != Phase::Active || !self.has_sel {
+            return None;
+        }
+        let n = PHASE1_ITEMS.len();
+        let (w, h) = toolbar::bar_size(n);
+        let s = scale as f64;
+        let pos = toolbar::place_toolbar(
+            self.selection,
+            w * s,
+            h * s,
+            self.active_monitor_rect(),
+            toolbar::ANCHOR_GAP * s,
+        );
+        Some(Rect::new(pos.x, pos.y, w * s, h * s))
+    }
+
+    fn hit_toolbar_item(&self, p: Point, scale: f32) -> Option<&'static str> {
+        let geom = self.toolbar_geom(scale)?;
+        let hidden = toolbar::parse_hidden(Some(""));
+        let items: Vec<&'static str> = PHASE1_ITEMS
+            .iter()
+            .copied()
+            .filter(|id| toolbar::is_visible(id, &hidden))
+            .collect();
+        toolbar_item_at(p, geom, &items)
+    }
+
+    fn handle_toolbar(&mut self, id: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tool) = Tool::from_id(id) {
+            self.editor.cancel_draft();
+            self.editor.tool = tool;
+            cx.notify();
+            return;
+        }
+        match id {
+            toolbar::UNDO => {
+                self.editor.undo();
+                cx.notify();
+            }
+            toolbar::REDO => {
+                self.editor.redo();
+                cx.notify();
+            }
+            toolbar::CLEAR => {
+                self.editor.clear();
+                cx.notify();
+            }
+            toolbar::SAVE => self.save(cx),
+            toolbar::COMPLETE => self.confirm(window, cx),
+            toolbar::CANCEL => self.cancel(window, cx),
+            _ => {}
+        }
+    }
+
+    fn mosaic_tiles(&self, cx: &mut App) -> Vec<(Rect, u32)> {
+        let mut out = Vec::new();
+        let Some(cap) = self.cap.as_ref() else {
+            return out;
+        };
+        for el in self.editor.visible() {
+            let Shape::Mosaic { block_size } = el.shape else {
+                continue;
+            };
+            let x = el.bounds.x.max(0.0) as u32;
+            let y = el.bounds.y.max(0.0) as u32;
+            let w = el.bounds.width.max(1.0) as u32;
+            let h = el.bounds.height.max(1.0) as u32;
+            let w = w.min(cap.width.saturating_sub(x));
+            let h = h.min(cap.height.saturating_sub(y));
+            if w < 2 || h < 2 {
+                continue;
+            }
+            let Ok((mut px, cw, ch, stride)) = (match cx
+                .with_gpu_context(|_d, ctx| crop_sdr_bgra(cap, ctx, x, y, w, h))
+            {
+                Some(r) => r,
+                None => continue,
+            }) else {
+                continue;
+            };
+            crate::overlay::composite::pixelate(
+                &mut px,
+                cw,
+                ch,
+                stride,
+                Rect::new(0.0, 0.0, cw as f64, ch as f64),
+                block_size,
+            );
+            let block = block_size.max(2) as u32;
+            let mut cy = 0u32;
+            while cy < ch {
+                let mut cxb = 0u32;
+                while cxb < cw {
+                    let i = (cy * stride + cxb * 4) as usize;
+                    if i + 2 < px.len() {
+                        let rgb = ((px[i + 2] as u32) << 16)
+                            | ((px[i + 1] as u32) << 8)
+                            | px[i] as u32;
+                        let bw = block.min(cw - cxb) as f64;
+                        let bh = block.min(ch - cy) as f64;
+                        out.push((
+                            Rect::new((x + cxb) as f64, (y + cy) as f64, bw, bh),
+                            rgb,
+                        ));
+                    }
+                    cxb += block;
+                }
+                cy += block;
+            }
+        }
+        out
     }
 
     fn refresh_magnifier_gpu(&mut self, cx: &mut App) {
@@ -624,6 +913,90 @@ impl OverlayView {
                 crate::capture::crop_sdr_bgra(cap, ctx, x, y, MAG_COUNT, MAG_COUNT)
             })
             .and_then(|r| r.ok());
+    }
+
+    fn toolbar_element(&self, scale: f32, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let geom = self.toolbar_geom(scale)?;
+        let tool_id = self.editor.tool.id();
+        let can_undo = self.editor.history.can_undo();
+        let can_redo = self.editor.history.can_redo();
+        let hidden = toolbar::parse_hidden(Some(""));
+        Some(
+            div()
+                .absolute()
+                .left(px(geom.x as f32 / scale))
+                .top(px(geom.y as f32 / scale))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(toolbar::ITEM_GAP as f32))
+                .px(px(toolbar::PAD as f32))
+                .py(px(toolbar::PAD as f32))
+                .rounded_xl()
+                .bg(theme::surface())
+                .border_1()
+                .border_color(theme::border())
+                .shadow(vec![BoxShadow {
+                    color: theme::base().opacity(0.18),
+                    offset: point(px(0.), px(4.)),
+                    blur_radius: px(16.),
+                    spread_radius: px(0.),
+                }])
+                .occlude()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .children(PHASE1_ITEMS.iter().copied().filter(|id| toolbar::is_visible(id, &hidden)).map(|id| {
+                    let active = tool_id == id;
+                    let dim = (id == toolbar::UNDO && !can_undo)
+                        || (id == toolbar::REDO && !can_redo);
+                    toolbar_button(id, active, dim, cx)
+                })),
+        )
+    }
+
+    fn committed_text_elements(&self, scale: f32) -> impl IntoIterator<Item = impl IntoElement> {
+        self.editor
+            .elements
+            .iter()
+            .filter_map(move |el| {
+                let Shape::Text { text, font_size } = &el.shape else {
+                    return None;
+                };
+                Some(
+                    div()
+                        .absolute()
+                        .left(px(el.bounds.x as f32 / scale))
+                        .top(px(el.bounds.y as f32 / scale))
+                        .text_color(rgb(el.stroke & 0x00FF_FFFF))
+                        .text_size(px(*font_size as f32 / scale))
+                        .child(text.clone()),
+                )
+            })
+            .collect::<Vec<_>>()
+    }
+
+    fn text_field_element(&self, scale: f32) -> Option<impl IntoElement> {
+        let edit = self.text_edit.as_ref()?;
+        let shown = if edit.buf.is_empty() {
+            "|".to_string()
+        } else {
+            format!("{}|", edit.buf)
+        };
+        Some(
+            div()
+                .absolute()
+                .left(px(edit.pt.x as f32 / scale))
+                .top(px(edit.pt.y as f32 / scale))
+                .min_w(px(80.))
+                .px(px(4.))
+                .py(px(2.))
+                .bg(white())
+                .text_color(black())
+                .text_sm()
+                .occlude()
+                .child(shown),
+        )
     }
 }
 
@@ -645,40 +1018,129 @@ impl Render for OverlayView {
         let phase = self.phase;
         let start = self.start;
         let has_sel = self.has_sel;
+        let marks: Vec<Element> = self.editor.visible().cloned().collect();
+        let mosaic = self.mosaic_tiles(cx);
+        let tool = self.editor.tool;
+        let cursor = match (phase, tool, self.text_edit.is_some()) {
+            (_, _, true) => CursorStyle::IBeam,
+            (Phase::Selecting, _, _) => CursorStyle::Crosshair,
+            (Phase::Active, Tool::Select, _) => CursorStyle::Arrow,
+            (Phase::Active, Tool::Text, _) => CursorStyle::IBeam,
+            _ => CursorStyle::Crosshair,
+        };
 
         div()
             .id("overlay-root")
             .size_full()
             .key_context("Overlay")
             .track_focus(&self.focus_handle)
-            .cursor(CursorStyle::Crosshair)
+            .cursor(cursor)
             .occlude()
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up(MouseButton::Right, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(Self::confirm_action))
             .on_action(cx.listener(Self::cancel_action))
+            .on_action(cx.listener(Self::undo_action))
+            .on_action(cx.listener(Self::redo_action))
             .child(
                 canvas(
                     move |_, _, _| (),
                     move |bounds, _, window, _cx| {
-                        paint_overlay(window, bounds, OverlayPaint {
-                            shown,
-                            mouse,
-                            mag,
-                            phase,
-                            start,
-                            has_sel,
-                            scale,
-                        });
+                        paint_overlay(
+                            window,
+                            bounds,
+                            OverlayPaint {
+                                shown,
+                                mouse,
+                                mag,
+                                phase,
+                                start,
+                                has_sel,
+                                scale,
+                                marks,
+                                mosaic,
+                            },
+                        );
                     },
                 )
                 .size_full(),
             )
             .child(coord_label(shown, mouse, phase, scale))
+            .children(self.toolbar_element(scale, cx))
+            .children(self.text_field_element(scale))
+            .children(self.committed_text_elements(scale))
     }
+}
+
+fn toolbar_button(
+    id: &'static str,
+    active: bool,
+    dim: bool,
+    cx: &mut Context<OverlayView>,
+) -> impl IntoElement {
+    let fg = if dim {
+        theme::disabled_fg()
+    } else if active {
+        theme::accent()
+    } else {
+        theme::primary_fg()
+    };
+    let idle_bg = if active {
+        theme::active_background()
+    } else {
+        theme::transparent()
+    };
+    let hover_bg = if active {
+        theme::active_background()
+    } else {
+        theme::elevated_surface()
+    };
+    div()
+        .id(id)
+        .w(px(toolbar::BTN as f32))
+        .h(px(toolbar::BTN as f32))
+        .rounded_md()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(idle_bg)
+        .text_color(fg)
+        .cursor(if dim {
+            CursorStyle::Arrow
+        } else {
+            CursorStyle::PointingHand
+        })
+        .when(!dim, |el| el.hover(move |s| s.bg(hover_bg)))
+        .child(
+            svg()
+                .path(toolbar::icon_path(id).unwrap_or(""))
+                .w(px(toolbar::ICON))
+                .h(px(toolbar::ICON))
+                .text_color(fg),
+        )
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |view, _, window, cx| {
+                view.handle_toolbar(id, window, cx);
+                cx.stop_propagation();
+            }),
+        )
+}
+
+fn toolbar_item_at(p: Point, geom: Rect, items: &[&'static str]) -> Option<&'static str> {
+    if items.is_empty() || !geom.contains(p) {
+        return None;
+    }
+    let slot = geom.width / items.len() as f64;
+    if slot <= 0.0 {
+        return None;
+    }
+    let i = ((p.x - geom.x) / slot).floor() as usize;
+    items.get(i.min(items.len() - 1)).copied()
 }
 
 fn coord_label(
@@ -725,6 +1187,8 @@ struct OverlayPaint {
     start: Instant,
     has_sel: bool,
     scale: f32,
+    marks: Vec<Element>,
+    mosaic: Vec<(Rect, u32)>,
 }
 
 fn paint_overlay(window: &mut Window, bounds: Bounds<Pixels>, paint: OverlayPaint) {
@@ -736,6 +1200,8 @@ fn paint_overlay(window: &mut Window, bounds: Bounds<Pixels>, paint: OverlayPain
         start,
         has_sel,
         scale,
+        marks,
+        mosaic,
     } = paint;
     let hole = shown.map(|r| rect_to_bounds(r, scale));
     for dim in dim_around(bounds, hole) {
@@ -749,10 +1215,213 @@ fn paint_overlay(window: &mut Window, bounds: Bounds<Pixels>, paint: OverlayPain
             paint_handles(window, dest, scale);
         }
     }
+    paint_marks(window, &marks, &mosaic, scale);
     if phase == Phase::Selecting {
         if let Some(pixels) = mag {
             paint_magnifier(window, bounds, mouse, pixels, scale);
         }
+    }
+}
+
+fn paint_marks(
+    window: &mut Window,
+    marks: &[Element],
+    mosaic: &[(Rect, u32)],
+    scale: f32,
+) {
+    for (r, color) in mosaic {
+        window.paint_quad(fill(rect_to_bounds(*r, scale), rgb(*color)));
+    }
+    for el in marks {
+        let stroke = rgb(el.stroke & 0x00FF_FFFF);
+        match &el.shape {
+            Shape::Rect => {
+                paint_rect_outline(window, el.bounds, el.stroke_width, scale, stroke);
+            }
+            Shape::Mosaic { .. } => {
+                if mosaic.is_empty() {
+                    window.paint_quad(fill(
+                        rect_to_bounds(el.bounds, scale),
+                        hsla(0., 0., 0.5, 0.35),
+                    ));
+                }
+            }
+            Shape::Arrow { start, end, head } => {
+                paint_arrow(window, *start, *end, *head, el.stroke_width, scale, stroke);
+            }
+            Shape::Pen { points } => {
+                paint_polyline(window, points, el.stroke_width, scale, stroke);
+            }
+            Shape::Text { text, font_size } => {
+                let _ = (text, font_size);
+                // Text is a GPUI div in the overlay tree; CPU composite handles export.
+            }
+        }
+    }
+}
+
+fn paint_rect_outline(
+    window: &mut Window,
+    r: Rect,
+    stroke_w: f64,
+    scale: f32,
+    color: gpui::Rgba,
+) {
+    let t = (stroke_w as f32 / scale).max(2.0);
+    let x = r.x as f32 / scale;
+    let y = r.y as f32 / scale;
+    let w = r.width as f32 / scale;
+    let h = r.height as f32 / scale;
+    window.paint_quad(fill(
+        Bounds {
+            origin: point(px(x), px(y)),
+            size: size(px(w.max(t)), px(t)),
+        },
+        color,
+    ));
+    window.paint_quad(fill(
+        Bounds {
+            origin: point(px(x), px(y + h - t)),
+            size: size(px(w.max(t)), px(t)),
+        },
+        color,
+    ));
+    window.paint_quad(fill(
+        Bounds {
+            origin: point(px(x), px(y)),
+            size: size(px(t), px(h.max(t))),
+        },
+        color,
+    ));
+    window.paint_quad(fill(
+        Bounds {
+            origin: point(px(x + w - t), px(y)),
+            size: size(px(t), px(h.max(t))),
+        },
+        color,
+    ));
+}
+
+fn paint_arrow(
+    window: &mut Window,
+    start: Point,
+    end: Point,
+    _head: f64,
+    stroke_w: f64,
+    scale: f32,
+    color: gpui::Rgba,
+) {
+    let Some(g) = filled_arrow(start, end, stroke_w) else {
+        return;
+    };
+    for (a, b, c) in g.triangles() {
+        paint_filled_triangle(window, a, b, c, scale, color);
+    }
+}
+
+fn paint_filled_triangle(
+    window: &mut Window,
+    a: Point,
+    b: Point,
+    c: Point,
+    scale: f32,
+    color: gpui::Rgba,
+) {
+    let ax = a.x as f32 / scale;
+    let ay = a.y as f32 / scale;
+    let bx = b.x as f32 / scale;
+    let by = b.y as f32 / scale;
+    let cx = c.x as f32 / scale;
+    let cy = c.y as f32 / scale;
+    let min_y = ay.min(by).min(cy).floor() as i32;
+    let max_y = ay.max(by).max(cy).ceil() as i32;
+    let edges = [(ax, ay, bx, by), (bx, by, cx, cy), (cx, cy, ax, ay)];
+    for y_i in min_y..=max_y {
+        let y = y_i as f32 + 0.5;
+        let mut xs = [f32::NAN; 4];
+        let mut n = 0;
+        for (x0, y0, x1, y1) in edges {
+            if n < 4 && ((y0 <= y && y1 > y) || (y1 <= y && y0 > y)) {
+                let t = (y - y0) / (y1 - y0);
+                xs[n] = x0 + t * (x1 - x0);
+                n += 1;
+            }
+        }
+        if n < 2 {
+            continue;
+        }
+        let (x_min, x_max) = if n == 2 {
+            (xs[0].min(xs[1]), xs[0].max(xs[1]))
+        } else {
+            let lo = xs[0].min(xs[1]).min(xs[2]);
+            let hi = xs[0].max(xs[1]).max(xs[2]);
+            (lo, hi)
+        };
+        if x_max - x_min < 0.5 {
+            continue;
+        }
+        window.paint_quad(fill(
+            Bounds {
+                origin: point(px(x_min), px(y_i as f32)),
+                size: size(px(x_max - x_min), px(1.0)),
+            },
+            color,
+        ));
+    }
+}
+
+fn paint_polyline(
+    window: &mut Window,
+    points: &[Point],
+    stroke_w: f64,
+    scale: f32,
+    color: gpui::Rgba,
+) {
+    if points.len() == 1 {
+        let r = (stroke_w / 2.0).max(1.0) as f32 / scale;
+        window.paint_quad(fill(
+            Bounds {
+                origin: point(
+                    px(points[0].x as f32 / scale - r),
+                    px(points[0].y as f32 / scale - r),
+                ),
+                size: size(px(r * 2.), px(r * 2.)),
+            },
+            color,
+        ));
+        return;
+    }
+    for w in points.windows(2) {
+        paint_segment(window, w[0], w[1], stroke_w, scale, color);
+    }
+}
+
+fn paint_segment(
+    window: &mut Window,
+    a: Point,
+    b: Point,
+    stroke_w: f64,
+    scale: f32,
+    color: gpui::Rgba,
+) {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let len = (dx * dx + dy * dy).sqrt().max(1.0);
+    let hw = (stroke_w / 2.0).max(1.5);
+    let step = hw.max(1.0);
+    let n = (len / step).ceil() as i32;
+    let s = (hw as f32 / scale).max(1.0);
+    for i in 0..=n {
+        let t = i as f64 / n.max(1) as f64;
+        let x = (a.x + dx * t) as f32 / scale;
+        let y = (a.y + dy * t) as f32 / scale;
+        window.paint_quad(fill(
+            Bounds {
+                origin: point(px(x - s), px(y - s)),
+                size: size(px(s * 2.), px(s * 2.)),
+            },
+            color,
+        ));
     }
 }
 
@@ -982,6 +1651,36 @@ fn hit_window(windows: &[Rect], p: Point) -> Option<Rect> {
     windows.iter().copied().find(|r| r.contains(p))
 }
 
+/// Outer HWND rect whose client area equals `desired` (screen coordinates).
+/// GPUI PopUp `WM_NCCALCSIZE` insets would otherwise shift the freeze visual right.
+fn window_rect_for_client_area(hwnd: HWND, desired: RECT) -> RECT {
+    let mut window = RECT::default();
+    let mut client = RECT::default();
+    let mut origin = POINT::default();
+    unsafe {
+        if GetWindowRect(hwnd, &mut window).is_err()
+            || GetClientRect(hwnd, &mut client).is_err()
+            || !ClientToScreen(hwnd, &mut origin).as_bool()
+        {
+            return desired;
+        }
+    }
+    apply_nc_borders(window, origin, client, desired)
+}
+
+fn apply_nc_borders(window: RECT, client_origin: POINT, client: RECT, desired: RECT) -> RECT {
+    let left = client_origin.x - window.left;
+    let top = client_origin.y - window.top;
+    let right = window.right - (client_origin.x + client.right - client.left);
+    let bottom = window.bottom - (client_origin.y + client.bottom - client.top);
+    RECT {
+        left: desired.left - left,
+        top: desired.top - top,
+        right: desired.right + right,
+        bottom: desired.bottom + bottom,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1011,5 +1710,81 @@ mod tests {
         let mid = ants_dash_array(0.2);
         assert_eq!(mid.len(), 4);
         assert!((f32::from(mid[1]) - 3.0).abs() < 1e-3, "{mid:?}");
+    }
+
+    #[test]
+    fn nc_insets_expand_window_so_client_matches_capture() {
+        // Win11-style: 8px left/right/bottom, 1px top.
+        let window = RECT {
+            left: 100,
+            top: 50,
+            right: 100 + 1920 + 16,
+            bottom: 50 + 1080 + 9,
+        };
+        let client_origin = POINT { x: 108, y: 51 };
+        let client = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let desired = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let outer = apply_nc_borders(window, client_origin, client, desired);
+        assert_eq!(outer.left, -8);
+        assert_eq!(outer.top, -1);
+        assert_eq!(outer.right, 1928);
+        assert_eq!(outer.bottom, 1088);
+    }
+
+    #[test]
+    fn zero_nc_insets_keep_window_on_capture_bounds() {
+        let window = RECT {
+            left: 0,
+            top: 0,
+            right: 800,
+            bottom: 600,
+        };
+        let client_origin = POINT { x: 0, y: 0 };
+        let client = RECT {
+            left: 0,
+            top: 0,
+            right: 800,
+            bottom: 600,
+        };
+        let desired = RECT {
+            left: -1920,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let outer = apply_nc_borders(window, client_origin, client, desired);
+        assert_eq!(outer.left, desired.left);
+        assert_eq!(outer.top, desired.top);
+        assert_eq!(outer.right, desired.right);
+        assert_eq!(outer.bottom, desired.bottom);
+    }
+
+    #[test]
+    fn complete_defaults_to_clipboard_not_file() {
+        let (write_file, copy) = complete_export_flags();
+        assert!(!write_file);
+        assert!(copy);
+    }
+
+    #[test]
+    fn toolbar_item_at_picks_slot_under_pointer() {
+        let geom = Rect::new(100.0, 200.0, 400.0, 40.0);
+        let items = ["select", "rect", "arrow", "pen"];
+        assert_eq!(toolbar_item_at(Point { x: 110.0, y: 210.0 }, geom, &items), Some("select"));
+        assert_eq!(toolbar_item_at(Point { x: 210.0, y: 210.0 }, geom, &items), Some("rect"));
+        assert_eq!(toolbar_item_at(Point { x: 310.0, y: 210.0 }, geom, &items), Some("arrow"));
+        assert_eq!(toolbar_item_at(Point { x: 450.0, y: 210.0 }, geom, &items), Some("pen"));
+        assert_eq!(toolbar_item_at(Point { x: 50.0, y: 210.0 }, geom, &items), None);
+        assert_eq!(toolbar_item_at(Point { x: 210.0, y: 10.0 }, geom, &items), None);
     }
 }

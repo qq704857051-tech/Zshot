@@ -1,12 +1,14 @@
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreatePopupMenu, DestroyMenu, GetCursorPos, InsertMenuW, LoadIconW, RegisterWindowMessageW,
-    SetForegroundWindow, TrackPopupMenu, HICON, IDI_APPLICATION, MF_BYPOSITION, MF_STRING,
-    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_LBUTTONUP, WM_RBUTTONUP,
+    CreatePopupMenu, DestroyMenu, GetCursorPos, InsertMenuW, LoadIconW, LoadImageW,
+    RegisterWindowMessageW, SetForegroundWindow, TrackPopupMenu, HICON, IDI_APPLICATION,
+    IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, MF_BYPOSITION, MF_STRING, TPM_LEFTALIGN,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_LBUTTONUP, WM_RBUTTONUP,
 };
 
 use crate::error::Result;
@@ -35,9 +37,28 @@ pub fn taskbar_created_message() -> u32 {
     })
 }
 
+/// Embedded by `build.rs` as resource 1 (`winres` `set_icon`).
+pub fn load_app_icon() -> Result<HICON> {
+    unsafe {
+        let module = GetModuleHandleW(None)?;
+        let handle = LoadImageW(
+            Some(module.into()),
+            PCWSTR(1 as *const u16),
+            IMAGE_ICON,
+            0,
+            0,
+            LR_DEFAULTSIZE | LR_SHARED,
+        );
+        match handle {
+            Ok(h) => Ok(HICON(h.0)),
+            Err(_) => Ok(LoadIconW(None, IDI_APPLICATION)?),
+        }
+    }
+}
+
 pub fn add_tray_icon(hwnd: HWND) -> Result<()> {
     unsafe {
-        let icon: HICON = LoadIconW(None, IDI_APPLICATION)?;
+        let icon = load_app_icon()?;
         let mut nid = NOTIFYICONDATAW {
             cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
             hWnd: hwnd,

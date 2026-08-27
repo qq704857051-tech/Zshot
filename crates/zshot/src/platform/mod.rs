@@ -8,7 +8,10 @@ pub use hook::{
     uninstall_ll_hook, unregister_fallback_hotkeys,
 };
 pub use instance::SingleInstance;
-pub use tray::{add_tray_icon, handle_tray, remove_tray_icon, taskbar_created_message, TrayCommand};
+pub use tray::{
+    add_tray_icon, handle_tray, load_app_icon, remove_tray_icon, taskbar_created_message,
+    TrayCommand,
+};
 
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
