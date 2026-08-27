@@ -95,8 +95,9 @@ fn empty_result() -> OverlayResult {
     }
 }
 
-/// Identity of a mosaic readback: which elements, where, at what block size.
-type MosaicKey = Vec<(u64, Rect, i32)>;
+/// Identity of a mosaic readback: which elements, where, at what block size, and
+/// how many path points -- extending a stroke inside its own bounds moves nothing else.
+type MosaicKey = Vec<(u64, Rect, i32, usize)>;
 
 #[derive(Clone, Default)]
 struct MosaicTiles {
@@ -877,6 +878,8 @@ impl OverlayView {
 
     /// Pixelated tiles plus the ids of the elements that produced them; an element
     /// missing from that list still needs a placeholder drawn for it.
+    /// Pixelated tiles plus the ids of the elements that produced them; an element
+    /// missing from that list still needs a placeholder drawn for it.
     fn mosaic_tiles(&self, cx: &mut App) -> MosaicTiles {
         let mut out = MosaicTiles::default();
         let Some(cap) = self.cap.as_ref() else {
@@ -885,8 +888,10 @@ impl OverlayView {
         let key: MosaicKey = self
             .editor
             .visible()
-            .filter_map(|el| match el.shape {
-                Shape::Mosaic { block_size } => Some((el.id, el.bounds, block_size)),
+            .filter_map(|el| match &el.shape {
+                Shape::Mosaic { points, block_size } => {
+                    Some((el.id, el.bounds, *block_size, points.len()))
+                }
                 _ => None,
             })
             .collect();
@@ -896,22 +901,32 @@ impl OverlayView {
             }
         }
         for el in self.editor.visible() {
-            let Shape::Mosaic { block_size } = el.shape else {
+            let Shape::Mosaic { points, block_size } = &el.shape else {
                 continue;
             };
-            // Clamping the origin has to shrink the extent too, or the preview
-            // renders the mosaic shifted relative to what the export produces.
-            let x = el.bounds.x.max(0.0);
-            let y = el.bounds.y.max(0.0);
-            let w = (el.bounds.x + el.bounds.width - x).max(0.0) as u32;
-            let h = (el.bounds.y + el.bounds.height - y).max(0.0) as u32;
-            let (x, y) = (x as u32, y as u32);
-            let w = w.min(cap.width.saturating_sub(x));
-            let h = h.min(cap.height.saturating_sub(y));
-            if w < 2 || h < 2 {
+            let block = (*block_size).max(2);
+            let cells = crate::overlay::editor::mosaic_cells(points, block);
+            if cells.is_empty() {
                 continue;
             }
-            let Ok((mut px, cw, ch, stride)) = (match cx
+            // Read back one grid-aligned rect covering every cell, then average
+            // inside it. Per-cell readbacks would be one GPU round trip per tile.
+            // ponytail: every new path point invalidates the cache and re-reads the
+            // whole stroke bounds. Fine up to a few hundred cells; if smudging across
+            // a full screen drops frames, cache per element id and only read back the
+            // cells the newest segment added.
+            let gx0 = cells.iter().map(|c| c.0).min().unwrap_or(0);
+            let gy0 = cells.iter().map(|c| c.1).min().unwrap_or(0);
+            let gx1 = cells.iter().map(|c| c.0).max().unwrap_or(0) + 1;
+            let gy1 = cells.iter().map(|c| c.1).max().unwrap_or(0) + 1;
+            let x = (gx0 * block).clamp(0, cap.width as i32) as u32;
+            let y = (gy0 * block).clamp(0, cap.height as i32) as u32;
+            let w = (gx1 * block).clamp(0, cap.width as i32) as u32 - x;
+            let h = (gy1 * block).clamp(0, cap.height as i32) as u32 - y;
+            if w < 1 || h < 1 {
+                continue;
+            }
+            let Ok((px, cw, ch, stride)) = (match cx
                 .with_gpu_context(|_d, ctx| crop_sdr_bgra(cap, ctx, x, y, w, h))
             {
                 Some(r) => r,
@@ -919,34 +934,40 @@ impl OverlayView {
             }) else {
                 continue;
             };
-            crate::overlay::composite::pixelate(
-                &mut px,
-                cw,
-                ch,
-                stride,
-                Rect::new(0.0, 0.0, cw as f64, ch as f64),
-                block_size,
-            );
-            let block = block_size.max(2) as u32;
-            let mut cy = 0u32;
-            while cy < ch {
-                let mut cxb = 0u32;
-                while cxb < cw {
-                    let i = (cy * stride + cxb * 4) as usize;
-                    if i + 2 < px.len() {
-                        let rgb = ((px[i + 2] as u32) << 16)
-                            | ((px[i + 1] as u32) << 8)
-                            | px[i] as u32;
-                        let bw = block.min(cw - cxb) as f64;
-                        let bh = block.min(ch - cy) as f64;
-                        out.tiles.push((
-                            Rect::new((x + cxb) as f64, (y + cy) as f64, bw, bh),
-                            rgb,
-                        ));
-                    }
-                    cxb += block;
+            for (gx, gy) in cells {
+                let cx0 = (gx * block - x as i32).clamp(0, cw as i32);
+                let cy0 = (gy * block - y as i32).clamp(0, ch as i32);
+                let cx1 = (gx * block + block - x as i32).clamp(0, cw as i32);
+                let cy1 = (gy * block + block - y as i32).clamp(0, ch as i32);
+                if cx1 <= cx0 || cy1 <= cy0 {
+                    continue;
                 }
-                cy += block;
+                let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
+                for sy in cy0..cy1 {
+                    for sx in cx0..cx1 {
+                        let i = (sy as u32 * stride + sx as u32 * 4) as usize;
+                        if i + 2 >= px.len() {
+                            continue;
+                        }
+                        b += px[i] as u32;
+                        g += px[i + 1] as u32;
+                        r += px[i + 2] as u32;
+                        n += 1;
+                    }
+                }
+                if n == 0 {
+                    continue;
+                }
+                let rgb = ((r / n) << 16) | ((g / n) << 8) | (b / n);
+                out.tiles.push((
+                    Rect::new(
+                        (gx * block) as f64,
+                        (gy * block) as f64,
+                        block as f64,
+                        block as f64,
+                    ),
+                    rgb,
+                ));
             }
             out.covered.push(el.id);
         }

@@ -20,6 +20,7 @@ pub enum Shape {
         points: Vec<Point>,
     },
     Mosaic {
+        points: Vec<Point>,
         block_size: i32,
     },
     Text {
@@ -48,7 +49,7 @@ impl Element {
                 end.x += dx;
                 end.y += dy;
             }
-            Shape::Pen { points } => {
+            Shape::Pen { points } | Shape::Mosaic { points, .. } => {
                 for p in points {
                     p.x += dx;
                     p.y += dy;
@@ -58,8 +59,9 @@ impl Element {
         }
     }
 
-    fn is_pen(&self) -> bool {
-        matches!(self.shape, Shape::Pen { .. })
+    /// Freehand shapes are worth keeping even when the drag never moved.
+    fn has_path(&self) -> bool {
+        matches!(self.shape, Shape::Pen { .. } | Shape::Mosaic { .. })
     }
 
     pub fn hit_test(&self, p: Point) -> bool {
@@ -68,18 +70,23 @@ impl Element {
                 dist_to_segment(p, *start, *end) <= self.stroke_width.max(4.0)
             }
             Shape::Pen { points } => {
-                if points.is_empty() {
-                    return false;
-                }
-                if points.len() == 1 {
-                    return dist_to_segment(p, points[0], points[0]) <= self.stroke_width.max(4.0);
-                }
-                points.windows(2).any(|w| {
-                    dist_to_segment(p, w[0], w[1]) <= self.stroke_width.max(4.0)
-                })
+                hit_path(p, points, self.stroke_width.max(4.0))
+            }
+            Shape::Mosaic { points, block_size } => {
+                hit_path(p, points, mosaic_brush_radius(*block_size))
             }
             _ => self.bounds.contains(p),
         }
+    }
+}
+
+fn hit_path(p: Point, points: &[Point], tolerance: f64) -> bool {
+    match points.len() {
+        0 => false,
+        1 => dist_to_segment(p, points[0], points[0]) <= tolerance,
+        _ => points
+            .windows(2)
+            .any(|w| dist_to_segment(p, w[0], w[1]) <= tolerance),
     }
 }
 
@@ -345,7 +352,7 @@ impl Session {
         if let Some(draft) = self.draft.take() {
             let tiny = draft.bounds.width < MIN_KEEP
                 && draft.bounds.height < MIN_KEEP
-                && !draft.is_pen();
+                && !draft.has_path();
             if !tiny {
                 self.history
                     .execute(&mut self.elements, Command::Add(draft));
@@ -411,6 +418,7 @@ impl Session {
             },
             Tool::Pen => Shape::Pen { points: vec![pt] },
             Tool::Mosaic => Shape::Mosaic {
+                points: vec![pt],
                 block_size: DEFAULT_MOSAIC_BLOCK,
             },
             _ => Shape::Rect,
@@ -422,15 +430,15 @@ impl Session {
             stroke_width: DEFAULT_STROKE_WIDTH,
             shape,
         };
-        if let Shape::Pen { .. } = el.shape {
-            recalc_pen_bounds(&mut el);
+        if el.has_path() {
+            recalc_path_bounds(&mut el);
         }
         el
     }
 }
 
-fn recalc_pen_bounds(el: &mut Element) {
-    let Shape::Pen { points } = &el.shape else {
+fn recalc_path_bounds(el: &mut Element) {
+    let (Shape::Pen { points } | Shape::Mosaic { points, .. }) = &el.shape else {
         return;
     };
     if points.is_empty() {
@@ -455,9 +463,9 @@ fn update_draft(draft: &mut Element, start: Point, current: Point) {
             *end = current;
             draft.bounds = rect_from_points(start, current);
         }
-        Shape::Pen { points } => {
+        Shape::Pen { points } | Shape::Mosaic { points, .. } => {
             points.push(current);
-            recalc_pen_bounds(draft);
+            recalc_path_bounds(draft);
         }
         _ => {
             draft.bounds = rect_from_points(start, current);
@@ -506,6 +514,48 @@ fn dist(a: Point, b: Point) -> f64 {
     let dx = a.x - b.x;
     let dy = a.y - b.y;
     (dx * dx + dy * dy).sqrt()
+}
+
+/// Brush half-width of the mosaic smudge tool: three cells across.
+pub fn mosaic_brush_radius(block: i32) -> f64 {
+    block.max(2) as f64 * 1.5
+}
+
+/// Grid cells the smudge path covers, as `(cell_x, cell_y)` indices into the
+/// image-wide grid. Aligning to the image rather than to the stroke is what lets
+/// two strokes -- or the same stroke extended, or moved -- keep their cells lined
+/// up instead of re-tiling from wherever the path happens to start.
+pub fn mosaic_cells(points: &[Point], block: i32) -> Vec<(i32, i32)> {
+    let block = block.max(2);
+    let r = mosaic_brush_radius(block);
+    let Some(first) = points.first() else {
+        return Vec::new();
+    };
+    let mut cells = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let segments: Vec<(Point, Point)> = if points.len() == 1 {
+        vec![(*first, *first)]
+    } else {
+        points.windows(2).map(|w| (w[0], w[1])).collect()
+    };
+    for (a, b) in segments {
+        let x0 = ((a.x.min(b.x) - r) / block as f64).floor() as i32;
+        let x1 = ((a.x.max(b.x) + r) / block as f64).floor() as i32;
+        let y0 = ((a.y.min(b.y) - r) / block as f64).floor() as i32;
+        let y1 = ((a.y.max(b.y) + r) / block as f64).floor() as i32;
+        for gy in y0..=y1 {
+            for gx in x0..=x1 {
+                let center = Point {
+                    x: (gx as f64 + 0.5) * block as f64,
+                    y: (gy as f64 + 0.5) * block as f64,
+                };
+                if dist_to_segment(center, a, b) <= r && seen.insert((gx, gy)) {
+                    cells.push((gx, gy));
+                }
+            }
+        }
+    }
+    cells
 }
 
 pub fn filled_arrow(start: Point, end: Point, stroke: f64) -> Option<FilledArrow> {
@@ -595,7 +645,11 @@ mod tests {
         s.pointer_moved(pt(32.0, 42.0));
         s.pointer_released();
         match &s.elements[1].shape {
-            Shape::Mosaic { block_size } => assert_eq!(*block_size, 16),
+            Shape::Mosaic { points, block_size } => {
+                assert_eq!(*block_size, 16);
+                assert_eq!(points.first(), Some(&pt(0.0, 10.0)));
+                assert_eq!(points.last(), Some(&pt(32.0, 42.0)));
+            }
             other => panic!("{other:?}"),
         }
 
@@ -706,6 +760,28 @@ mod tests {
             "head {} wide but only {head_len} long",
             g.head_width()
         );
+    }
+
+    #[test]
+    fn mosaic_cells_align_to_the_image_grid_not_the_stroke() {
+        // Same stroke, shifted by a non-multiple of the block: the covered cells
+        // must shift by whole cells, never re-tile from the stroke's own origin.
+        let at = |x: f64| mosaic_cells(&[pt(x, 100.0), pt(x + 50.0, 100.0)], 16);
+        for (gx, _) in at(37.0) {
+            assert_eq!(gx * 16 % 16, 0, "cell must sit on the image grid");
+        }
+        let a = at(0.0);
+        let b = at(32.0);
+        assert!(a.iter().all(|(gx, gy)| b.contains(&(gx + 2, *gy))));
+    }
+
+    #[test]
+    fn mosaic_cells_dedupe_across_segments() {
+        let doubled = mosaic_cells(&[pt(50.0, 50.0), pt(80.0, 50.0), pt(50.0, 50.0)], 16);
+        let mut uniq = doubled.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(doubled.len(), uniq.len());
     }
 
     #[test]

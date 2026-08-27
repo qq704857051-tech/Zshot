@@ -59,9 +59,7 @@ fn draw_element(buf: &mut Bgra<'_>, el: &Element) {
             }
         }
         Shape::Pen { points } => draw_polyline(buf, points, color, thick),
-        Shape::Mosaic { block_size } => {
-            pixelate_buf(buf, el.bounds, (*block_size).max(2));
-        }
+        Shape::Mosaic { points, block_size } => draw_mosaic(buf, points, *block_size),
         Shape::Text { text, font_size } => {
             draw_text(buf, el.bounds, text, *font_size, color);
         }
@@ -264,51 +262,44 @@ fn point_in_triangle(px: f64, py: f64, a: Point, b: Point, c: Point) -> bool {
     !(has_neg && has_pos)
 }
 
-pub fn pixelate(
-    pixels: &mut [u8],
-    width: u32,
-    height: u32,
-    stride: u32,
-    bounds: Rect,
-    block: i32,
-) {
-    let mut buf = Bgra {
-        pixels,
-        width,
-        height,
-        stride,
-    };
-    pixelate_buf(&mut buf, bounds, block);
-}
-
-fn pixelate_buf(buf: &mut Bgra<'_>, bounds: Rect, block: i32) {
-    // Clamp to the buffer: sampling a block whose top-left is outside it would
-    // seed the whole block with the transparent black `get` returns for misses.
-    let w = buf.width as i32;
-    let h = buf.height as i32;
-    let x0 = (bounds.x.round() as i32).clamp(0, w);
-    let y0 = (bounds.y.round() as i32).clamp(0, h);
-    let x1 = ((bounds.x + bounds.width).round() as i32).clamp(0, w);
-    let y1 = ((bounds.y + bounds.height).round() as i32).clamp(0, h);
-    if x1 <= x0 || y1 <= y0 {
-        return;
-    }
-    let block = block.max(2);
-    let mut y = y0;
-    while y < y1 {
-        let yh = (y + block).min(y1);
-        let mut x = x0;
-        while x < x1 {
-            let xw = (x + block).min(x1);
-            let sample = buf.get(x, y);
-            for py in y..yh {
-                for px in x..xw {
-                    buf.put(px, py, sample);
-                }
-            }
-            x += block;
+/// Flatten each grid cell the smudge path covers to that cell's mean colour.
+/// Cells are image-aligned and never overlap, so writing them back in place cannot
+/// contaminate a later cell's average.
+fn draw_mosaic(buf: &mut Bgra<'_>, points: &[Point], block_size: i32) {
+    let block = block_size.max(2);
+    for (gx, gy) in crate::overlay::editor::mosaic_cells(points, block) {
+        let x0 = (gx * block).clamp(0, buf.width as i32);
+        let y0 = (gy * block).clamp(0, buf.height as i32);
+        let x1 = (gx * block + block).clamp(0, buf.width as i32);
+        let y1 = (gy * block + block).clamp(0, buf.height as i32);
+        if x1 <= x0 || y1 <= y0 {
+            continue;
         }
-        y += block;
+        let mut sum = [0u32; 4];
+        let mut n = 0u32;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let p = buf.get(x, y);
+                for i in 0..4 {
+                    sum[i] += p[i] as u32;
+                }
+                n += 1;
+            }
+        }
+        if n == 0 {
+            continue;
+        }
+        let avg = [
+            (sum[0] / n) as u8,
+            (sum[1] / n) as u8,
+            (sum[2] / n) as u8,
+            (sum[3] / n) as u8,
+        ];
+        for y in y0..y1 {
+            for x in x0..x1 {
+                buf.put(x, y, avg);
+            }
+        }
     }
 }
 
@@ -430,46 +421,115 @@ mod tests {
         }
     }
 
+    /// A smudge stroke sweeping left-to-right across the middle of `bounds`.
     fn mosaic_el(bounds: Rect) -> Element {
+        let y = bounds.y + bounds.height / 2.0;
         Element {
             id: 2,
             bounds,
             stroke: DEFAULT_STROKE,
             stroke_width: 1.0,
             shape: Shape::Mosaic {
+                points: vec![
+                    crate::geom::Point { x: bounds.x, y },
+                    crate::geom::Point {
+                        x: bounds.x + bounds.width,
+                        y,
+                    },
+                ],
                 block_size: DEFAULT_MOSAIC_BLOCK,
             },
         }
     }
 
     #[test]
-    fn mosaic_makes_interior_blocks_uniform_and_leaves_exterior() {
-        let (mut px, stride) = unique(32, 32);
+    fn mosaic_flattens_cells_under_the_stroke_and_leaves_the_rest() {
+        let (mut px, stride) = unique(64, 64);
         let original = px.clone();
-        apply_annotations(
-            &mut px,
-            32,
-            32,
-            stride,
-            0.0,
-            0.0,
-            &[mosaic_el(Rect::new(8.0, 8.0, 16.0, 16.0))],
-        );
-        for y in 0..32i32 {
-            for x in 0..32i32 {
-                let i = (y as u32 * stride + x as u32 * 4) as usize;
-                let inside = x >= 8 && x < 24 && y >= 8 && y < 24;
-                if !inside {
-                    assert_eq!(&px[i..i + 4], &original[i..i + 4], "exterior {x},{y}");
+        // One dab at (32,32). With block 16 the brush radius is 24, so the only
+        // cell centres within reach are (24,24) (40,24) (24,40) (40,40) -- the four
+        // cells spanning x 16..48, y 16..48.
+        let el = Element {
+            id: 2,
+            bounds: Rect::new(8.0, 8.0, 48.0, 48.0),
+            stroke: DEFAULT_STROKE,
+            stroke_width: 1.0,
+            shape: Shape::Mosaic {
+                points: vec![crate::geom::Point { x: 32.0, y: 32.0 }],
+                block_size: 16,
+            },
+        };
+        apply_annotations(&mut px, 64, 64, stride, 0.0, 0.0, &[el]);
+        let at = |buf: &[u8], x: u32, y: u32| {
+            let i = (y * stride + x * 4) as usize;
+            buf[i..i + 4].to_vec()
+        };
+        for y in 0..64u32 {
+            for x in 0..64u32 {
+                let touched = (16..48).contains(&x) && (16..48).contains(&y);
+                if !touched {
+                    assert_eq!(at(&px, x, y), at(&original, x, y), "untouched {x},{y}");
                 }
             }
         }
-        // 16px block size → one cell covering the 16×16 mosaic.
-        let sample = &px[(8 * stride + 8 * 4) as usize..][..4];
-        for y in 8..24i32 {
-            for x in 8..24i32 {
-                let i = (y as u32 * stride + x as u32 * 4) as usize;
-                assert_eq!(&px[i..i + 4], sample, "interior {x},{y}");
+        for (cx, cy) in [(16u32, 16u32), (32, 16), (16, 32), (32, 32)] {
+            let sample = at(&px, cx, cy);
+            for y in cy..cy + 16 {
+                for x in cx..cx + 16 {
+                    assert_eq!(at(&px, x, y), sample, "cell at {cx},{cy}: {x},{y}");
+                }
+            }
+            assert_ne!(sample, at(&original, cx, cy), "cell {cx},{cy} unchanged");
+        }
+    }
+
+    /// The point of image-aligned cells: whatever offset the stroke starts at, every
+    /// 16x16 cell of the image is either untouched or flattened whole. A grid that
+    /// followed the stroke would leave cells half-changed or holding two colours.
+    #[test]
+    fn mosaic_cells_stay_on_the_image_grid_whatever_the_stroke_offset() {
+        for start_x in [16.0, 21.0, 28.0, 33.5] {
+            let (mut px, stride) = unique(96, 64);
+            let original = px.clone();
+            let el = Element {
+                id: 2,
+                bounds: Rect::new(0.0, 0.0, 96.0, 64.0),
+                stroke: DEFAULT_STROKE,
+                stroke_width: 1.0,
+                shape: Shape::Mosaic {
+                    points: vec![
+                        crate::geom::Point { x: start_x, y: 30.0 },
+                        crate::geom::Point {
+                            x: start_x + 30.0,
+                            y: 34.0,
+                        },
+                    ],
+                    block_size: 16,
+                },
+            };
+            apply_annotations(&mut px, 96, 64, stride, 0.0, 0.0, &[el]);
+            let at = |buf: &[u8], x: u32, y: u32| {
+                let i = (y * stride + x * 4) as usize;
+                buf[i..i + 4].to_vec()
+            };
+            for gy in 0..4u32 {
+                for gx in 0..6u32 {
+                    let (x0, y0) = (gx * 16, gy * 16);
+                    let cells: Vec<Vec<u8>> = (y0..y0 + 16)
+                        .flat_map(|y| (x0..x0 + 16).map(move |x| (x, y)))
+                        .map(|(x, y)| at(&px, x, y))
+                        .collect();
+                    let untouched = (y0..y0 + 16)
+                        .flat_map(|y| (x0..x0 + 16).map(move |x| (x, y)))
+                        .all(|(x, y)| at(&px, x, y) == at(&original, x, y));
+                    if untouched {
+                        continue;
+                    }
+                    assert!(
+                        cells.windows(2).all(|w| w[0] == w[1]),
+                        "start_x {start_x}: cell {gx},{gy} is not uniform"
+                    );
+                }
             }
         }
     }
@@ -536,7 +596,10 @@ mod tests {
             bounds: Rect::new(-8.0, 8.0, 16.0, 16.0),
             stroke: DEFAULT_STROKE,
             stroke_width: 1.0,
-            shape: Shape::Mosaic { block_size: 16 },
+            shape: Shape::Mosaic {
+                points: vec![crate::geom::Point { x: -8.0, y: 16.0 }],
+                block_size: 16,
+            },
         };
         apply_annotations(&mut px, 32, 32, stride, 0.0, 0.0, &[el]);
         for y in 0..32u32 {
