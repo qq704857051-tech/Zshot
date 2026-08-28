@@ -423,7 +423,7 @@ fn start_bench_iteration(cx: &mut App) {
     perf.mark("T2");
     match capture_from_app(cx, true, &mut perf) {
         Ok(cap) => {
-            let _ = show_overlay(cx, cap, &mut perf);
+            let _ = show_overlay(cx, cap, &mut perf, false);
         }
         Err(e) => {
             eprintln!("bench capture failed: {e}");
@@ -695,7 +695,10 @@ enum ShotFlow {
 fn take_shot(action: HotkeyAction) -> Result<ShotFlow> {
     let mut perf = PerfSession::start();
     perf.mark("T2");
-    let region = matches!(action, HotkeyAction::Region);
+    // Copy-only freezes the desktop like a region capture; the overlay then
+    // confirms the drag straight to the clipboard. Only fullscreen skips the
+    // overlay.
+    let region = !matches!(action, HotkeyAction::Fullscreen);
     let cap = match with_gpui_app(|cx| capture_from_app(cx, region, &mut perf)) {
         Some(Ok(c)) => c,
         Some(Err(e)) => {
@@ -706,19 +709,19 @@ fn take_shot(action: HotkeyAction) -> Result<ShotFlow> {
     };
 
     match action {
-        HotkeyAction::Region => {
+        HotkeyAction::Region | HotkeyAction::CopyOnly => {
             // Capture is done; do not hold App across overlay interaction.
-            match with_gpui_app(|cx| show_overlay(cx, cap, &mut perf)) {
+            let copy_only = matches!(action, HotkeyAction::CopyOnly);
+            match with_gpui_app(|cx| show_overlay(cx, cap, &mut perf, copy_only)) {
                 Some(_) => Ok(ShotFlow::OverlayOpen),
                 None => Err(Error::new("GPUI app unavailable")),
             }
         }
-        HotkeyAction::Fullscreen | HotkeyAction::CopyOnly => {
-            let write_file = matches!(action, HotkeyAction::Fullscreen);
+        HotkeyAction::Fullscreen => {
             let (x, y, w, h) = (0, 0, cap.width, cap.height);
             let (px, cw, ch, stride) = with_gpui_app(|cx| crop_from_app(cx, &cap, x, y, w, h))
                 .unwrap_or_else(|| Err(Error::new("GPUI app unavailable")))?;
-            export_pixels(px, cw, ch, stride, write_file, true)?;
+            export_pixels(px, cw, ch, stride, true, true)?;
             let _ = perf.write_log();
             Ok(ShotFlow::Finished)
         }
@@ -806,7 +809,9 @@ fn export_pixels(
         });
     }
     if copy {
-        let _ = set_clipboard_dib(&px, cw, ch, stride);
+        // Not swallowed: copy-only exports have no PNG to prove they ran, so a
+        // silent failure here reads as "the hotkey is dead".
+        set_clipboard_dib(&px, cw, ch, stride)?;
     }
     Ok(())
 }

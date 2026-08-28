@@ -152,6 +152,9 @@ pub struct OverlayView {
     /// rewrite it while this view is alive, and the bar must not change shape
     /// underneath a capture the user is already working in.
     hidden_toolbar_items: Vec<String>,
+    /// Copy-only capture: mouse-up on a fresh selection confirms immediately,
+    /// skipping the toolbar — "框选后直接复制".
+    copy_only: bool,
 }
 
 /// OCR / translation output: read-only text plus copy, same as the C# panel.
@@ -183,10 +186,11 @@ pub fn show_overlay(
     cx: &mut App,
     cap: CapturedDesktop,
     perf: &mut PerfSession,
+    copy_only: bool,
 ) -> Entity<OverlayView> {
     bind_overlay_keys(cx);
     let session = std::mem::replace(perf, PerfSession::start());
-    match show_overlay_inner(cx, cap, session) {
+    match show_overlay_inner(cx, cap, session, copy_only) {
         Ok(entity) => entity,
         Err(e) => {
             eprintln!("overlay: {e}");
@@ -213,6 +217,7 @@ fn show_overlay_inner(
     cx: &mut App,
     cap: CapturedDesktop,
     perf: PerfSession,
+    copy_only: bool,
 ) -> Result<Entity<OverlayView>> {
     let swap = match cx.with_gpu_context(|device, context| {
         present_freeze_from_texture(device, context, &cap.sdr_display, cap.width, cap.height)
@@ -225,7 +230,7 @@ fn show_overlay_inner(
     if let Some(handle) = OVERLAY_WINDOW.with(|slot| *slot.borrow()) {
         if let Ok(entity) = handle.entity(cx) {
             let _ = handle.update(cx, |view, window, cx| {
-                view.reset_from_capture(cap, perf, swap, window);
+                view.reset_from_capture(cap, perf, swap, copy_only, window);
                 view.attach_and_show(window, cx);
             });
             return Ok(entity);
@@ -251,7 +256,7 @@ fn show_overlay_inner(
                 topmost: true,
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| OverlayView::from_capture(cx, cap, perf, swap, window)),
+        |window, cx| cx.new(|cx| OverlayView::from_capture(cx, cap, perf, swap, copy_only, window)),
         )
         .map_err(|e| crate::error::Error::new(e.to_string()))?;
 
@@ -298,6 +303,7 @@ impl OverlayView {
             mask_cache: RefCell::new(None),
             panel: None,
             hidden_toolbar_items: crate::config::get().screenshot.hidden_toolbar_items,
+            copy_only: false,
         }
     }
 
@@ -306,6 +312,7 @@ impl OverlayView {
         cap: CapturedDesktop,
         perf: PerfSession,
         swap: IDXGISwapChain1,
+        copy_only: bool,
         window: &mut Window,
     ) -> Self {
         let mut view = Self {
@@ -336,6 +343,7 @@ impl OverlayView {
             mask_cache: RefCell::new(None),
             panel: None,
             hidden_toolbar_items: crate::config::get().screenshot.hidden_toolbar_items,
+            copy_only,
         };
         view.sync_from_cap(window);
         view
@@ -346,6 +354,7 @@ impl OverlayView {
         cap: CapturedDesktop,
         perf: PerfSession,
         swap: IDXGISwapChain1,
+        copy_only: bool,
         window: &mut Window,
     ) {
         self.selection = Rect::new(0.0, 0.0, 0.0, 0.0);
@@ -368,6 +377,7 @@ impl OverlayView {
         self.mask_cache = RefCell::new(None);
         self.panel = None;
         self.hidden_toolbar_items = crate::config::get().screenshot.hidden_toolbar_items;
+        self.copy_only = copy_only;
         self.sync_from_cap(window);
     }
 
@@ -609,7 +619,9 @@ impl OverlayView {
             return;
         }
         self.mouse = Self::pointer_to_capture(event.position, window.scale_factor());
-        self.on_up();
+        if self.on_up() {
+            self.confirm(window, cx);
+        }
         cx.notify();
     }
 
@@ -657,32 +669,42 @@ impl OverlayView {
         }
     }
 
-    fn on_up(&mut self) {
+    /// Returns true when the fresh selection should be confirmed right away:
+    /// the copy-only flow never enters the toolbar phase.
+    fn on_up(&mut self) -> bool {
         if !self.down {
-            return;
+            return false;
         }
         self.down = false;
         if self.phase == Phase::Active {
             self.editor.pointer_released();
-            return;
+            return false;
         }
         if self.phase == Phase::Selecting {
             let dx = (self.mouse.x - self.down_pt.x).abs();
             let dy = (self.mouse.y - self.down_pt.y).abs();
-            if dx <= MIN_RECT && dy <= MIN_RECT {
+            let selected = if dx <= MIN_RECT && dy <= MIN_RECT {
                 if let Some(h) = self.hover {
                     self.selection = h;
                     self.from_drag = false;
                     self.has_sel = true;
-                    self.phase = Phase::Active;
+                    true
+                } else {
+                    false
                 }
-            } else if self.has_sel
-                && self.selection.width > MIN_RECT
-                && self.selection.height > MIN_RECT
-            {
+            } else {
+                self.has_sel
+                    && self.selection.width > MIN_RECT
+                    && self.selection.height > MIN_RECT
+            };
+            if selected {
+                if self.copy_only {
+                    return true;
+                }
                 self.phase = Phase::Active;
             }
         }
+        false
     }
 
     fn current_rect(&self) -> Option<Rect> {

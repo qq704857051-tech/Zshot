@@ -193,4 +193,32 @@ mod tests {
         assert!(bytes.windows(4).any(|w| w == b"IEND"));
         assert!(bytes.len() > 32);
     }
+
+    /// Diagnosis for 'copy-only pastes nothing': the DIB must come back out
+    /// of the clipboard with the same pixels.
+    #[test]
+    fn clipboard_dib_round_trip() {
+        use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+        use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+
+        let pixels: Vec<u8> = vec![1, 2, 3, 255, 5, 6, 7, 255, 9, 10, 11, 255, 13, 14, 15, 255];
+        set_clipboard_dib(&pixels, 2, 2, 8).expect("set_clipboard_dib");
+
+        unsafe {
+            OpenClipboard(Some(HWND::default())).expect("OpenClipboard");
+            let h = GetClipboardData(CF_DIB.0 as u32).expect("GetClipboardData(CF_DIB)");
+            let h = windows::Win32::Foundation::HGLOBAL(h.0 as *mut _);
+            let size = GlobalSize(h);
+            let ptr = GlobalLock(h) as *const u8;
+            assert!(!ptr.is_null());
+            let data = std::slice::from_raw_parts(ptr, size);
+            let header = &*(data.as_ptr() as *const BITMAPINFOHEADER);
+            assert_eq!(header.biWidth, 2);
+            assert_eq!(header.biHeight, -2, "top-down DIB");
+            let image = &data[std::mem::size_of::<BITMAPINFOHEADER>()..];
+            assert_eq!(image, &pixels[..]);
+            let _ = GlobalUnlock(h);
+            let _ = CloseClipboard();
+        }
+    }
 }
