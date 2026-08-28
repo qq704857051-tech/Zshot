@@ -3,7 +3,6 @@
 
 use crate::geom::{Point, Rect};
 
-pub const DEFAULT_STROKE: u32 = super::theme::STROKE_ARGB;
 pub const DEFAULT_STROKE_WIDTH: f64 = 4.0;
 pub const DEFAULT_MOSAIC_BLOCK: i32 = 16;
 const MIN_KEEP: f64 = 2.0;
@@ -245,6 +244,12 @@ pub struct Session {
     dragging: bool,
     move_dx: f64,
     move_dy: f64,
+    /// Defaults for new elements, snapshotted from settings when the session
+    /// starts so a mid-capture settings edit cannot change the tool under the
+    /// user's hand.
+    stroke: u32,
+    stroke_width: f64,
+    mosaic_block: i32,
 }
 
 impl Default for Session {
@@ -255,6 +260,7 @@ impl Default for Session {
 
 impl Session {
     pub fn new() -> Self {
+        let ann = crate::config::get().screenshot.annotation;
         Self {
             elements: Vec::new(),
             history: History::new(80),
@@ -266,6 +272,9 @@ impl Session {
             dragging: false,
             move_dx: 0.0,
             move_dy: 0.0,
+            stroke: ann.stroke_argb(),
+            stroke_width: ann.clamped_stroke_width(),
+            mosaic_block: ann.clamped_mosaic_block(),
         }
     }
 
@@ -373,8 +382,8 @@ impl Session {
                 (trimmed.chars().count() as f64 * 12.0).max(40.0),
                 28.0,
             ),
-            stroke: DEFAULT_STROKE,
-            stroke_width: DEFAULT_STROKE_WIDTH,
+            stroke: self.stroke,
+            stroke_width: self.stroke_width,
             shape: Shape::Text {
                 text: trimmed.to_string(),
                 font_size: 20.0,
@@ -419,15 +428,15 @@ impl Session {
             Tool::Pen => Shape::Pen { points: vec![pt] },
             Tool::Mosaic => Shape::Mosaic {
                 points: vec![pt],
-                block_size: DEFAULT_MOSAIC_BLOCK,
+                block_size: self.mosaic_block,
             },
             _ => Shape::Rect,
         };
         let mut el = Element {
             id,
             bounds,
-            stroke: DEFAULT_STROKE,
-            stroke_width: DEFAULT_STROKE_WIDTH,
+            stroke: self.stroke,
+            stroke_width: self.stroke_width,
             shape,
         };
         if el.has_path() {

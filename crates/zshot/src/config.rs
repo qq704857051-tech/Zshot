@@ -83,6 +83,58 @@ pub struct Screenshot {
     /// which is what the build did before this field existed — the C# default
     /// of hiding four tools would silently remove two working ones here.
     pub hidden_toolbar_items: Vec<String>,
+    pub annotation: Annotation,
+}
+
+/// Defaults for new annotation elements. The color stays a hex string so the
+/// file remains hand-editable, same rationale as the hotkey strings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Annotation {
+    /// Stroke width in logical px; clamped to 1..=20 when applied.
+    pub stroke_width: f64,
+    /// "#RRGGBB" or "#AARRGGBB".
+    pub stroke_color: String,
+    /// Mosaic cell size in image px; clamped to 4..=64 when applied.
+    pub mosaic_block: i32,
+}
+
+impl Default for Annotation {
+    // Derives from the editor constants so the two can never drift apart.
+    fn default() -> Self {
+        Self {
+            stroke_width: crate::overlay::editor::DEFAULT_STROKE_WIDTH,
+            stroke_color: format!("#{:06X}", crate::overlay::theme::STROKE_ARGB & 0xFF_FFFF),
+            mosaic_block: crate::overlay::editor::DEFAULT_MOSAIC_BLOCK,
+        }
+    }
+}
+
+impl Annotation {
+    /// Opaque ARGB. A broken hex string falls back to the shipped red rather
+    /// than making every annotation invisible.
+    pub fn stroke_argb(&self) -> u32 {
+        parse_hex_color(&self.stroke_color).unwrap_or(crate::overlay::theme::STROKE_ARGB)
+    }
+
+    pub fn clamped_stroke_width(&self) -> f64 {
+        self.stroke_width.clamp(1.0, 20.0)
+    }
+
+    pub fn clamped_mosaic_block(&self) -> i32 {
+        self.mosaic_block.clamp(4, 64)
+    }
+}
+
+/// "#RRGGBB" is made opaque; "#AARRGGBB" keeps its alpha.
+pub fn parse_hex_color(text: &str) -> Option<u32> {
+    let hex = text.trim().strip_prefix('#').unwrap_or(text.trim());
+    let v = u32::from_str_radix(hex, 16).ok()?;
+    match hex.len() {
+        6 => Some(0xFF00_0000 | v),
+        8 => Some(v),
+        _ => None,
+    }
 }
 
 pub fn path() -> Result<PathBuf> {
@@ -216,5 +268,32 @@ mod tests {
             before.screenshot.hidden_toolbar_items
         );
         assert_eq!(after.ocr.models_dir, before.ocr.models_dir);
+        assert_eq!(after.screenshot.annotation.stroke_color, "#FA3C3C");
+    }
+
+    #[test]
+    fn annotation_defaults_match_the_editor_constants() {
+        let a = Annotation::default();
+        assert_eq!(a.stroke_argb(), crate::overlay::theme::STROKE_ARGB);
+        assert_eq!(a.clamped_stroke_width(), crate::overlay::editor::DEFAULT_STROKE_WIDTH);
+        assert_eq!(a.clamped_mosaic_block(), crate::overlay::editor::DEFAULT_MOSAIC_BLOCK);
+    }
+
+    #[test]
+    fn hex_colors_parse_both_forms() {
+        assert_eq!(parse_hex_color("#FA3C3C"), Some(0xFFFA_3C3C));
+        assert_eq!(parse_hex_color("fa3c3c"), Some(0xFFFA_3C3C));
+        assert_eq!(parse_hex_color("#80FA3C3C"), Some(0x80FA_3C3C));
+        assert_eq!(parse_hex_color("red"), None);
+        assert_eq!(parse_hex_color("#12345"), None);
+    }
+
+    /// Hand-edited extremes must not break the renderer.
+    #[test]
+    fn annotation_values_are_clamped_when_applied() {
+        let a = Annotation { stroke_width: 999.0, stroke_color: String::new(), mosaic_block: 0 };
+        assert_eq!(a.clamped_stroke_width(), 20.0);
+        assert_eq!(a.clamped_mosaic_block(), 4);
+        assert_eq!(a.stroke_argb(), crate::overlay::theme::STROKE_ARGB);
     }
 }

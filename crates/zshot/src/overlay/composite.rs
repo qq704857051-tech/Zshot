@@ -488,7 +488,8 @@ pub fn export_annotated_png(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::overlay::editor::{Element, Shape, DEFAULT_MOSAIC_BLOCK, DEFAULT_STROKE};
+    use crate::overlay::editor::{Element, Shape, DEFAULT_MOSAIC_BLOCK};
+    use crate::overlay::theme::STROKE_ARGB;
     use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
     fn solid(w: u32, h: u32, c: [u8; 4]) -> (Vec<u8>, u32) {
@@ -522,7 +523,7 @@ mod tests {
         Element {
             id: 1,
             bounds,
-            stroke: DEFAULT_STROKE,
+            stroke: STROKE_ARGB,
             stroke_width: 3.0,
             shape: Shape::Rect,
         }
@@ -534,7 +535,7 @@ mod tests {
         Element {
             id: 2,
             bounds,
-            stroke: DEFAULT_STROKE,
+            stroke: STROKE_ARGB,
             stroke_width: 1.0,
             shape: Shape::Mosaic {
                 points: vec![
@@ -559,7 +560,7 @@ mod tests {
         let el = Element {
             id: 2,
             bounds: Rect::new(8.0, 8.0, 48.0, 48.0),
-            stroke: DEFAULT_STROKE,
+            stroke: STROKE_ARGB,
             stroke_width: 1.0,
             shape: Shape::Mosaic {
                 points: vec![crate::geom::Point { x: 32.0, y: 32.0 }],
@@ -601,7 +602,7 @@ mod tests {
             let el = Element {
                 id: 2,
                 bounds: Rect::new(0.0, 0.0, 96.0, 64.0),
-                stroke: DEFAULT_STROKE,
+                stroke: STROKE_ARGB,
                 stroke_width: 1.0,
                 shape: Shape::Mosaic {
                     points: vec![
@@ -701,7 +702,7 @@ mod tests {
         let el = Element {
             id: 9,
             bounds: Rect::new(-8.0, 8.0, 16.0, 16.0),
-            stroke: DEFAULT_STROKE,
+            stroke: STROKE_ARGB,
             stroke_width: 1.0,
             shape: Shape::Mosaic {
                 points: vec![crate::geom::Point { x: -8.0, y: 16.0 }],
@@ -875,7 +876,7 @@ mod tests {
         let el = Element {
             id: 3,
             bounds: Rect::new(2.0, 2.0, 58.0, 28.0),
-            stroke: DEFAULT_STROKE,
+            stroke: STROKE_ARGB,
             stroke_width: 3.0,
             shape: Shape::Arrow {
                 start: crate::geom::Point { x: 4.0, y: 16.0 },

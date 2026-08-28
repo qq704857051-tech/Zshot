@@ -2,7 +2,7 @@
 
 mod assets;
 pub(crate) mod composite;
-mod editor;
+pub(crate) mod editor;
 pub(crate) mod theme;
 pub(crate) mod toolbar;
 

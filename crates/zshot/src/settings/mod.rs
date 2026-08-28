@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use gpui::{
     deferred, div, prelude::*, px, size, App, Bounds, Context, Entity, Focusable, FontWeight,
-    MouseButton,
+    CursorStyle, MouseButton,
     SharedString, Subscription, Timer, TitlebarOptions, Window, WindowBounds, WindowHandle,
     WindowOptions,
 };
@@ -156,13 +156,37 @@ impl Page {
     }
 }
 
+/// The dropdown currently open, if any — only one overlays the page at a time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectId {
+    Language,
+    StrokeWidth,
+    MosaicBlock,
+}
+
+/// (label, value) presets for the annotation dropdowns.
+const STROKE_WIDTHS: [(&str, f64); 4] = [("细 2 px", 2.0), ("中 4 px", 4.0), ("粗 6 px", 6.0), ("特粗 8 px", 8.0)];
+const MOSAIC_BLOCKS: [(&str, i32); 4] = [("小 8 px", 8), ("中 16 px", 16), ("大 24 px", 24), ("特大 32 px", 32)];
+/// (hex, packed RGB) — the swatch row on the screenshot page. The first entry
+/// is the historical default red.
+const SWATCHES: [(&str, u32); 8] = [
+    ("#FA3C3C", 0xFA3C3C),
+    ("#FF8C00", 0xFF8C00),
+    ("#FFD700", 0xFFD700),
+    ("#22B14C", 0x22B14C),
+    ("#3B82F6", 0x3B82F6),
+    ("#A855F7", 0xA855F7),
+    ("#1E1E1E", 0x1E1E1E),
+    ("#FFFFFF", 0xFFFFFF),
+];
+
 pub struct SettingsView {
     page: Page,
     settings: Settings,
     engine: SharedString,
     status: SharedString,
     status_error: bool,
-    language_open: bool,
+    open_select: Option<SelectId>,
     prompt_open: bool,
     /// Which action is being bound, if any. The recording hook is live for
     /// exactly as long as this is `Some`.
@@ -253,7 +277,7 @@ impl SettingsView {
             },
             status: SharedString::default(),
             status_error: false,
-            language_open: false,
+            open_select: None,
             prompt_open: false,
             recording: None,
             autostart: system::autostart_enabled(),
@@ -325,13 +349,59 @@ impl SettingsView {
     }
 
     fn set_language(&mut self, code: &str, cx: &mut Context<Self>) {
-        self.language_open = false;
+        self.open_select = None;
         if self.settings.translation.target_language != code {
             self.settings.translation.target_language = code.to_string();
             self.persist(cx);
         } else {
             cx.notify();
         }
+    }
+
+    /// A card whose right side is a dropdown. The open list is positioned
+    /// absolutely and painted in the deferred pass, so it overlays the cards
+    /// below instead of reflowing the page. Callers build the option rows
+    /// themselves: each carries its own click handler.
+    fn select_card(
+        &self,
+        cx: &mut Context<Self>,
+        which: SelectId,
+        header: &'static str,
+        desc: Option<&'static str>,
+        current: SharedString,
+        rows: Vec<gpui::Stateful<gpui::Div>>,
+    ) -> gpui::Div {
+        let open = self.open_select == Some(which);
+        div()
+            .relative()
+            .child(
+                widgets::card(header, desc.map(Into::into)).child(
+                    widgets::select(
+                        SharedString::from(format!("select-{}", which as u8)),
+                        current,
+                        open,
+                        Some(INLINE_FIELD_W),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.open_select = if open { None } else { Some(which) };
+                            cx.notify();
+                        }),
+                    ),
+                ),
+            )
+            .when(open, |el| {
+                // 72 = card min_h (68) + 4px gap, same as the language list.
+                el.child(deferred(
+                    div()
+                        .absolute()
+                        .top(px(72.))
+                        .right(px(0.))
+                        .w(px(INLINE_FIELD_W))
+                        .child(widgets::select_list().children(rows)),
+                ))
+            })
     }
 
     fn hotkey_text(&self, action: HotkeyAction) -> SharedString {
@@ -516,6 +586,93 @@ impl SettingsView {
             rows.push(div().flex().flex_row().gap(px(8.)).children(cells));
         }
 
+        let ann = &self.settings.screenshot.annotation;
+        let current_argb = ann.stroke_argb();
+        let swatches = SWATCHES.map(|(hex, rgb24)| {
+            let selected = current_argb == 0xFF00_0000 | rgb24;
+            div()
+                .id(SharedString::from(format!("swatch-{hex}")))
+                .flex_none()
+                .w(px(22.))
+                .h(px(22.))
+                .rounded_full()
+                .bg(gpui::rgb(rgb24))
+                .border_2()
+                .border_color(if selected { theme::accent() } else { theme::border() })
+                .cursor(CursorStyle::PointingHand)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        if this.settings.screenshot.annotation.stroke_color != hex {
+                            this.settings.screenshot.annotation.stroke_color = hex.into();
+                            this.persist(cx);
+                        }
+                    }),
+                )
+        });
+        let color = widgets::card("默认颜色", Some("新画笔、形状和文字标注的颜色。".into()))
+            .child(div().flex().flex_row().gap(px(8.)).children(swatches));
+
+        let stored_w = ann.stroke_width;
+        let width_label: SharedString = STROKE_WIDTHS
+            .iter()
+            .find(|(_, v)| (*v - stored_w).abs() < f64::EPSILON)
+            .map(|(label, _)| label.to_string().into())
+            .unwrap_or_else(|| format!("{stored_w:.0} px").into());
+        let width_rows = STROKE_WIDTHS
+            .map(|(label, v)| {
+                widgets::select_option(
+                    SharedString::from(format!("width-{v}")),
+                    label,
+                    (v - stored_w).abs() < f64::EPSILON,
+                )
+                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                    this.settings.screenshot.annotation.stroke_width = v;
+                    this.open_select = None;
+                    this.persist(cx);
+                }))
+            })
+            .into_iter()
+            .collect();
+        let width = self.select_card(
+            cx,
+            SelectId::StrokeWidth,
+            "线条粗细",
+            Some("画笔、形状和箭头的描边宽度。"),
+            width_label,
+            width_rows,
+        );
+
+        let stored_b = ann.mosaic_block;
+        let mosaic_label: SharedString = MOSAIC_BLOCKS
+            .iter()
+            .find(|(_, v)| *v == stored_b)
+            .map(|(label, _)| label.to_string().into())
+            .unwrap_or_else(|| format!("{stored_b} px").into());
+        let mosaic_rows = MOSAIC_BLOCKS
+            .map(|(label, v)| {
+                widgets::select_option(
+                    SharedString::from(format!("mosaic-{v}")),
+                    label,
+                    v == stored_b,
+                )
+                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                    this.settings.screenshot.annotation.mosaic_block = v;
+                    this.open_select = None;
+                    this.persist(cx);
+                }))
+            })
+            .into_iter()
+            .collect();
+        let mosaic = self.select_card(
+            cx,
+            SelectId::MosaicBlock,
+            "马赛克大小",
+            Some("马赛克涂抹的格子边长，单位是图像像素。"),
+            mosaic_label,
+            mosaic_rows,
+        );
+
         div()
             .flex()
             .flex_col()
@@ -527,6 +684,17 @@ impl SettingsView {
                 .child(div().flex().flex_col().children(rows)),
             )
             .child(widgets::hint("工具栏改动在下一次截图时生效。"))
+            .child(widgets::group_header("注释工具"))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(color)
+                    .child(width)
+                    .child(mosaic),
+            )
+            .child(widgets::hint("新标注使用这里的默认值，下一次截图时生效。"))
     }
 
     fn page_ocr(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -558,56 +726,29 @@ impl SettingsView {
                     ),
             );
 
-        // Short value: it sits beside its label, with the list dropping under it.
         let current = self.settings.translation.target_language.clone();
-        let language = div()
-            .relative()
-            .child(
-                widgets::card("目标语言", None).child(
-                    widgets::select(
-                        "lang-select",
-                        self.language_label(),
-                        self.language_open,
-                        Some(INLINE_FIELD_W),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.language_open = !this.language_open;
-                            cx.notify();
-                        }),
-                    ),
-                ),
-            )
-            .when(self.language_open, |el| {
-                // Deferred + absolute: the list overlays the cards below
-                // instead of pushing them down. Layout stays anchored under
-                // the card (min_h 68 + 4px gap); only painting is deferred
-                // past the later siblings.
-                el.child(deferred(
-                    div()
-                        .absolute()
-                        .top(px(72.))
-                        .right(px(0.))
-                        .w(px(INLINE_FIELD_W))
-                        .child(widgets::select_list().children(LANGUAGES.map(
-                                |(code, name)| {
-                                    widgets::select_option(
-                                        code,
-                                        format!("{name} ({code})"),
-                                        current == code,
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.set_language(code, cx)
-                                        }),
-                                    )
-                                },
-                            )))
-                    ),
+        let rows = LANGUAGES
+            .map(|(code, name)| {
+                widgets::select_option(
+                    code,
+                    format!("{name} ({code})"),
+                    current == code,
                 )
-            });
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| this.set_language(code, cx)),
+                )
+            })
+            .into_iter()
+            .collect();
+        let language = self.select_card(
+            cx,
+            SelectId::Language,
+            "目标语言",
+            None,
+            self.language_label(),
+            rows,
+        );
 
         let prompt_summary = if self.settings.translation.prompt.trim().is_empty() {
             "使用内置"
