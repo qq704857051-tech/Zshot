@@ -103,14 +103,17 @@ pub fn set_clipboard_dib(pixels: &[u8], width: u32, height: u32, stride: u32) ->
         let header = ptr as *mut BITMAPINFOHEADER;
         (*header).biSize = header_size as u32;
         (*header).biWidth = width as i32;
-        (*header).biHeight = -(height as i32);
+        // Bottom-up, not top-down: Windows' on-demand CF_DIB -> CF_BITMAP
+        // synthesis fails for negative-height DIBs, and most paste targets
+        // (WeChat, GDI+ apps) ask for exactly that format.
+        (*header).biHeight = height as i32;
         (*header).biPlanes = 1;
         (*header).biBitCount = 32;
         (*header).biCompression = BI_RGB.0;
         (*header).biSizeImage = image_size as u32;
         let dest = ptr.add(header_size);
         for y in 0..height as usize {
-            let src = y * stride as usize;
+            let src = (height as usize - 1 - y) * stride as usize;
             let dst = y * packed_stride as usize;
             std::ptr::copy_nonoverlapping(
                 pixels.as_ptr().add(src),
@@ -214,9 +217,10 @@ mod tests {
             let data = std::slice::from_raw_parts(ptr, size);
             let header = &*(data.as_ptr() as *const BITMAPINFOHEADER);
             assert_eq!(header.biWidth, 2);
-            assert_eq!(header.biHeight, -2, "top-down DIB");
+            assert_eq!(header.biHeight, 2, "bottom-up DIB");
             let image = &data[std::mem::size_of::<BITMAPINFOHEADER>()..];
-            assert_eq!(image, &pixels[..]);
+            // Bottom-up: the first stored row is the last source row.
+            assert_eq!(image, &[9, 10, 11, 255, 13, 14, 15, 255, 1, 2, 3, 255, 5, 6, 7, 255]);
             let _ = GlobalUnlock(h);
             let _ = CloseClipboard();
         }
