@@ -49,6 +49,39 @@ impl AssetSource for ToolbarAssets {
             "toolbar/cancel.svg" => Some(Cow::Borrowed(include_bytes!(
                 "../../../../assets/toolbar/cancel.svg"
             ))),
+            "settings/screenshot.svg" => Some(Cow::Borrowed(include_bytes!(
+                "../../../../assets/settings/screenshot.svg"
+            ))),
+            "settings/ocr.svg" => Some(Cow::Borrowed(include_bytes!(
+                "../../../../assets/settings/ocr.svg"
+            ))),
+            "settings/hotkey.svg" => Some(Cow::Borrowed(include_bytes!(
+                "../../../../assets/settings/hotkey.svg"
+            ))),
+            "settings/general.svg" => Some(Cow::Borrowed(include_bytes!(
+                "../../../../assets/settings/general.svg"
+            ))),
+            "settings/copy.svg" => Some(Cow::Borrowed(include_bytes!(
+                "../../../../assets/settings/copy.svg"
+            ))),
+            "settings/monitor.svg" => Some(Cow::Borrowed(include_bytes!(
+                "../../../../assets/settings/monitor.svg"
+            ))),
+            "settings/check.svg" => Some(Cow::Borrowed(include_bytes!(
+                "../../../../assets/settings/check.svg"
+            ))),
+            "settings/info.svg" => Some(Cow::Borrowed(include_bytes!(
+                "../../../../assets/settings/info.svg"
+            ))),
+            "settings/folder.svg" => Some(Cow::Borrowed(include_bytes!(
+                "../../../../assets/settings/folder.svg"
+            ))),
+            "settings/chevron.svg" => Some(Cow::Borrowed(include_bytes!(
+                "../../../../assets/settings/chevron.svg"
+            ))),
+            "settings/close.svg" => Some(Cow::Borrowed(include_bytes!(
+                "../../../../assets/settings/close.svg"
+            ))),
             _ => None,
         })
     }

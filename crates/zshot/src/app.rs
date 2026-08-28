@@ -41,7 +41,8 @@ use crate::platform::{
     action_from_wparam, action_wparam, add_tray_icon, handle_tray, install_ll_hook, load_app_icon,
     register_fallback_hotkeys, remove_tray_icon, set_dpi_aware, set_hook_target,
     taskbar_created_message, uninstall_ll_hook, unregister_fallback_hotkeys, SingleInstance,
-    TrayCommand, WM_TRAYICON, WM_ZSHOT_HOTKEY,
+    unpack_hotkey, TrayCommand, WM_TRAYICON, WM_ZSHOT_HOTKEY, WM_ZSHOT_HOTKEY_RECORDED,
+    WM_ZSHOT_SETTINGS,
 };
 
 static BUSY: AtomicBool = AtomicBool::new(false);
@@ -555,7 +556,7 @@ fn boot_resident(
     let hwnd = create_hidden_overlapped_window()?;
     *cleanup_hwnd.borrow_mut() = Some(hwnd);
 
-    let bindings = HotkeyBindings::poc_defaults();
+    let bindings = HotkeyBindings::from_settings(&crate::config::get().hotkeys);
     set_hook_target(hwnd, bindings);
     if let Err(e) = install_ll_hook() {
         eprintln!("LL hook failed ({e}); using RegisterHotKey fallback");
@@ -631,6 +632,15 @@ unsafe extern "system" fn hidden_proc(
         }
         return LRESULT(0);
     }
+    if msg == WM_ZSHOT_HOTKEY_RECORDED {
+        let hotkey = unpack_hotkey(wparam.0);
+        with_gpui_app(move |cx| crate::settings::on_hotkey_recorded(cx, hotkey));
+        return LRESULT(0);
+    }
+    if msg == WM_ZSHOT_SETTINGS {
+        with_gpui_app(crate::settings::open);
+        return LRESULT(0);
+    }
     if msg == taskbar_created_message() {
         let _ = add_tray_icon(hwnd);
         return LRESULT(0);
@@ -641,6 +651,9 @@ unsafe extern "system" fn hidden_proc(
                 TrayCommand::Region => post_action(hwnd, HotkeyAction::Region),
                 TrayCommand::Fullscreen => post_action(hwnd, HotkeyAction::Fullscreen),
                 TrayCommand::CopyOnly => post_action(hwnd, HotkeyAction::CopyOnly),
+                TrayCommand::Settings => unsafe {
+                    let _ = PostMessageW(Some(hwnd), WM_ZSHOT_SETTINGS, WPARAM(0), LPARAM(0));
+                },
                 TrayCommand::Exit => {
                     remove_tray_icon(hwnd);
                     PostQuitMessage(0);

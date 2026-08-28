@@ -7,7 +7,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, DestroyMenu, GetCursorPos, InsertMenuW, LoadIconW, LoadImageW,
     RegisterWindowMessageW, SetForegroundWindow, TrackPopupMenu, HICON, IDI_APPLICATION,
-    IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, MF_BYPOSITION, MF_STRING, TPM_LEFTALIGN,
+    IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, MF_BYPOSITION, MF_SEPARATOR, MF_STRING, TPM_LEFTALIGN,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_LBUTTONUP, WM_RBUTTONUP,
 };
 
@@ -17,6 +17,7 @@ use crate::platform::WM_TRAYICON;
 const ID_REGION: u32 = 1;
 const ID_FULL: u32 = 2;
 const ID_COPY: u32 = 3;
+const ID_SETTINGS: u32 = 4;
 const ID_EXIT: u32 = 9;
 
 #[derive(Clone, Copy, Debug)]
@@ -24,6 +25,7 @@ pub enum TrayCommand {
     Region,
     Fullscreen,
     CopyOnly,
+    Settings,
     Exit,
 }
 
@@ -118,7 +120,9 @@ fn show_menu(hwnd: HWND) -> Option<TrayCommand> {
         let _ = InsertMenuW(menu, 0, MF_BYPOSITION | MF_STRING, ID_REGION as usize, PCWSTR(w("区域截图\0").as_ptr()));
         let _ = InsertMenuW(menu, 1, MF_BYPOSITION | MF_STRING, ID_FULL as usize, PCWSTR(w("全屏截图\0").as_ptr()));
         let _ = InsertMenuW(menu, 2, MF_BYPOSITION | MF_STRING, ID_COPY as usize, PCWSTR(w("仅复制\0").as_ptr()));
-        let _ = InsertMenuW(menu, 3, MF_BYPOSITION | MF_STRING, ID_EXIT as usize, PCWSTR(w("退出\0").as_ptr()));
+        let _ = InsertMenuW(menu, 3, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = InsertMenuW(menu, 4, MF_BYPOSITION | MF_STRING, ID_SETTINGS as usize, PCWSTR(w("设置\0").as_ptr()));
+        let _ = InsertMenuW(menu, 5, MF_BYPOSITION | MF_STRING, ID_EXIT as usize, PCWSTR(w("退出\0").as_ptr()));
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
         let _ = SetForegroundWindow(hwnd);
@@ -136,6 +140,7 @@ fn show_menu(hwnd: HWND) -> Option<TrayCommand> {
             ID_REGION => Some(TrayCommand::Region),
             ID_FULL => Some(TrayCommand::Fullscreen),
             ID_COPY => Some(TrayCommand::CopyOnly),
+            ID_SETTINGS => Some(TrayCommand::Settings),
             ID_EXIT => Some(TrayCommand::Exit),
             _ => None,
         }

@@ -64,6 +64,17 @@ pub fn recognize(bgra: &[u8], w: u32, h: u32, stride: u32) -> Result<String> {
     Ok(reading_order::to_plain_text(&blocks))
 }
 
+/// What the settings page reports as the active engine. There is no fallback
+/// recognizer in this build, so a missing model means OCR is simply off.
+pub fn models_available() -> bool {
+    let Ok(dir) = models_dir() else {
+        return false;
+    };
+    [DET_MODEL, REC_MODEL, DICT]
+        .iter()
+        .all(|f| dir.join(f).is_file())
+}
+
 /// A panic while holding the lock must not disable OCR for the rest of the
 /// session — the session behind it is still usable.
 fn lock() -> std::sync::MutexGuard<'static, Option<Engine>> {
@@ -100,7 +111,7 @@ fn build() -> Result<OAROCR> {
 /// `settings.json` wins, then `ZSHOT_MODELS` (dev runs out of `target/`), then
 /// the install layout the C# build already uses.
 fn models_dir() -> Result<PathBuf> {
-    if let Some(dir) = crate::config::get().ocr.models_dir.clone() {
+    if let Some(dir) = crate::config::get().ocr.models_dir {
         return Ok(dir);
     }
     if let Some(dir) = std::env::var_os("ZSHOT_MODELS") {

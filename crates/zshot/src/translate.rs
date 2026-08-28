@@ -6,7 +6,7 @@
 use std::ffi::c_void;
 
 use windows::core::{HSTRING, PCWSTR, PWSTR};
-use windows::Security::Credentials::PasswordVault;
+use windows::Security::Credentials::{PasswordCredential, PasswordVault};
 use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpCrackUrl, WinHttpOpen, WinHttpOpenRequest,
     WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse,
@@ -26,7 +26,7 @@ const DEFAULT_SYSTEM_PROMPT: &str = "You are a translator. Output only the trans
 
 /// Blocking. Call it off the UI thread.
 pub fn translate(text: &str) -> Result<String> {
-    let cfg = &config::get().translation;
+    let cfg = config::get().translation;
     if cfg.base_url.trim().is_empty() {
         let path = config::path()
             .map(|p| p.display().to_string())
@@ -56,7 +56,7 @@ pub fn translate(text: &str) -> Result<String> {
 }
 
 /// The vault entry is optional: local gateways commonly take no key.
-fn api_key() -> Result<String> {
+pub fn api_key() -> Result<String> {
     let vault = PasswordVault::new()?;
     let Ok(cred) = vault.Retrieve(
         &HSTRING::from(VAULT_RESOURCE),
@@ -66,6 +66,29 @@ fn api_key() -> Result<String> {
     };
     cred.RetrievePassword()?;
     Ok(cred.Password()?.to_string())
+}
+
+/// Replaces the stored key. An empty value removes the entry rather than
+/// storing a blank one, so `api_key` keeps reporting "no key" the same way it
+/// does before the user ever opens the settings window.
+pub fn set_api_key(key: &str) -> Result<()> {
+    let vault = PasswordVault::new()?;
+    let resource = HSTRING::from(VAULT_RESOURCE);
+    let account = HSTRING::from(VAULT_ACCOUNT);
+    if let Ok(existing) = vault.Retrieve(&resource, &account) {
+        vault.Remove(&existing)?;
+    }
+    let key = key.trim();
+    if key.is_empty() {
+        return Ok(());
+    }
+    let cred = PasswordCredential::CreatePasswordCredential(
+        &resource,
+        &account,
+        &HSTRING::from(key),
+    )?;
+    vault.Add(&cred)?;
+    Ok(())
 }
 
 /// Accept a bare host, a `/v1` root, or the full path — users paste all three.

@@ -13,6 +13,7 @@ pub mod ocr;
 pub mod overlay;
 pub mod perf;
 pub mod platform;
+pub mod settings;
 pub mod translate;
 
 pub use app::{once_capture, run};

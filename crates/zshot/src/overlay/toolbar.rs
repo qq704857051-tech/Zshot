@@ -91,18 +91,6 @@ pub fn label(id: &str) -> &'static str {
     }
 }
 
-pub fn parse_hidden(stored: Option<&str>) -> Vec<String> {
-    match stored {
-        None => DEFAULT_HIDDEN.iter().map(|s| (*s).to_string()).collect(),
-        Some(s) => s
-            .split(',')
-            .map(str::trim)
-            .filter(|p| !p.is_empty() && CUSTOMIZABLE.contains(p))
-            .map(str::to_string)
-            .collect(),
-    }
-}
-
 pub fn is_visible(id: &str, hidden: &[String]) -> bool {
     if id == COPY {
         return false;
@@ -136,21 +124,33 @@ pub fn place_toolbar(
     Point { x, y }
 }
 
+/// Where the panel's vertical edge anchors.
+pub enum PanelY {
+    /// Top edge at `bar.bottom + gap`.
+    BelowBar,
+    /// Bottom edge at `bar.y - gap`; the caller bottom-anchors because the
+    /// content height is unknown before layout.
+    AboveBar,
+    /// Explicit top edge (beside the selection).
+    Top(f64),
+}
+
 /// Where the OCR/translate panel goes relative to the toolbar.
 pub struct PanelPlacement {
     pub x: f64,
-    /// False means the caller must bottom-anchor at `bar.y - gap`: the content
-    /// height is unknown before layout, so the top edge cannot be precomputed.
-    pub anchor_below: bool,
+    pub y: PanelY,
     pub body_max_h: f64,
 }
 
-/// The toolbar is clamped to the monitor by its own (narrower) width; the wider
-/// panel needs its own clamp. Vertically it prefers below the toolbar and flips
-/// above when that side has more room. The body scrolls, so shrinking max_h to
-/// fit the monitor loses no text.
+/// Places the panel so it stays on the monitor and, whenever possible, off the
+/// selection — the user compares the recognized text against it. It keeps to
+/// the toolbar's side of the selection first; when that side is too short it
+/// moves beside the selection; only when neither works (selection fills the
+/// monitor) does it take the roomier side and overlap. The body scrolls, so
+/// shrinking max_h to fit loses no text.
 pub fn place_panel(
     bar: Rect,
+    selection: Rect,
     panel_w: f64,
     chrome: f64,
     body_limit: (f64, f64),
@@ -158,20 +158,69 @@ pub fn place_panel(
     gap: f64,
     margin: f64,
 ) -> PanelPlacement {
+    let (body_min, body_max) = body_limit;
     let mon_l = monitor.x + margin;
     let mon_t = monitor.y + margin;
     let mon_r = monitor.x + monitor.width - margin;
     let mon_b = monitor.y + monitor.height - margin;
-    let x = bar.x.clamp(mon_l, (mon_r - panel_w).max(mon_l));
-    let below = mon_b - (bar.y + bar.height + gap);
-    let above = bar.y - gap - mon_t;
-    let anchor_below = below >= above;
-    let avail = if anchor_below { below } else { above };
-    let body_max_h = (avail - chrome).clamp(body_limit.0, body_limit.1);
+    let clamp_x = |x: f64| x.clamp(mon_l, (mon_r - panel_w).max(mon_l));
+    let fit = |room: f64| (room - chrome).clamp(body_min, body_max);
+
+    let room_below = mon_b - (bar.y + bar.height + gap);
+    let room_above = bar.y - gap - mon_t;
+    let bar_below_sel = bar.y + bar.height / 2.0 >= selection.y + selection.height / 2.0;
+    let need = chrome + body_min;
+
+    // The toolbar's side of the selection: the panel cannot cover it there.
+    // The toolbar itself is already clamped to the monitor by its own
+    // (narrower) width; the wider panel clamps x on its own.
+    if bar_below_sel && room_below >= need {
+        return PanelPlacement {
+            x: clamp_x(bar.x),
+            y: PanelY::BelowBar,
+            body_max_h: fit(room_below),
+        };
+    }
+    if !bar_below_sel && room_above >= need {
+        return PanelPlacement {
+            x: clamp_x(bar.x),
+            y: PanelY::AboveBar,
+            body_max_h: fit(room_above),
+        };
+    }
+
+    // Beside the selection (right first), kept inside its vertical span so the
+    // panel cannot hit the toolbar either, which sits outside that span.
+    let right_x = selection.x + selection.width + gap;
+    let left_x = selection.x - gap - panel_w;
+    let top = selection.y.max(mon_t);
+    let vroom = (selection.y + selection.height).min(mon_b) - top;
+    let beside = if right_x + panel_w <= mon_r {
+        Some(right_x)
+    } else if left_x >= mon_l {
+        Some(left_x)
+    } else {
+        None
+    };
+    if let (Some(x), true) = (beside, vroom >= need) {
+        return PanelPlacement {
+            x,
+            y: PanelY::Top(top),
+            body_max_h: fit(vroom),
+        };
+    }
+
+    // The selection fills the monitor: overlap is unavoidable, take the
+    // roomier side of the toolbar.
+    let (y, room) = if room_below >= room_above {
+        (PanelY::BelowBar, room_below)
+    } else {
+        (PanelY::AboveBar, room_above)
+    };
     PanelPlacement {
-        x,
-        anchor_below,
-        body_max_h,
+        x: clamp_x(bar.x),
+        y,
+        body_max_h: fit(room),
     }
 }
 
@@ -179,9 +228,13 @@ pub fn place_panel(
 mod tests {
     use super::*;
 
+    fn hidden(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| (*s).to_string()).collect()
+    }
+
     #[test]
     fn complete_and_cancel_are_always_visible() {
-        let hidden = parse_hidden(Some("complete,cancel,save"));
+        let hidden = hidden(&[COMPLETE, CANCEL, SAVE]);
         assert!(is_visible(COMPLETE, &hidden));
         assert!(is_visible(CANCEL, &hidden));
         assert!(!is_visible(SAVE, &hidden));
@@ -189,13 +242,22 @@ mod tests {
 
     #[test]
     fn copy_is_never_on_the_bar() {
-        assert!(!is_visible(COPY, &parse_hidden(None)));
-        assert!(!is_visible(COPY, &parse_hidden(Some(""))));
+        assert!(!is_visible(COPY, &hidden(DEFAULT_HIDDEN)));
+        assert!(!is_visible(COPY, &[]));
+    }
+
+    /// An empty list is the shipped default: nothing hidden. `DEFAULT_HIDDEN`
+    /// is the C# set, kept for when the settings page offers a reset.
+    #[test]
+    fn an_empty_list_hides_nothing() {
+        for id in PHASE1_ITEMS {
+            assert!(is_visible(id, &[]), "{id}");
+        }
     }
 
     #[test]
     fn default_hidden_matches_csharp() {
-        let hidden = parse_hidden(None);
+        let hidden = hidden(DEFAULT_HIDDEN);
         assert!(!is_visible(ELLIPSE, &hidden));
         assert!(!is_visible(TEXT, &hidden));
         assert!(!is_visible(NUMBER, &hidden));
@@ -250,7 +312,8 @@ mod tests {
     #[test]
     fn panel_prefers_below_toolbar() {
         let p = place_panel(
-            Rect::new(100.0, 208.0, 462.0, 44.0),
+            Rect::new(100.0, 208.0, 538.0, 44.0),
+            Rect::new(100.0, 80.0, 200.0, 120.0),
             320.0,
             80.0,
             (48.0, 260.0),
@@ -258,17 +321,18 @@ mod tests {
             8.0,
             4.0,
         );
-        assert!(p.anchor_below);
+        assert!(matches!(p.y, PanelY::BelowBar));
         assert_eq!(p.x, 100.0);
         assert_eq!(p.body_max_h, 260.0);
     }
 
     #[test]
-    fn panel_flips_above_when_toolbar_sits_at_monitor_bottom() {
-        // Selection spans nearly the full monitor: the toolbar clamps to the
-        // bottom edge, and the panel would start off-screen without the flip.
+    fn panel_keeps_toolbar_side_instead_of_roomier_side() {
+        // The toolbar sits above a bottom-heavy selection; below the bar is
+        // roomier but the panel would cover the selection from its top edge.
         let p = place_panel(
-            Rect::new(100.0, 1036.0, 462.0, 44.0),
+            Rect::new(100.0, 148.0, 538.0, 44.0),
+            Rect::new(100.0, 200.0, 800.0, 800.0),
             320.0,
             80.0,
             (48.0, 260.0),
@@ -276,16 +340,72 @@ mod tests {
             8.0,
             4.0,
         );
-        assert!(!p.anchor_below);
+        assert!(matches!(p.y, PanelY::AboveBar));
+        // room above = 148 - 8 - 4 = 136; body = 136 - 80 chrome = 56.
+        assert_eq!(p.body_max_h, 56.0);
+    }
+
+    #[test]
+    fn panel_moves_beside_selection_when_no_vertical_room() {
+        // The selection nearly fills the monitor: the toolbar clamps above it
+        // with no room on either side, but 1120 px remain on the right.
+        let p = place_panel(
+            Rect::new(100.0, 8.0, 538.0, 44.0),
+            Rect::new(100.0, 60.0, 800.0, 980.0),
+            320.0,
+            80.0,
+            (48.0, 260.0),
+            Rect::new(0.0, 0.0, 1920.0, 1080.0),
+            8.0,
+            4.0,
+        );
+        assert!(matches!(p.y, PanelY::Top(60.0)));
+        assert_eq!(p.x, 100.0 + 800.0 + 8.0);
+        assert_eq!(p.body_max_h, 260.0);
+    }
+
+    #[test]
+    fn panel_beside_falls_back_to_the_left() {
+        // The selection hugs the right edge; beside must go left.
+        let p = place_panel(
+            Rect::new(100.0, 8.0, 538.0, 44.0),
+            Rect::new(1500.0, 60.0, 380.0, 980.0),
+            320.0,
+            80.0,
+            (48.0, 260.0),
+            Rect::new(0.0, 0.0, 1920.0, 1080.0),
+            8.0,
+            4.0,
+        );
+        assert!(matches!(p.y, PanelY::Top(_)));
+        assert_eq!(p.x, 1500.0 - 8.0 - 320.0);
+    }
+
+    #[test]
+    fn panel_overlaps_only_when_selection_fills_the_monitor() {
+        // Full-screen selection: no vertical room and no side room, so it
+        // takes the roomier side of the toolbar (above) and overlaps.
+        let p = place_panel(
+            Rect::new(100.0, 1032.0, 538.0, 44.0),
+            Rect::new(0.0, 0.0, 1920.0, 1080.0),
+            320.0,
+            80.0,
+            (48.0, 260.0),
+            Rect::new(0.0, 0.0, 1920.0, 1080.0),
+            8.0,
+            4.0,
+        );
+        assert!(matches!(p.y, PanelY::AboveBar));
         assert_eq!(p.body_max_h, 260.0);
     }
 
     #[test]
     fn panel_shrinks_body_to_fit() {
-        // Short monitor: above the bar is 182 - 8 - 4 = 170 px, below is
-        // 396 - 234 = 162 px. Above wins and the body gets 170 - 80 = 90 px.
+        // Short monitor: below the bar is 396 - 234 = 162 px, which fits the
+        // minimum but not the full body: 162 - 80 chrome = 82 px.
         let p = place_panel(
             Rect::new(100.0, 182.0, 462.0, 44.0),
+            Rect::new(100.0, 20.0, 800.0, 150.0),
             320.0,
             80.0,
             (48.0, 260.0),
@@ -293,8 +413,8 @@ mod tests {
             8.0,
             4.0,
         );
-        assert!(!p.anchor_below);
-        assert_eq!(p.body_max_h, 90.0);
+        assert!(matches!(p.y, PanelY::BelowBar));
+        assert_eq!(p.body_max_h, 82.0);
     }
 
     #[test]
@@ -304,6 +424,7 @@ mod tests {
         // x would push the panel off-screen; the panel slides left on its own.
         let p = place_panel(
             Rect::new(1218.0, 208.0, 82.0, 44.0),
+            Rect::new(900.0, 80.0, 200.0, 120.0),
             320.0,
             80.0,
             (48.0, 260.0),
@@ -311,6 +432,7 @@ mod tests {
             8.0,
             4.0,
         );
+        assert!(matches!(p.y, PanelY::BelowBar));
         assert_eq!(p.x, 976.0);
         assert!(p.x >= 804.0);
         assert!(p.x + 320.0 <= 1296.0);

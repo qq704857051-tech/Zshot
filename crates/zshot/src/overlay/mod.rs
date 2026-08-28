@@ -3,8 +3,8 @@
 mod assets;
 pub(crate) mod composite;
 mod editor;
-mod theme;
-mod toolbar;
+pub(crate) mod theme;
+pub(crate) mod toolbar;
 
 pub use assets::ToolbarAssets;
 
@@ -148,6 +148,10 @@ pub struct OverlayView {
     /// strokes again only happens when the annotations actually change.
     mask_cache: RefCell<Option<MarkMasks>>,
     panel: Option<Panel>,
+    /// Read when the overlay is shown, not per frame: the settings window can
+    /// rewrite it while this view is alive, and the bar must not change shape
+    /// underneath a capture the user is already working in.
+    hidden_toolbar_items: Vec<String>,
 }
 
 /// OCR / translation output: read-only text plus copy, same as the C# panel.
@@ -293,6 +297,7 @@ impl OverlayView {
             mosaic_cache: RefCell::new(None),
             mask_cache: RefCell::new(None),
             panel: None,
+            hidden_toolbar_items: crate::config::get().screenshot.hidden_toolbar_items,
         }
     }
 
@@ -330,6 +335,7 @@ impl OverlayView {
             mosaic_cache: RefCell::new(None),
             mask_cache: RefCell::new(None),
             panel: None,
+            hidden_toolbar_items: crate::config::get().screenshot.hidden_toolbar_items,
         };
         view.sync_from_cap(window);
         view
@@ -361,6 +367,7 @@ impl OverlayView {
         self.text_edit = None;
         self.mask_cache = RefCell::new(None);
         self.panel = None;
+        self.hidden_toolbar_items = crate::config::get().screenshot.hidden_toolbar_items;
         self.sync_from_cap(window);
     }
 
@@ -871,11 +878,22 @@ impl OverlayView {
         )
     }
 
+    /// One list for sizing, hit testing and painting. Sizing the bar for every
+    /// tool while painting a filtered subset drifts every slot, so a click on
+    /// the last button lands on its neighbour.
+    fn visible_items(&self) -> Vec<&'static str> {
+        PHASE1_ITEMS
+            .iter()
+            .copied()
+            .filter(|id| toolbar::is_visible(id, &self.hidden_toolbar_items))
+            .collect()
+    }
+
     fn toolbar_geom(&self, scale: f32) -> Option<Rect> {
         if self.phase != Phase::Active || !self.has_sel {
             return None;
         }
-        let n = PHASE1_ITEMS.len();
+        let n = self.visible_items().len();
         let (w, h) = toolbar::bar_size(n);
         let s = scale as f64;
         let pos = toolbar::place_toolbar(
@@ -890,13 +908,7 @@ impl OverlayView {
 
     fn hit_toolbar_item(&self, p: Point, scale: f32) -> Option<&'static str> {
         let geom = self.toolbar_geom(scale)?;
-        let hidden = toolbar::parse_hidden(Some(""));
-        let items: Vec<&'static str> = PHASE1_ITEMS
-            .iter()
-            .copied()
-            .filter(|id| toolbar::is_visible(id, &hidden))
-            .collect();
-        toolbar_item_at(p, geom, &items)
+        toolbar_item_at(p, geom, &self.visible_items())
     }
 
     fn handle_toolbar(&mut self, id: &'static str, window: &mut Window, cx: &mut Context<Self>) {
@@ -1176,7 +1188,7 @@ impl OverlayView {
         let tool_id = self.editor.tool.id();
         let can_undo = self.editor.history.can_undo();
         let can_redo = self.editor.history.can_redo();
-        let hidden = toolbar::parse_hidden(Some(""));
+        let items = self.visible_items();
         Some(
             div()
                 .absolute()
@@ -1202,7 +1214,7 @@ impl OverlayView {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
                     cx.stop_propagation();
                 })
-                .children(PHASE1_ITEMS.iter().copied().filter(|id| toolbar::is_visible(id, &hidden)).map(|id| {
+                .children(items.into_iter().map(|id| {
                     let active = tool_id == id;
                     let dim = (id == toolbar::UNDO && !can_undo)
                         || (id == toolbar::REDO && !can_redo);
@@ -1219,11 +1231,14 @@ impl OverlayView {
         // element tree is logical, so convert before placing.
         let s = scale.max(0.01) as f64;
         let bar = Rect::new(bar.x / s, bar.y / s, bar.width / s, bar.height / s);
+        let sel = self.selection;
+        let sel = Rect::new(sel.x / s, sel.y / s, sel.width / s, sel.height / s);
         let mon = self.active_monitor_rect();
         let mon = Rect::new(mon.x / s, mon.y / s, mon.width / s, mon.height / s);
         let chrome = (PANEL_CHROME + if copyable { PANEL_COPY_H } else { 0. }) as f64;
         let place = toolbar::place_panel(
             bar,
+            sel,
             PANEL_W as f64,
             chrome,
             (PANEL_MIN_BODY_H as f64, PANEL_MAX_H as f64),
@@ -1236,14 +1251,16 @@ impl OverlayView {
             .absolute()
             .left(px(place.x as f32))
             .w(px(PANEL_W));
-        // Bottom-anchored when flipped above the toolbar: the content height is
-        // unknown before layout, so a top edge cannot be precomputed, while the
-        // bottom edge hugs the toolbar regardless of how tall the body is.
-        let el = if place.anchor_below {
-            el.top(px((bar.y + bar.height + toolbar::ANCHOR_GAP) as f32))
-        } else {
-            let parent_h = self.freeze_size.1 as f64 / s;
-            el.bottom(px((parent_h - bar.y + toolbar::ANCHOR_GAP) as f32))
+        // AboveBar bottom-anchors because the content height is unknown before
+        // layout: a top edge cannot be precomputed, while the bottom edge hugs
+        // the toolbar regardless of how tall the body is.
+        let el = match place.y {
+            toolbar::PanelY::BelowBar => el.top(px((bar.y + bar.height + toolbar::ANCHOR_GAP) as f32)),
+            toolbar::PanelY::AboveBar => {
+                let parent_h = self.freeze_size.1 as f64 / s;
+                el.bottom(px((parent_h - bar.y + toolbar::ANCHOR_GAP) as f32))
+            }
+            toolbar::PanelY::Top(y) => el.top(px(y as f32)),
         };
         Some(
             el.flex()
