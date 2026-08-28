@@ -10,22 +10,10 @@ const MIN_KEEP: f64 = 2.0;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Shape {
     Rect,
-    Arrow {
-        start: Point,
-        end: Point,
-        head: f64,
-    },
-    Pen {
-        points: Vec<Point>,
-    },
-    Mosaic {
-        points: Vec<Point>,
-        block_size: i32,
-    },
-    Text {
-        text: String,
-        font_size: f64,
-    },
+    Arrow { start: Point, end: Point, head: f64 },
+    Pen { points: Vec<Point> },
+    Mosaic { points: Vec<Point>, block_size: i32 },
+    Text { text: String, font_size: f64 },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -68,9 +56,7 @@ impl Element {
             Shape::Arrow { start, end, .. } => {
                 dist_to_segment(p, *start, *end) <= self.stroke_width.max(4.0)
             }
-            Shape::Pen { points } => {
-                hit_path(p, points, self.stroke_width.max(4.0))
-            }
+            Shape::Pen { points } => hit_path(p, points, self.stroke_width.max(4.0)),
             Shape::Mosaic { points, block_size } => {
                 hit_path(p, points, mosaic_brush_radius(*block_size))
             }
@@ -389,8 +375,7 @@ impl Session {
                 font_size: 20.0,
             },
         };
-        self.history
-            .execute(&mut self.elements, Command::Add(el));
+        self.history.execute(&mut self.elements, Command::Add(el));
     }
 
     pub fn undo(&mut self) -> bool {

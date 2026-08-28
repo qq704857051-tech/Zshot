@@ -329,8 +329,7 @@ pub fn triangles_mask(tris: &[(Point, Point, Point)]) -> Option<CoverageMask> {
             }
             if hits > 0 {
                 let cov = hits as f64 / (S * S) as f64;
-                data[(y - y0) as usize * width + (x - x0) as usize] =
-                    (cov * 255.0).round() as u8;
+                data[(y - y0) as usize * width + (x - x0) as usize] = (cov * 255.0).round() as u8;
             }
         }
     }
@@ -425,15 +424,7 @@ fn draw_text(buf: &mut Bgra<'_>, bounds: Rect, text: &str, font_size: f64, c: [u
 }
 
 /// 5×7 bitmap font (ASCII); other glyphs get a filled block so CJK still marks the crop.
-fn stamp_glyph(
-    buf: &mut Bgra<'_>,
-    x: f64,
-    y: f64,
-    cell_w: f64,
-    cell_h: f64,
-    ch: char,
-    c: [u8; 4],
-) {
+fn stamp_glyph(buf: &mut Bgra<'_>, x: f64, y: f64, cell_w: f64, cell_h: f64, ch: char, c: [u8; 4]) {
     let bits = glyph_bits(ch);
     let sx = cell_w / 5.0;
     let sy = cell_h / 7.0;
@@ -481,7 +472,9 @@ pub fn export_annotated_png(
     elements: &[Element],
 ) -> crate::error::Result<Vec<u8>> {
     let mut buf = pixels.to_vec();
-    apply_annotations(&mut buf, width, height, stride, origin_x, origin_y, elements);
+    apply_annotations(
+        &mut buf, width, height, stride, origin_x, origin_y, elements,
+    );
     crate::codec::encode_png_bgra(&buf, width, height, stride)
 }
 
@@ -606,7 +599,10 @@ mod tests {
                 stroke_width: 1.0,
                 shape: Shape::Mosaic {
                     points: vec![
-                        crate::geom::Point { x: start_x, y: 30.0 },
+                        crate::geom::Point {
+                            x: start_x,
+                            y: 30.0,
+                        },
                         crate::geom::Point {
                             x: start_x + 30.0,
                             y: 34.0,
@@ -901,9 +897,6 @@ mod tests {
             neck > tail + 2,
             "body should taper: tail {tail} neck {neck}"
         );
-        assert!(
-            head > neck,
-            "head {head} should be wider than neck {neck}"
-        );
+        assert!(head > neck, "head {head} should be wider than neck {neck}");
     }
 }

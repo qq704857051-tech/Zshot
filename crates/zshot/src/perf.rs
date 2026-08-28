@@ -93,6 +93,23 @@ pub fn log_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(base).join("Zshot").join("logs"))
 }
 
+/// Append one line to `logs/app.log`. Release builds have no console, so this
+/// is where operational failures (capture, export, clipboard) end up. Never
+/// fails loudly: a logging error must not break a screenshot.
+pub fn log_app(msg: &str) {
+    let Ok(dir) = log_dir() else {
+        return;
+    };
+    if create_dir_all(&dir).is_err() {
+        return;
+    }
+    let Ok(mut f) = OpenOptions::new().create(true).append(true).open(dir.join("app.log"))
+    else {
+        return;
+    };
+    let _ = writeln!(f, "{} {msg}", now_stamp());
+}
+
 fn missing_localappdata() -> crate::error::Error {
     crate::error::Error::new("LOCALAPPDATA is not set")
 }

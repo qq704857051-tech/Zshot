@@ -621,7 +621,9 @@ unsafe extern "system" fn hidden_proc(
 ) -> LRESULT {
     if msg == WM_ZSHOT_HOTKEY {
         if let Some(action) = action_from_wparam(wparam.0) {
-            let _ = dispatch_action(action);
+            if let Err(e) = dispatch_action(action) {
+                crate::perf::log_app(&format!("action {action:?} failed: {e}"));
+            }
         }
         return LRESULT(0);
     }
@@ -702,7 +704,7 @@ fn take_shot(action: HotkeyAction) -> Result<ShotFlow> {
     let cap = match with_gpui_app(|cx| capture_from_app(cx, region, &mut perf)) {
         Some(Ok(c)) => c,
         Some(Err(e)) => {
-            eprintln!("capture failed: {e}");
+            crate::perf::log_app(&format!("capture failed: {e}"));
             return Err(e);
         }
         None => return Err(Error::new("GPUI app unavailable")),
@@ -776,10 +778,10 @@ pub(crate) fn export_annotated_region(
                 &result.marks,
             );
             if let Err(e) = export_pixels(px, cw, ch, stride, result.write_file, result.copy) {
-                eprintln!("export failed: {e}");
+                crate::perf::log_app(&format!("export failed: {e}"));
             }
         }
-        Err(e) => eprintln!("crop failed: {e}"),
+        Err(e) => crate::perf::log_app(&format!("crop failed: {e}")),
     }
 }
 
@@ -804,14 +806,18 @@ fn export_pixels(
                 );
             }
             if let Err(e) = write_png_file(&path, &px_file, cw, ch, stride) {
-                eprintln!("png write failed: {e}");
+                crate::perf::log_app(&format!("png write failed: {e}"));
             }
         });
     }
     if copy {
         // Not swallowed: copy-only exports have no PNG to prove they ran, so a
         // silent failure here reads as "the hotkey is dead".
-        set_clipboard_dib(&px, cw, ch, stride)?;
+        set_clipboard_dib(&px, cw, ch, stride).map_err(|e| {
+            crate::perf::log_app(&format!("clipboard write failed: {e}"));
+            e
+        })?;
+        crate::perf::log_app(&format!("clipboard: {cw}x{ch} copied"));
     }
     Ok(())
 }
