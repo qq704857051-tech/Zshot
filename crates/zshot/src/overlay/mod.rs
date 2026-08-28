@@ -162,6 +162,12 @@ const TRANSLATE_TITLE: &str = "翻译";
 const COPIED_TITLE: &str = "已复制";
 const PANEL_W: f32 = 320.;
 const PANEL_MAX_H: f32 = 260.;
+/// Title row, gaps and padding; the copy button row adds `PANEL_COPY_H`.
+const PANEL_CHROME: f32 = 48.;
+const PANEL_COPY_H: f32 = 32.;
+/// The body scrolls, so even a cramped monitor keeps this much text visible.
+const PANEL_MIN_BODY_H: f32 = 48.;
+const PANEL_MARGIN: f32 = 4.;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -1208,22 +1214,39 @@ impl OverlayView {
     fn panel_element(&self, scale: f32, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let panel = self.panel.as_ref()?;
         let bar = self.toolbar_geom(scale)?;
-        let bar_x = bar.x as f32 / scale;
-        let bar_y = bar.y as f32 / scale;
-        let bar_h = bar.height as f32 / scale;
-        // ponytail: the panel follows the toolbar, which already flipped to stay
-        // on the monitor. A tall panel can still run off the bottom — clamp it
-        // against the monitor rect if that shows up in use.
-        let top = bar_y + bar_h + toolbar::ANCHOR_GAP as f32;
         let copyable = !panel.busy && !panel.body.is_empty();
+        // toolbar_geom and active_monitor_rect are in physical pixels; the
+        // element tree is logical, so convert before placing.
+        let s = scale.max(0.01) as f64;
+        let bar = Rect::new(bar.x / s, bar.y / s, bar.width / s, bar.height / s);
+        let mon = self.active_monitor_rect();
+        let mon = Rect::new(mon.x / s, mon.y / s, mon.width / s, mon.height / s);
+        let chrome = (PANEL_CHROME + if copyable { PANEL_COPY_H } else { 0. }) as f64;
+        let place = toolbar::place_panel(
+            bar,
+            PANEL_W as f64,
+            chrome,
+            (PANEL_MIN_BODY_H as f64, PANEL_MAX_H as f64),
+            mon,
+            toolbar::ANCHOR_GAP,
+            PANEL_MARGIN as f64,
+        );
+        let el = div()
+            .id("overlay-panel")
+            .absolute()
+            .left(px(place.x as f32))
+            .w(px(PANEL_W));
+        // Bottom-anchored when flipped above the toolbar: the content height is
+        // unknown before layout, so a top edge cannot be precomputed, while the
+        // bottom edge hugs the toolbar regardless of how tall the body is.
+        let el = if place.anchor_below {
+            el.top(px((bar.y + bar.height + toolbar::ANCHOR_GAP) as f32))
+        } else {
+            let parent_h = self.freeze_size.1 as f64 / s;
+            el.bottom(px((parent_h - bar.y + toolbar::ANCHOR_GAP) as f32))
+        };
         Some(
-            div()
-                .id("overlay-panel")
-                .absolute()
-                .left(px(bar_x))
-                .top(px(top))
-                .w(px(PANEL_W))
-                .flex()
+            el.flex()
                 .flex_col()
                 .gap(px(6.))
                 .p(px(10.))
@@ -1250,7 +1273,7 @@ impl OverlayView {
                 .child(
                     div()
                         .id("overlay-panel-body")
-                        .max_h(px(PANEL_MAX_H))
+                        .max_h(px(place.body_max_h as f32))
                         .overflow_y_scroll()
                         .text_size(px(13.))
                         .text_color(theme::primary_fg())

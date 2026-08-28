@@ -136,6 +136,45 @@ pub fn place_toolbar(
     Point { x, y }
 }
 
+/// Where the OCR/translate panel goes relative to the toolbar.
+pub struct PanelPlacement {
+    pub x: f64,
+    /// False means the caller must bottom-anchor at `bar.y - gap`: the content
+    /// height is unknown before layout, so the top edge cannot be precomputed.
+    pub anchor_below: bool,
+    pub body_max_h: f64,
+}
+
+/// The toolbar is clamped to the monitor by its own (narrower) width; the wider
+/// panel needs its own clamp. Vertically it prefers below the toolbar and flips
+/// above when that side has more room. The body scrolls, so shrinking max_h to
+/// fit the monitor loses no text.
+pub fn place_panel(
+    bar: Rect,
+    panel_w: f64,
+    chrome: f64,
+    body_limit: (f64, f64),
+    monitor: Rect,
+    gap: f64,
+    margin: f64,
+) -> PanelPlacement {
+    let mon_l = monitor.x + margin;
+    let mon_t = monitor.y + margin;
+    let mon_r = monitor.x + monitor.width - margin;
+    let mon_b = monitor.y + monitor.height - margin;
+    let x = bar.x.clamp(mon_l, (mon_r - panel_w).max(mon_l));
+    let below = mon_b - (bar.y + bar.height + gap);
+    let above = bar.y - gap - mon_t;
+    let anchor_below = below >= above;
+    let avail = if anchor_below { below } else { above };
+    let body_max_h = (avail - chrome).clamp(body_limit.0, body_limit.1);
+    PanelPlacement {
+        x,
+        anchor_below,
+        body_max_h,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +245,75 @@ mod tests {
         assert!(pos.x + 400.0 <= 500.0);
         assert!(pos.y >= 0.0);
         assert!(pos.y + 40.0 <= 80.0);
+    }
+
+    #[test]
+    fn panel_prefers_below_toolbar() {
+        let p = place_panel(
+            Rect::new(100.0, 208.0, 462.0, 44.0),
+            320.0,
+            80.0,
+            (48.0, 260.0),
+            Rect::new(0.0, 0.0, 1920.0, 1080.0),
+            8.0,
+            4.0,
+        );
+        assert!(p.anchor_below);
+        assert_eq!(p.x, 100.0);
+        assert_eq!(p.body_max_h, 260.0);
+    }
+
+    #[test]
+    fn panel_flips_above_when_toolbar_sits_at_monitor_bottom() {
+        // Selection spans nearly the full monitor: the toolbar clamps to the
+        // bottom edge, and the panel would start off-screen without the flip.
+        let p = place_panel(
+            Rect::new(100.0, 1036.0, 462.0, 44.0),
+            320.0,
+            80.0,
+            (48.0, 260.0),
+            Rect::new(0.0, 0.0, 1920.0, 1080.0),
+            8.0,
+            4.0,
+        );
+        assert!(!p.anchor_below);
+        assert_eq!(p.body_max_h, 260.0);
+    }
+
+    #[test]
+    fn panel_shrinks_body_to_fit() {
+        // Short monitor: above the bar is 182 - 8 - 4 = 170 px, below is
+        // 396 - 234 = 162 px. Above wins and the body gets 170 - 80 = 90 px.
+        let p = place_panel(
+            Rect::new(100.0, 182.0, 462.0, 44.0),
+            320.0,
+            80.0,
+            (48.0, 260.0),
+            Rect::new(0.0, 0.0, 1920.0, 400.0),
+            8.0,
+            4.0,
+        );
+        assert!(!p.anchor_below);
+        assert_eq!(p.body_max_h, 90.0);
+    }
+
+    #[test]
+    fn panel_clamps_into_monitor() {
+        // A heavily hidden toolbar can be far narrower than the 320 px panel
+        // (2 visible buttons = 82 px). Clamped to the monitor's right edge, its
+        // x would push the panel off-screen; the panel slides left on its own.
+        let p = place_panel(
+            Rect::new(1218.0, 208.0, 82.0, 44.0),
+            320.0,
+            80.0,
+            (48.0, 260.0),
+            Rect::new(800.0, 0.0, 500.0, 1080.0),
+            8.0,
+            4.0,
+        );
+        assert_eq!(p.x, 976.0);
+        assert!(p.x >= 804.0);
+        assert!(p.x + 320.0 <= 1296.0);
     }
 
     #[test]
