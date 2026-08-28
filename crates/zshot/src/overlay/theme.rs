@@ -7,11 +7,11 @@ pub fn base() -> Hsla {
 }
 
 pub fn surface() -> Hsla {
-    Hsla::from(rgb(0xF4F5F7)).opacity(0.90)
+    Hsla::from(rgb(0xFFFFFF)).opacity(0.94)
 }
 
 pub fn elevated_surface() -> Hsla {
-    Hsla::from(rgb(0xE8EAED))
+    Hsla::from(rgb(0xF3F4F6))
 }
 
 pub fn primary_fg() -> Hsla {
@@ -43,7 +43,7 @@ pub fn active_background() -> Hsla {
 }
 
 pub fn border() -> Hsla {
-    hsla(0.0, 0.0, 0.0, 0.08)
+    hsla(0.0, 0.0, 0.0, 0.06)
 }
 
 pub fn danger() -> Hsla {
@@ -77,9 +77,9 @@ mod tests {
 
     #[test]
     fn surface_and_washes_keep_specified_alpha() {
-        assert!((surface().a - 0.90).abs() < 0.001);
+        assert!((surface().a - 0.94).abs() < 0.001);
         assert!((active_background().a - 0.16).abs() < 0.001);
-        assert!((border().a - 0.08).abs() < 0.001);
+        assert!((border().a - 0.06).abs() < 0.001);
         assert_eq!(border().h, 0.0);
         assert_eq!(border().s, 0.0);
         assert!(border().l < 0.01);
@@ -88,7 +88,7 @@ mod tests {
     #[test]
     fn opaque_tokens_match_hex() {
         assert_eq!(rgb_of(base()), (0x19, 0x1A, 0x1D));
-        assert_eq!(rgb_of(elevated_surface()), (0xE8, 0xEA, 0xED));
+        assert_eq!(rgb_of(elevated_surface()), (0xF3, 0xF4, 0xF6));
         assert_eq!(rgb_of(primary_fg()), (0x1C, 0x1D, 0x21));
         assert_eq!(rgb_of(secondary_fg()), (0x6B, 0x6F, 0x78));
         assert_eq!(rgb_of(disabled_fg()), (0x9A, 0xA0, 0xA8));
@@ -97,6 +97,6 @@ mod tests {
         assert_eq!(rgb_of(accent_pressed()), (0x42, 0x78, 0xE8));
         assert_eq!(rgb_of(danger()), (0xFF, 0x5A, 0x52));
         assert_eq!(rgb_of(success()), (0x35, 0xC9, 0x6F));
-        assert_eq!(rgb_of(Hsla::from(rgb(0xF4F5F7))), (0xF4, 0xF5, 0xF7));
+        assert_eq!(rgb_of(Hsla::from(rgb(0xFFFFFF))), (0xFF, 0xFF, 0xFF));
     }
 }

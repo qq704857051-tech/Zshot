@@ -1193,7 +1193,7 @@ impl OverlayView {
                 .border_1()
                 .border_color(theme::border())
                 .shadow(vec![BoxShadow {
-                    color: theme::base().opacity(0.18),
+                    color: theme::base().opacity(0.12),
                     offset: point(px(0.), px(4.)),
                     blur_radius: px(16.),
                     spread_radius: px(0.),
@@ -1255,7 +1255,7 @@ impl OverlayView {
                 .border_1()
                 .border_color(theme::border())
                 .shadow(vec![BoxShadow {
-                    color: theme::base().opacity(0.18),
+                    color: theme::base().opacity(0.12),
                     offset: point(px(0.), px(4.)),
                     blur_radius: px(16.),
                     spread_radius: px(0.),
