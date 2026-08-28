@@ -14,7 +14,8 @@ use std::cell::{Cell, RefCell};
 use std::time::Duration;
 
 use gpui::{
-    div, prelude::*, px, size, App, Bounds, Context, Entity, Focusable, FontWeight, MouseButton,
+    deferred, div, prelude::*, px, size, App, Bounds, Context, Entity, Focusable, FontWeight,
+    MouseButton,
     SharedString, Subscription, Timer, TitlebarOptions, Window, WindowBounds, WindowHandle,
     WindowOptions,
 };
@@ -37,17 +38,7 @@ const RECORDING_TIMEOUT: Duration = Duration::from_secs(10);
 /// Short values sit beside their label rather than stretching the card.
 const INLINE_FIELD_W: f32 = 220.;
 
-const LANGUAGES: [(&str, &str); 9] = [
-    ("zh-CN", "简体中文"),
-    ("zh-TW", "繁體中文"),
-    ("en", "English"),
-    ("ja", "日本語"),
-    ("ko", "한국어"),
-    ("fr", "Français"),
-    ("de", "Deutsch"),
-    ("es", "Español"),
-    ("ru", "Русский"),
-];
+const LANGUAGES: [(&str, &str); 3] = [("zh-CN", "简体中文"), ("en", "English"), ("ja", "日本語")];
 
 const HOTKEY_ROWS: [(HotkeyAction, &str, &str, &str, &str); 3] = [
     (
@@ -570,8 +561,7 @@ impl SettingsView {
         // Short value: it sits beside its label, with the list dropping under it.
         let current = self.settings.translation.target_language.clone();
         let language = div()
-            .flex()
-            .flex_col()
+            .relative()
             .child(
                 widgets::card("目标语言", None).child(
                     widgets::select(
@@ -590,11 +580,17 @@ impl SettingsView {
                 ),
             )
             .when(self.language_open, |el| {
-                el.child(
-                    div().flex().flex_row().justify_end().child(
-                        div()
-                            .w(px(INLINE_FIELD_W))
-                            .child(widgets::select_list().children(LANGUAGES.map(
+                // Deferred + absolute: the list overlays the cards below
+                // instead of pushing them down. Layout stays anchored under
+                // the card (min_h 68 + 4px gap); only painting is deferred
+                // past the later siblings.
+                el.child(deferred(
+                    div()
+                        .absolute()
+                        .top(px(72.))
+                        .right(px(0.))
+                        .w(px(INLINE_FIELD_W))
+                        .child(widgets::select_list().children(LANGUAGES.map(
                                 |(code, name)| {
                                     widgets::select_option(
                                         code,
@@ -608,7 +604,7 @@ impl SettingsView {
                                         }),
                                     )
                                 },
-                            ))),
+                            )))
                     ),
                 )
             });
