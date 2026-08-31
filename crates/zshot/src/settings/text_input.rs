@@ -585,7 +585,7 @@ impl Element for TextElement {
                     theme::primary_fg(),
                 )),
             )
-        } else {
+        } else if input.focus_handle.is_focused(window) {
             (
                 Some(fill(
                     Bounds::from_corners(
@@ -602,6 +602,11 @@ impl Element for TextElement {
                 )),
                 None,
             )
+        } else {
+            // Unfocused with a leftover selection: paint nothing. The range is
+            // kept in state, so refocusing (or keyboard input, which resets it)
+            // brings the highlight back instead of leaking it into the frame.
+            (None, None)
         };
         PrepaintState {
             line: Some(line),
