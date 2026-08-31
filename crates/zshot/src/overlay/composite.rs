@@ -835,10 +835,12 @@ mod tests {
         };
         apply_annotations(&mut px, 64, 64, stride, 0.0, 0.0, &[el]);
         let partial = px
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[0] > 0 && p[0] < 255)
             .count();
-        let solid_px = px.chunks_exact(4).filter(|p| p[0] == 255).count();
+        let solid_px = px.as_chunks::<4>().0.iter().filter(|p| p[0] == 255).count();
         assert!(solid_px > 50, "stroke barely drawn: {solid_px}");
         assert!(partial > 40, "expected soft edge pixels, got {partial}");
     }
@@ -860,7 +862,9 @@ mod tests {
         };
         apply_annotations(&mut px, 64, 32, stride, 0.0, 0.0, &[el]);
         let partial = px
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[0] > 0 && p[0] < 255)
             .count();
         assert!(partial > 20, "expected soft edge pixels, got {partial}");

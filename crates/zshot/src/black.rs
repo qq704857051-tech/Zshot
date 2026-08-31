@@ -114,7 +114,7 @@ mod tests {
         let w = 32u32;
         let h = 32u32;
         let mut buf = vec![0u8; (w * h * 4) as usize];
-        for px in buf.chunks_exact_mut(4) {
+        for px in buf.as_chunks_mut::<4>().0 {
             px[0] = 40;
             px[1] = 80;
             px[2] = 120;
