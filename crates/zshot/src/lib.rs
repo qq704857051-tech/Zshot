@@ -17,6 +17,7 @@ pub mod pin;
 pub mod platform;
 pub mod settings;
 pub mod translate;
+pub mod update;
 
 pub use app::{once_capture, run};
 pub use error::{Error, Result};

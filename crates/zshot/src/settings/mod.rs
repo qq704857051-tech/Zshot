@@ -197,6 +197,10 @@ pub struct SettingsView {
     model: Entity<TextInput>,
     timeout: Entity<TextInput>,
     prompt: Entity<TextInput>,
+    /// In-flight update check guards against double clicks.
+    update_checking: bool,
+    /// (version, url) of a newer release, when the last check found one.
+    update_available: Option<(String, String)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -282,6 +286,8 @@ impl SettingsView {
             model,
             timeout,
             prompt,
+            update_checking: false,
+            update_available: None,
             _subscriptions: subscriptions,
         }
     }
@@ -542,6 +548,50 @@ impl SettingsView {
             Err(e) => self.fail(format!("清理失败：{e}")),
         }
         cx.notify();
+    }
+
+    fn check_update(&mut self, cx: &mut Context<Self>) {
+        if self.update_checking {
+            return;
+        }
+        self.update_checking = true;
+        self.ok("正在检查更新…");
+        let task = cx.background_spawn(async move { crate::update::check_latest() });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |view, cx| {
+                view.update_checking = false;
+                match result {
+                    Ok(release)
+                        if crate::update::is_newer(
+                            &release.version,
+                            crate::update::current_version(),
+                        ) =>
+                    {
+                        view.ok(format!("发现新版本 v{}", release.version));
+                        view.update_available = Some((release.version, release.url));
+                    }
+                    Ok(_) => {
+                        view.update_available = None;
+                        view.ok("当前已是最新版本");
+                    }
+                    Err(e) => view.fail(format!("检查更新失败：{e}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn open_update_page(&mut self, cx: &mut Context<Self>) {
+        let Some((_, url)) = &self.update_available else {
+            return;
+        };
+        if let Err(e) = crate::update::open_release_page(url) {
+            self.fail(e.to_string());
+            cx.notify();
+        }
     }
 
     fn nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -901,6 +951,7 @@ impl SettingsView {
             .child(widgets::hint(
                 "点击右侧方框后按下组合键。录制期间截图不会触发；再点一次或等待 10 秒即取消。",
             ))
+            .child(widgets::hint("托盘图标左键可直接触发区域截图，右键菜单会显示当前快捷键。"))
     }
 
     fn page_general(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -909,6 +960,28 @@ impl SettingsView {
                 Ok(p) => p.display().to_string().into(),
                 Err(_) => "LOCALAPPDATA 未设置".into(),
             }
+        };
+
+        // One button, two jobs: check first, then become the download link
+        // once a newer release is known.
+        let update_button = if let Some((version, _)) = &self.update_available {
+            widgets::button("update-open", format!("前往下载 v{version}")).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.open_update_page(cx)),
+            )
+        } else {
+            widgets::button(
+                "update-check",
+                if self.update_checking {
+                    "检查中…"
+                } else {
+                    "检查更新"
+                },
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.check_update(cx)),
+            )
         };
         div()
             .flex()
@@ -982,6 +1055,28 @@ impl SettingsView {
                             ),
                         ),
                     ),
+            )
+            .child(widgets::group_header("关于"))
+            .child(
+                widgets::card("Zshot", Some("轻量截图与文字识别工具。".into())).child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(12.))
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .text_color(theme::secondary_fg())
+                                .child(format!(
+                                    "v{}{}",
+                                    crate::update::current_version(),
+                                    if cfg!(debug_assertions) { " (debug)" } else { "" }
+                                )),
+                        )
+                        .child(update_button),
+                ),
             )
     }
 }

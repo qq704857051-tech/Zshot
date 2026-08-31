@@ -12,6 +12,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::error::Result;
+use crate::hotkey;
 use crate::platform::WM_TRAYICON;
 
 const ID_REGION: u32 = 1;
@@ -76,7 +77,7 @@ pub fn add_tray_icon(hwnd: HWND) -> Result<()> {
             hIcon: icon,
             ..Default::default()
         };
-        let tip: Vec<u16> = "Zshot\0".encode_utf16().collect();
+        let tip: Vec<u16> = "Zshot — 左键截图\0".encode_utf16().collect();
         nid.szTip[..tip.len()].copy_from_slice(&tip);
 
         let mut last_err = None;
@@ -123,26 +124,30 @@ pub fn handle_tray(hwnd: HWND, lparam: LPARAM) -> Option<TrayCommand> {
 fn show_menu(hwnd: HWND) -> Option<TrayCommand> {
     unsafe {
         let menu = CreatePopupMenu().ok()?;
+        let hotkeys = crate::config::get().hotkeys;
+        let region = menu_label("区域截图", &hotkeys.region);
+        let full = menu_label("全屏截图", &hotkeys.fullscreen);
+        let copy = menu_label("仅复制", &hotkeys.copy_only);
         let _ = InsertMenuW(
             menu,
             0,
             MF_BYPOSITION | MF_STRING,
             ID_REGION as usize,
-            PCWSTR(w("区域截图\0").as_ptr()),
+            PCWSTR(region.as_ptr()),
         );
         let _ = InsertMenuW(
             menu,
             1,
             MF_BYPOSITION | MF_STRING,
             ID_FULL as usize,
-            PCWSTR(w("全屏截图\0").as_ptr()),
+            PCWSTR(full.as_ptr()),
         );
         let _ = InsertMenuW(
             menu,
             2,
             MF_BYPOSITION | MF_STRING,
             ID_COPY as usize,
-            PCWSTR(w("仅复制\0").as_ptr()),
+            PCWSTR(copy.as_ptr()),
         );
         let _ = InsertMenuW(menu, 3, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
         let _ = InsertMenuW(
@@ -181,6 +186,14 @@ fn show_menu(hwnd: HWND) -> Option<TrayCommand> {
             _ => None,
         }
     }
+}
+
+/// Menu labels double as a hotkey cheat sheet: the shell right-aligns text
+/// after `\t`, the classic accelerator column. The bindings are re-read on
+/// every popup so a rebind shows up without a restart.
+fn menu_label(title: &str, stored: &str) -> Vec<u16> {
+    let hint = hotkey::parse(stored).map(hotkey::format).unwrap_or_default();
+    format!("{title}\t{hint}\0").encode_utf16().collect()
 }
 
 fn w(s: &str) -> Vec<u16> {
