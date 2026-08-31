@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,15 +12,14 @@ fn gpui_app() -> Application {
 }
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::ProcessStatus::{
     GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
 };
+use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::GetCurrentProcess;
-use windows::Win32::UI::Shell::{FOLDERID_Pictures, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, PostMessageW, PostQuitMessage, RegisterClassExW, ShowWindow,
     CS_HREDRAW, CS_VREDRAW, SW_HIDE, WM_DESTROY, WM_HOTKEY, WNDCLASSEXW, WS_OVERLAPPED,
@@ -811,25 +810,55 @@ fn export_pixels(
 }
 
 fn default_png_path() -> Result<PathBuf> {
-    let pictures = unsafe {
-        let pw = SHGetKnownFolderPath(&FOLDERID_Pictures, KF_FLAG_DEFAULT, None)?;
-        let s = pw.to_string().unwrap_or_else(|_| "Pictures".into());
-        CoTaskMemFree(Some(pw.0 as *const _));
-        s
-    };
-    let dir = PathBuf::from(pictures).join("Zshot");
+    let dir = crate::config::screenshot_dir()?;
     std::fs::create_dir_all(&dir)?;
-    let d = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    // Seconds alone collide when two shots land in the same second.
-    Ok(dir.join(format!(
-        "zshot-{}-{:03}.png",
-        d.as_secs(),
-        d.subsec_millis()
-    )))
+    // Local time, not UTC: the name is for the user reading their own folder.
+    let t = unsafe { GetLocalTime() };
+    let stem = format!(
+        "Zshot_{:04}{:02}{:02}_{:02}{:02}{:02}",
+        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
+    );
+    Ok(unique_path(&dir, &stem))
+}
+
+/// Two shots inside the same second share a stem; a screenshot silently
+/// overwriting the previous one is the worst way to lose one.
+fn unique_path(dir: &Path, stem: &str) -> PathBuf {
+    let first = dir.join(format!("{stem}.png"));
+    if !first.exists() {
+        return first;
+    }
+    (2..)
+        .map(|n| dir.join(format!("{stem}_{n}.png")))
+        .find(|p| !p.exists())
+        .unwrap_or(first)
 }
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unique_path_suffixes_only_on_collision() {
+        let dir = std::env::temp_dir().join("zshot-unique-path-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let first = unique_path(&dir, "Zshot_20260828_143052");
+        assert_eq!(first.file_name().unwrap(), "Zshot_20260828_143052.png");
+
+        std::fs::write(&first, b"").expect("write");
+        let second = unique_path(&dir, "Zshot_20260828_143052");
+        assert_eq!(second.file_name().unwrap(), "Zshot_20260828_143052_2.png");
+
+        std::fs::write(&second, b"").expect("write");
+        let third = unique_path(&dir, "Zshot_20260828_143052");
+        assert_eq!(third.file_name().unwrap(), "Zshot_20260828_143052_3.png");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

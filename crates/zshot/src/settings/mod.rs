@@ -519,6 +519,22 @@ impl SettingsView {
         cx.notify();
     }
 
+    fn choose_save_dir(&mut self, cx: &mut Context<Self>) {
+        let current = crate::config::screenshot_dir().unwrap_or_default();
+        match system::pick_folder(&current) {
+            // Cancel is not a failure, so it leaves the status line alone.
+            Ok(None) => {}
+            Ok(Some(dir)) => {
+                self.settings.screenshot.save_dir = Some(dir);
+                self.persist(cx);
+            }
+            Err(e) => {
+                self.fail(format!("{e}"));
+                cx.notify();
+            }
+        }
+    }
+
     fn open_folder(
         &mut self,
         dir: crate::error::Result<std::path::PathBuf>,
@@ -694,9 +710,38 @@ impl SettingsView {
             mosaic_rows,
         );
 
+        let save_dir: SharedString = match crate::config::screenshot_dir() {
+            Ok(p) => p.display().to_string().into(),
+            Err(e) => format!("{e}").into(),
+        };
+        let location = widgets::vcard("保存位置", Some("工具栏的保存按钮把 PNG 写到这里。".into()))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(12.))
+                    .child(widgets::path_line(save_dir).flex_1().min_w(px(0.)))
+                    .child(widgets::button("save-dir-pick", "更改").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.choose_save_dir(cx)),
+                    ))
+                    .child(
+                        widgets::icon_button("save-dir-open", "settings/folder.svg").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.open_folder(crate::config::screenshot_dir(), cx);
+                            }),
+                        ),
+                    ),
+            );
+
         div()
             .flex()
             .flex_col()
+            .child(widgets::group_header("保存").mt(px(0.)))
+            .child(location)
+            .child(widgets::group_header("工具栏"))
             .child(
                 widgets::vcard(
                     "工具栏按钮",

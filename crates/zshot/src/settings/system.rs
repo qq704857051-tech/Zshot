@@ -4,10 +4,15 @@ use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
 use windows::core::PCWSTR;
+use windows::Win32::Foundation::ERROR_CANCELLED;
+use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::Registry::{
     RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ,
 };
-use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::Shell::{
+    FileOpenDialog, IFileOpenDialog, IShellItem, SHCreateItemFromParsingName, ShellExecuteW,
+    FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
+};
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 use crate::error::{Error, Result};
@@ -115,4 +120,35 @@ pub fn clear_logs() -> Result<usize> {
         }
     }
     Ok(removed)
+}
+
+/// Folder picker for the save-location card. `Ok(None)` is the user pressing
+/// cancel, which must not read as a failure — every other error does.
+pub fn pick_folder(current: &Path) -> Result<Option<PathBuf>> {
+    unsafe {
+        let dialog: IFileOpenDialog =
+            CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+        dialog.SetOptions(dialog.GetOptions()? | FOS_PICKFOLDERS)?;
+        // Open where the user already saves. A path that no longer exists just
+        // leaves the dialog at the shell default.
+        let start = wide(&current.display().to_string());
+        if let Ok(item) =
+            SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(start.as_ptr()), None)
+        {
+            let _ = dialog.SetFolder(&item);
+        }
+        if let Err(e) = dialog.Show(None) {
+            if e.code() == ERROR_CANCELLED.to_hresult() {
+                return Ok(None);
+            }
+            return Err(e.into());
+        }
+        let pw = dialog.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?;
+        // Freed before the `?`: an early return here would leak the COM string.
+        let text = pw.to_string();
+        CoTaskMemFree(Some(pw.0 as *const _));
+        Ok(Some(PathBuf::from(
+            text.map_err(|e| Error::new(e.to_string()))?,
+        )))
+    }
 }

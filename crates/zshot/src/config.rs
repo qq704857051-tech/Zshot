@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
+use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::UI::Shell::{FOLDERID_Pictures, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
 
 use crate::error::{Error, Result};
 
@@ -83,6 +85,8 @@ pub struct Screenshot {
     /// which is what the build did before this field existed — the C# default
     /// of hiding four tools would silently remove two working ones here.
     pub hidden_toolbar_items: Vec<String>,
+    /// Where 保存 writes. `None` means `Pictures\Zshot`; see `screenshot_dir`.
+    pub save_dir: Option<PathBuf>,
     pub annotation: Annotation,
 }
 
@@ -135,6 +139,27 @@ pub fn parse_hex_color(text: &str) -> Option<u32> {
         8 => Some(v),
         _ => None,
     }
+}
+
+/// Where saved PNGs land. A configured directory wins; otherwise
+/// `Pictures\Zshot`, the folder the build has always used. Not created here —
+/// the caller writes into it and `create_dir_all` right before.
+pub fn screenshot_dir() -> Result<PathBuf> {
+    if let Some(dir) = get().screenshot.save_dir {
+        return Ok(dir);
+    }
+    default_screenshot_dir()
+}
+
+pub fn default_screenshot_dir() -> Result<PathBuf> {
+    let pictures = unsafe {
+        let pw = SHGetKnownFolderPath(&FOLDERID_Pictures, KF_FLAG_DEFAULT, None)?;
+        // Freed before the `?`: an early return here would leak the COM string.
+        let text = pw.to_string();
+        CoTaskMemFree(Some(pw.0 as *const _));
+        text.map_err(|e| Error::new(e.to_string()))?
+    };
+    Ok(PathBuf::from(pictures).join("Zshot"))
 }
 
 pub fn path() -> Result<PathBuf> {
