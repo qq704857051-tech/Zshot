@@ -108,8 +108,8 @@ fn build() -> Result<OAROCR> {
     .map_err(|e| Error::new(format!("OCR init failed: {e}")))
 }
 
-/// `settings.json` wins, then `ZSHOT_MODELS` (dev runs out of `target/`), then
-/// the install layout the C# build already uses.
+/// `settings.json` wins, then `ZSHOT_MODELS`, then the install layout the C#
+/// build already uses, then the in-repo copy a `cargo run` build sits beside.
 fn models_dir() -> Result<PathBuf> {
     if let Some(dir) = crate::config::get().ocr.models_dir {
         return Ok(dir);
@@ -121,8 +121,19 @@ fn models_dir() -> Result<PathBuf> {
     let base = exe
         .parent()
         .ok_or_else(|| Error::new("executable has no parent directory"))?;
-    Ok(base.join("models").join("v6"))
+    let shipped = base.join("models").join("v6");
+    if shipped.is_dir() {
+        return Ok(shipped);
+    }
+    // ponytail: a `cargo run` build sits in `target\`, where the packaged
+    // `models\v6` is not. The repo copy is the same three files, so fall back
+    // to it rather than making every developer set ZSHOT_MODELS.
+    Ok(PathBuf::from(REPO_MODELS))
 }
+
+/// The in-repo copy, resolved at compile time. Absent on a user machine, which
+/// is why the directory next to the exe is checked first.
+const REPO_MODELS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/v6");
 
 fn schedule_idle_drop() {
     // ponytail: one detached timer per recognition. Nobody clicks OCR fast
