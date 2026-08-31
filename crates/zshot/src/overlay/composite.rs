@@ -804,7 +804,7 @@ mod tests {
             },
         };
         let (mut px, stride) = solid(64, 64, [0, 0, 0, 255]);
-        apply_annotations(&mut px, 64, 64, stride, 0.0, 0.0, &[el.clone()]);
+        apply_annotations(&mut px, 64, 64, stride, 0.0, 0.0, std::slice::from_ref(&el));
         let mask = element_mask(&el).expect("pen mask");
         for row in 0..mask.height {
             for col in 0..mask.width {

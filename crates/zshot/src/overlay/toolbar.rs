@@ -222,6 +222,9 @@ pub struct PanelPlacement {
 /// moves beside the selection; only when neither works (selection fills the
 /// monitor) does it take the roomier side and overlap. The body scrolls, so
 /// shrinking max_h to fit loses no text.
+/// Eight loose parameters mirror the geometry this places against; bundling
+/// them into a struct would only rename the same fields at every call site.
+#[allow(clippy::too_many_arguments)]
 pub fn place_panel(
     bar: Rect,
     selection: Rect,

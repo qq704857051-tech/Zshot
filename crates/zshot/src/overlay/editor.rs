@@ -496,15 +496,19 @@ impl FilledArrow {
         ]
     }
 
+    // Exercised by the geometry tests below; nothing in the UI asks yet.
+    #[allow(dead_code)]
     pub fn neck_width(self) -> f64 {
         dist(self.neck_left, self.neck_right)
     }
 
+    #[allow(dead_code)]
     pub fn head_width(self) -> f64 {
         dist(self.left, self.right)
     }
 }
 
+#[allow(dead_code)]
 fn dist(a: Point, b: Point) -> f64 {
     let dx = a.x - b.x;
     let dy = a.y - b.y;

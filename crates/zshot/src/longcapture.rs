@@ -11,11 +11,8 @@
 /// the stitched output stays in BGRA.
 pub fn bgra_to_gray(bgra: &[u8], width: usize, height: usize) -> Vec<u8> {
     let mut gray = vec![0u8; width * height];
-    let n = gray.len().min(bgra.len() / 4);
-    for i in 0..n {
-        let o = i * 4;
-        gray[i] =
-            ((bgra[o] as u32 * 29 + bgra[o + 1] as u32 * 150 + bgra[o + 2] as u32 * 77) >> 8) as u8;
+    for (g, px) in gray.iter_mut().zip(bgra.chunks_exact(4)) {
+        *g = ((px[0] as u32 * 29 + px[1] as u32 * 150 + px[2] as u32 * 77) >> 8) as u8;
     }
     gray
 }

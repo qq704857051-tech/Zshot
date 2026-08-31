@@ -34,6 +34,8 @@ pub fn accent_hover() -> Hsla {
     Hsla::from(rgb(0x6A9CFF))
 }
 
+// Reserved for pressed-state fills; the color test below pins the value.
+#[allow(dead_code)]
 pub fn accent_pressed() -> Hsla {
     Hsla::from(rgb(0x4278E8))
 }
