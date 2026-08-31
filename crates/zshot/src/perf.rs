@@ -103,7 +103,10 @@ pub fn log_app(msg: &str) {
     if create_dir_all(&dir).is_err() {
         return;
     }
-    let Ok(mut f) = OpenOptions::new().create(true).append(true).open(dir.join("app.log"))
+    let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("app.log"))
     else {
         return;
     };

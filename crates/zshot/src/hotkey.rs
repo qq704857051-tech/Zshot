@@ -247,7 +247,10 @@ mod tests {
     #[test]
     fn parse_accepts_the_shipped_defaults() {
         let stored = crate::config::Hotkeys::default();
-        assert_eq!(HotkeyBindings::from_settings(&stored), HotkeyBindings::poc_defaults());
+        assert_eq!(
+            HotkeyBindings::from_settings(&stored),
+            HotkeyBindings::poc_defaults()
+        );
     }
 
     #[test]

@@ -24,8 +24,23 @@ pub const CANCEL: &str = "cancel";
 pub const COPY: &str = "copy";
 
 pub const CUSTOMIZABLE: &[&str] = &[
-    COLOR, SELECT, RECT, ELLIPSE, LINE, ARROW, PEN, TEXT, MOSAIC, NUMBER, UNDO, REDO, CLEAR, OCR,
-    TRANSLATE, LONG_CAPTURE, SAVE,
+    COLOR,
+    SELECT,
+    RECT,
+    ELLIPSE,
+    LINE,
+    ARROW,
+    PEN,
+    TEXT,
+    MOSAIC,
+    NUMBER,
+    UNDO,
+    REDO,
+    CLEAR,
+    OCR,
+    TRANSLATE,
+    LONG_CAPTURE,
+    SAVE,
 ];
 
 #[allow(dead_code)]

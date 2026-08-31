@@ -26,7 +26,17 @@ use crate::overlay::theme;
 actions!(
     zshot_input,
     [
-        Backspace, Delete, Left, Right, SelectLeft, SelectRight, SelectAll, Home, End, Paste, Cut,
+        Backspace,
+        Delete,
+        Left,
+        Right,
+        SelectLeft,
+        SelectRight,
+        SelectAll,
+        Home,
+        End,
+        Paste,
+        Cut,
         Copy,
     ]
 );
@@ -357,7 +367,8 @@ impl EntityInputHandler for TextInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
         self.content =
-            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..]).into();
+            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
+                .into();
         let caret = range.start + new_text.len();
         self.selected_range = caret..caret;
         self.marked_range.take();
@@ -378,7 +389,8 @@ impl EntityInputHandler for TextInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
         self.content =
-            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..]).into();
+            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
+                .into();
         self.marked_range = if new_text.is_empty() {
             None
         } else {
@@ -408,7 +420,10 @@ impl EntityInputHandler for TextInput {
         let last_layout = self.last_layout.as_ref()?;
         Some(Bounds::from_corners(
             point(bounds.left() + last_layout.x_for_index(start), bounds.top()),
-            point(bounds.left() + last_layout.x_for_index(end), bounds.bottom()),
+            point(
+                bounds.left() + last_layout.x_for_index(end),
+                bounds.bottom(),
+            ),
         ))
     }
 
@@ -471,9 +486,7 @@ impl Render for TextInput {
             .text_size(px(13.))
             .text_color(theme::primary_fg())
             .cursor(CursorStyle::IBeam)
-            .child(TextElement {
-                input: cx.entity(),
-            })
+            .child(TextElement { input: cx.entity() })
     }
 }
 

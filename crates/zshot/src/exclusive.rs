@@ -11,7 +11,10 @@ pub struct ExclusiveHints {
 /// DXGI `AttachedToDesktop == false` means the output is not in the DWM desktop
 /// (typical exclusive fullscreen). The shell QUNS D3D-fullscreen flag is the
 /// other DXGI/D3D exclusive signal.
-pub fn dxgi_output_is_exclusive(attached_to_desktop: bool, d3d_fullscreen_notification: bool) -> bool {
+pub fn dxgi_output_is_exclusive(
+    attached_to_desktop: bool,
+    d3d_fullscreen_notification: bool,
+) -> bool {
     !attached_to_desktop || d3d_fullscreen_notification
 }
 

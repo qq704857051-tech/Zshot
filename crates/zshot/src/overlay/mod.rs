@@ -14,11 +14,11 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     actions, black, canvas, div, fill, hsla, outline, point, prelude::*, px, rgb, size, svg, white,
-    App, BorderStyle, Bounds, BoxShadow, Context, CursorStyle, Entity, FocusHandle, Focusable,
-    InteractiveElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    AnyView, ContentMask, MouseUpEvent, PathBuilder, Pixels, Point as GpuiPoint, SharedString,
-    Timer, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions,
+    AnyView, App, BorderStyle, Bounds, BoxShadow, ContentMask, Context, CursorStyle, Entity,
+    FocusHandle, Focusable, InteractiveElement, KeyBinding, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point as GpuiPoint,
+    SharedString, Timer, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
+    WindowKind, WindowOptions,
 };
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -33,17 +33,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WDA_EXCLUDEFROMCAPTURE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
-use crate::platform::WM_APP_READY_SENTINEL;
 use crate::capture::{crop_sdr_bgra, enumerate_monitors, CapturedDesktop};
 use crate::error::Result;
-use crate::overlay::composite::{element_mask, CoverageMask};
-use crate::overlay::editor::{Element, PressKind, Session, Shape, Tool};
-use crate::overlay::toolbar::PHASE1_ITEMS;
 use crate::geom::{
     hit_test, move_rect, physical_source_rect, resize_rect, Point, Rect, SelectionHitKind,
 };
 use crate::gpui_bridge::present_freeze_from_texture;
+use crate::overlay::composite::{element_mask, CoverageMask};
+use crate::overlay::editor::{Element, PressKind, Session, Shape, Tool};
+use crate::overlay::toolbar::PHASE1_ITEMS;
 use crate::perf::PerfSession;
+use crate::platform::WM_APP_READY_SENTINEL;
 
 const MAG_COUNT: u32 = 15;
 const MAG_PIXEL: f32 = 10.0;
@@ -66,7 +66,10 @@ pub fn bench_auto_hide_enabled() -> bool {
     std::env::var_os("ZSHOT_BENCH").is_some()
 }
 
-actions!(overlay, [ConfirmSelection, CancelOverlay, UndoEdit, RedoEdit]);
+actions!(
+    overlay,
+    [ConfirmSelection, CancelOverlay, UndoEdit, RedoEdit]
+);
 
 thread_local! {
     static OVERLAY_WINDOW: RefCell<Option<WindowHandle<OverlayView>>> = const { RefCell::new(None) };
@@ -256,7 +259,9 @@ fn show_overlay_inner(
                 topmost: true,
                 ..Default::default()
             },
-        |window, cx| cx.new(|cx| OverlayView::from_capture(cx, cap, perf, swap, copy_only, window)),
+            |window, cx| {
+                cx.new(|cx| OverlayView::from_capture(cx, cap, perf, swap, copy_only, window))
+            },
         )
         .map_err(|e| crate::error::Error::new(e.to_string()))?;
 
@@ -693,9 +698,7 @@ impl OverlayView {
                     false
                 }
             } else {
-                self.has_sel
-                    && self.selection.width > MIN_RECT
-                    && self.selection.height > MIN_RECT
+                self.has_sel && self.selection.width > MIN_RECT && self.selection.height > MIN_RECT
             };
             if selected {
                 if self.copy_only {
@@ -789,12 +792,7 @@ impl OverlayView {
         cx.notify();
     }
 
-    fn on_key_down(
-        &mut self,
-        event: &KeyDownEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let Some(edit) = self.text_edit.as_mut() else {
             return;
         };
@@ -1034,14 +1032,12 @@ impl OverlayView {
         let task = cx.background_spawn(async move { crate::ocr::recognize(&px, w, h, stride) });
         cx.spawn(async move |this, cx| {
             let recognized = task.await;
-            let _ = this.update(cx, |this, cx| {
-                match recognized {
-                    Ok(text) if text.trim().is_empty() => {
-                        this.show_panel(OCR_TITLE, "未识别到文字".into(), false, cx)
-                    }
-                    Ok(text) => this.show_panel(OCR_TITLE, text, false, cx),
-                    Err(e) => this.show_panel("识别失败", e.to_string(), false, cx),
+            let _ = this.update(cx, |this, cx| match recognized {
+                Ok(text) if text.trim().is_empty() => {
+                    this.show_panel(OCR_TITLE, "未识别到文字".into(), false, cx)
                 }
+                Ok(text) => this.show_panel(OCR_TITLE, text, false, cx),
+                Err(e) => this.show_panel("识别失败", e.to_string(), false, cx),
             });
         })
         .detach();
@@ -1139,12 +1135,12 @@ impl OverlayView {
             if w < 1 || h < 1 {
                 continue;
             }
-            let Ok((px, cw, ch, stride)) = (match cx
-                .with_gpu_context(|_d, ctx| crop_sdr_bgra(cap, ctx, x, y, w, h))
-            {
-                Some(r) => r,
-                None => continue,
-            }) else {
+            let Ok((px, cw, ch, stride)) =
+                (match cx.with_gpu_context(|_d, ctx| crop_sdr_bgra(cap, ctx, x, y, w, h)) {
+                    Some(r) => r,
+                    None => continue,
+                })
+            else {
                 continue;
             };
             for (gx, gy) in cells {
@@ -1238,8 +1234,8 @@ impl OverlayView {
                 })
                 .children(items.into_iter().map(|id| {
                     let active = tool_id == id;
-                    let dim = (id == toolbar::UNDO && !can_undo)
-                        || (id == toolbar::REDO && !can_redo);
+                    let dim =
+                        (id == toolbar::UNDO && !can_undo) || (id == toolbar::REDO && !can_redo);
                     toolbar_button(id, active, dim, cx)
                 })),
         )
@@ -1277,7 +1273,9 @@ impl OverlayView {
         // layout: a top edge cannot be precomputed, while the bottom edge hugs
         // the toolbar regardless of how tall the body is.
         let el = match place.y {
-            toolbar::PanelY::BelowBar => el.top(px((bar.y + bar.height + toolbar::ANCHOR_GAP) as f32)),
+            toolbar::PanelY::BelowBar => {
+                el.top(px((bar.y + bar.height + toolbar::ANCHOR_GAP) as f32))
+            }
             toolbar::PanelY::AboveBar => {
                 let parent_h = self.freeze_size.1 as f64 / s;
                 el.bottom(px((parent_h - bar.y + toolbar::ANCHOR_GAP) as f32))
@@ -1320,24 +1318,24 @@ impl OverlayView {
                 )
                 .children(copyable.then(|| {
                     div().flex().flex_row().justify_end().child(
-                    div()
-                        .id("overlay-panel-copy")
-                        .px(px(10.))
-                        .py(px(4.))
-                        .rounded_md()
-                        .text_size(px(12.))
-                        .text_color(theme::primary_fg())
-                        .bg(theme::active_background())
-                        .hover(|s| s.bg(theme::accent_hover()))
-                        .cursor(CursorStyle::PointingHand)
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.copy_panel(cx);
-                            }),
-                        )
-                        .child("复制"),
+                        div()
+                            .id("overlay-panel-copy")
+                            .px(px(10.))
+                            .py(px(4.))
+                            .rounded_md()
+                            .text_size(px(12.))
+                            .text_color(theme::primary_fg())
+                            .bg(theme::active_background())
+                            .hover(|s| s.bg(theme::accent_hover()))
+                            .cursor(CursorStyle::PointingHand)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.copy_panel(cx);
+                                }),
+                            )
+                            .child("复制"),
                     )
                 })),
         )
@@ -1589,12 +1587,7 @@ fn toolbar_item_at(p: Point, geom: Rect, items: &[&'static str]) -> Option<&'sta
     items.get(i as usize).copied()
 }
 
-fn coord_label(
-    shown: Option<Rect>,
-    mouse: Point,
-    phase: Phase,
-    scale: f32,
-) -> impl IntoElement {
+fn coord_label(shown: Option<Rect>, mouse: Point, phase: Phase, scale: f32) -> impl IntoElement {
     let (text, x, y) = if let Some(r) = shown {
         (
             format!(
@@ -2107,7 +2100,10 @@ mod tests {
         assert_eq!(at(101.0), None, "left padding is not a button");
         assert_eq!(at(141.0), None, "gap between buttons is not a button");
         assert_eq!(at(50.0), None);
-        assert_eq!(toolbar_item_at(Point { x: 210.0, y: 10.0 }, geom, &items), None);
+        assert_eq!(
+            toolbar_item_at(Point { x: 210.0, y: 10.0 }, geom, &items),
+            None
+        );
     }
 
     /// The whole point of the rewrite: the last slot must not steal Cancel's clicks.

@@ -260,7 +260,8 @@ impl Gpu {
                 .CreateShaderResourceView(src, None, Some(&mut srv))?;
             let srv = srv.ok_or_else(|| Error::new("SRV"))?;
             let mut rtv = None;
-            self.device.CreateRenderTargetView(dest, None, Some(&mut rtv))?;
+            self.device
+                .CreateRenderTargetView(dest, None, Some(&mut rtv))?;
             let rtv: ID3D11RenderTargetView = rtv.ok_or_else(|| Error::new("RTV"))?;
 
             let vp = D3D11_VIEWPORT {
@@ -445,7 +446,8 @@ fn compile_vs(device: &ID3D11Device) -> Result<ID3D11VertexShader> {
     let blob = compile("vs_main", "vs_5_0")?;
     let mut vs = None;
     unsafe {
-        let slice = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize());
+        let slice =
+            std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize());
         device.CreateVertexShader(slice, None, Some(&mut vs))?;
     }
     let _blob = blob; // drop after Create*Shader
@@ -456,7 +458,8 @@ fn compile_ps(device: &ID3D11Device, entry: &str) -> Result<ID3D11PixelShader> {
     let blob = compile(entry, "ps_5_0")?;
     let mut ps = None;
     unsafe {
-        let slice = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize());
+        let slice =
+            std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize());
         device.CreatePixelShader(slice, None, Some(&mut ps))?;
     }
     let _blob = blob; // drop after Create*Shader
@@ -498,10 +501,13 @@ fn compile(entry: &str, target: &str) -> Result<windows::Win32::Graphics::Direct
     blob.ok_or_else(|| Error::new("D3DCompile blob"))
 }
 
-fn create_cbuffer(device: &ID3D11Device, data: &[f32; 4]) -> Result<windows::Win32::Graphics::Direct3D11::ID3D11Buffer> {
+fn create_cbuffer(
+    device: &ID3D11Device,
+    data: &[f32; 4],
+) -> Result<windows::Win32::Graphics::Direct3D11::ID3D11Buffer> {
     use windows::Win32::Graphics::Direct3D11::{
-        D3D11_BIND_CONSTANT_BUFFER, D3D11_BUFFER_DESC, D3D11_SUBRESOURCE_DATA, D3D11_USAGE_DYNAMIC,
-        D3D11_CPU_ACCESS_WRITE,
+        D3D11_BIND_CONSTANT_BUFFER, D3D11_BUFFER_DESC, D3D11_CPU_ACCESS_WRITE,
+        D3D11_SUBRESOURCE_DATA, D3D11_USAGE_DYNAMIC,
     };
     let desc = D3D11_BUFFER_DESC {
         ByteWidth: 16,

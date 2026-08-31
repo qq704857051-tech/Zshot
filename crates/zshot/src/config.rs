@@ -163,8 +163,7 @@ pub fn save(settings: &Settings) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let text =
-        serde_json::to_string_pretty(settings).map_err(|e| Error::new(format!("{e}")))?;
+    let text = serde_json::to_string_pretty(settings).map_err(|e| Error::new(format!("{e}")))?;
     std::fs::write(&path, text)?;
     *cache().write().unwrap_or_else(|e| e.into_inner()) = Some(settings.clone());
     Ok(())
@@ -262,7 +261,10 @@ mod tests {
         assert_eq!(after.translation.base_url, before.translation.base_url);
         assert_eq!(after.translation.prompt, before.translation.prompt);
         assert_eq!(after.translation.model, before.translation.model);
-        assert_eq!(after.translation.timeout_seconds, before.translation.timeout_seconds);
+        assert_eq!(
+            after.translation.timeout_seconds,
+            before.translation.timeout_seconds
+        );
         assert_eq!(
             after.screenshot.hidden_toolbar_items,
             before.screenshot.hidden_toolbar_items
@@ -275,8 +277,14 @@ mod tests {
     fn annotation_defaults_match_the_editor_constants() {
         let a = Annotation::default();
         assert_eq!(a.stroke_argb(), crate::overlay::theme::STROKE_ARGB);
-        assert_eq!(a.clamped_stroke_width(), crate::overlay::editor::DEFAULT_STROKE_WIDTH);
-        assert_eq!(a.clamped_mosaic_block(), crate::overlay::editor::DEFAULT_MOSAIC_BLOCK);
+        assert_eq!(
+            a.clamped_stroke_width(),
+            crate::overlay::editor::DEFAULT_STROKE_WIDTH
+        );
+        assert_eq!(
+            a.clamped_mosaic_block(),
+            crate::overlay::editor::DEFAULT_MOSAIC_BLOCK
+        );
     }
 
     #[test]
@@ -291,7 +299,11 @@ mod tests {
     /// Hand-edited extremes must not break the renderer.
     #[test]
     fn annotation_values_are_clamped_when_applied() {
-        let a = Annotation { stroke_width: 999.0, stroke_color: String::new(), mosaic_block: 0 };
+        let a = Annotation {
+            stroke_width: 999.0,
+            stroke_color: String::new(),
+            mosaic_block: 0,
+        };
         assert_eq!(a.clamped_stroke_width(), 20.0);
         assert_eq!(a.clamped_mosaic_block(), 4);
         assert_eq!(a.stroke_argb(), crate::overlay::theme::STROKE_ARGB);

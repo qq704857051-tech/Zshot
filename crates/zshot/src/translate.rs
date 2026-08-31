@@ -82,11 +82,8 @@ pub fn set_api_key(key: &str) -> Result<()> {
     if key.is_empty() {
         return Ok(());
     }
-    let cred = PasswordCredential::CreatePasswordCredential(
-        &resource,
-        &account,
-        &HSTRING::from(key),
-    )?;
+    let cred =
+        PasswordCredential::CreatePasswordCredential(&resource, &account, &HSTRING::from(key))?;
     vault.Add(&cred)?;
     Ok(())
 }

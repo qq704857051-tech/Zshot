@@ -2,8 +2,8 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
-    VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT, HOT_KEY_MODIFIERS,
+    GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL,
+    MOD_NOREPEAT, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, PostMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT,
@@ -128,7 +128,8 @@ pub fn apply_bindings(bindings: HotkeyBindings) {
 }
 
 pub fn pack_hotkey(h: Hotkey) -> usize {
-    let mods = (h.ctrl as usize) | (h.alt as usize) << 1 | (h.shift as usize) << 2 | (h.win as usize) << 3;
+    let mods =
+        (h.ctrl as usize) | (h.alt as usize) << 1 | (h.shift as usize) << 2 | (h.win as usize) << 3;
     (mods << 16) | h.vk as usize
 }
 
@@ -243,7 +244,11 @@ fn register_one(hwnd: HWND, id: i32, hotkey: Hotkey) -> windows::core::Result<()
         mods |= HOT_KEY_MODIFIERS(0x0008); // MOD_WIN
     }
     // PrtSc with no modifiers is valid.
-    let vk = if hotkey.vk == 0 { VK_SNAPSHOT } else { hotkey.vk };
+    let vk = if hotkey.vk == 0 {
+        VK_SNAPSHOT
+    } else {
+        hotkey.vk
+    };
     unsafe { RegisterHotKey(Some(hwnd), id, mods, vk as u32) }
 }
 

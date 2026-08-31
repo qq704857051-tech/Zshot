@@ -34,7 +34,10 @@ pub enum TrayCommand {
 pub fn taskbar_created_message() -> u32 {
     static MSG: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *MSG.get_or_init(|| unsafe {
-        let name: Vec<u16> = "TaskbarCreated".encode_utf16().chain(std::iter::once(0)).collect();
+        let name: Vec<u16> = "TaskbarCreated"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         RegisterWindowMessageW(PCWSTR(name.as_ptr()))
     })
 }
@@ -117,12 +120,42 @@ pub fn handle_tray(hwnd: HWND, lparam: LPARAM) -> Option<TrayCommand> {
 fn show_menu(hwnd: HWND) -> Option<TrayCommand> {
     unsafe {
         let menu = CreatePopupMenu().ok()?;
-        let _ = InsertMenuW(menu, 0, MF_BYPOSITION | MF_STRING, ID_REGION as usize, PCWSTR(w("区域截图\0").as_ptr()));
-        let _ = InsertMenuW(menu, 1, MF_BYPOSITION | MF_STRING, ID_FULL as usize, PCWSTR(w("全屏截图\0").as_ptr()));
-        let _ = InsertMenuW(menu, 2, MF_BYPOSITION | MF_STRING, ID_COPY as usize, PCWSTR(w("仅复制\0").as_ptr()));
+        let _ = InsertMenuW(
+            menu,
+            0,
+            MF_BYPOSITION | MF_STRING,
+            ID_REGION as usize,
+            PCWSTR(w("区域截图\0").as_ptr()),
+        );
+        let _ = InsertMenuW(
+            menu,
+            1,
+            MF_BYPOSITION | MF_STRING,
+            ID_FULL as usize,
+            PCWSTR(w("全屏截图\0").as_ptr()),
+        );
+        let _ = InsertMenuW(
+            menu,
+            2,
+            MF_BYPOSITION | MF_STRING,
+            ID_COPY as usize,
+            PCWSTR(w("仅复制\0").as_ptr()),
+        );
         let _ = InsertMenuW(menu, 3, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = InsertMenuW(menu, 4, MF_BYPOSITION | MF_STRING, ID_SETTINGS as usize, PCWSTR(w("设置\0").as_ptr()));
-        let _ = InsertMenuW(menu, 5, MF_BYPOSITION | MF_STRING, ID_EXIT as usize, PCWSTR(w("退出\0").as_ptr()));
+        let _ = InsertMenuW(
+            menu,
+            4,
+            MF_BYPOSITION | MF_STRING,
+            ID_SETTINGS as usize,
+            PCWSTR(w("设置\0").as_ptr()),
+        );
+        let _ = InsertMenuW(
+            menu,
+            5,
+            MF_BYPOSITION | MF_STRING,
+            ID_EXIT as usize,
+            PCWSTR(w("退出\0").as_ptr()),
+        );
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
         let _ = SetForegroundWindow(hwnd);

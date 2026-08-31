@@ -12,6 +12,7 @@ fn gpui_app() -> Application {
 }
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -19,8 +20,7 @@ use windows::Win32::System::ProcessStatus::{
     GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
 };
 use windows::Win32::System::Threading::GetCurrentProcess;
-use windows::Win32::UI::Shell::{SHGetKnownFolderPath, FOLDERID_Pictures, KF_FLAG_DEFAULT};
-use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::UI::Shell::{FOLDERID_Pictures, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, PostMessageW, PostQuitMessage, RegisterClassExW, ShowWindow,
     CS_HREDRAW, CS_VREDRAW, SW_HIDE, WM_DESTROY, WM_HOTKEY, WNDCLASSEXW, WS_OVERLAPPED,
@@ -40,8 +40,8 @@ use crate::perf::{write_perf_summary, PerfSession};
 use crate::platform::{
     action_from_wparam, action_wparam, add_tray_icon, handle_tray, install_ll_hook, load_app_icon,
     register_fallback_hotkeys, remove_tray_icon, set_dpi_aware, set_hook_target,
-    taskbar_created_message, uninstall_ll_hook, unregister_fallback_hotkeys, SingleInstance,
-    unpack_hotkey, TrayCommand, WM_TRAYICON, WM_ZSHOT_HOTKEY, WM_ZSHOT_HOTKEY_RECORDED,
+    taskbar_created_message, uninstall_ll_hook, unpack_hotkey, unregister_fallback_hotkeys,
+    SingleInstance, TrayCommand, WM_TRAYICON, WM_ZSHOT_HOTKEY, WM_ZSHOT_HOTKEY_RECORDED,
     WM_ZSHOT_SETTINGS,
 };
 
@@ -97,11 +97,7 @@ fn install_gpu_lifecycle(cx: &App) {
     });
 }
 
-fn capture_from_app(
-    cx: &mut App,
-    region: bool,
-    perf: &mut PerfSession,
-) -> Result<CapturedDesktop> {
+fn capture_from_app(cx: &mut App, region: bool, perf: &mut PerfSession) -> Result<CapturedDesktop> {
     let generation = cx.gpu_generation();
     let overlay_luid = cx.adapter_luid().unwrap_or((0, 0));
     // Borrow GPU only long enough to clone the device and compile shaders — do not hold
@@ -114,7 +110,8 @@ fn capture_from_app(
         None => return Err(Error::new("GPU context unavailable")),
     };
     let prepared = prepare_capture(region, &device, &shaders, overlay_luid)?;
-    match cx.with_gpu_context(|device, ctx| capture_for_action(prepared, perf, device, ctx, &shaders))
+    match cx
+        .with_gpu_context(|device, ctx| capture_for_action(prepared, perf, device, ctx, &shaders))
     {
         Some(r) => r,
         None => Err(Error::new("GPU context unavailable")),
@@ -171,10 +168,7 @@ pub fn run() -> Result<()> {
             };
         }
         Some("--stress-overlay") => {
-            let n = args
-                .get(2)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(100usize);
+            let n = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(100usize);
             return stress_overlay(n);
         }
         _ => {}
@@ -519,17 +513,15 @@ fn run_tray() -> Result<()> {
     gpui_app().run({
         let cleanup_hwnd = cleanup_hwnd.clone();
         let boot_error = boot_error.clone();
-        move |cx: &mut App| {
-            match boot_resident(cx, cleanup_hwnd) {
-                Ok(()) => {
-                    perf_boot.mark("T1");
-                    let _ = perf_boot.write_log();
-                }
-                Err(e) => {
-                    eprintln!("{e}");
-                    *boot_error.borrow_mut() = Some(e);
-                    cx.quit();
-                }
+        move |cx: &mut App| match boot_resident(cx, cleanup_hwnd) {
+            Ok(()) => {
+                perf_boot.mark("T1");
+                let _ = perf_boot.write_log();
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                *boot_error.borrow_mut() = Some(e);
+                cx.quit();
             }
         }
     });
@@ -761,11 +753,7 @@ pub(crate) fn complete_region_shot(
     }
 }
 
-pub(crate) fn export_annotated_region(
-    cx: &mut App,
-    cap: &CapturedDesktop,
-    result: &OverlayResult,
-) {
+pub(crate) fn export_annotated_region(cx: &mut App, cap: &CapturedDesktop, result: &OverlayResult) {
     match crop_from_app(cx, cap, result.x, result.y, result.w, result.h) {
         Ok((mut px, cw, ch, stride)) => {
             apply_annotations(
@@ -835,7 +823,11 @@ fn default_png_path() -> Result<PathBuf> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     // Seconds alone collide when two shots land in the same second.
-    Ok(dir.join(format!("zshot-{}-{:03}.png", d.as_secs(), d.subsec_millis())))
+    Ok(dir.join(format!(
+        "zshot-{}-{:03}.png",
+        d.as_secs(),
+        d.subsec_millis()
+    )))
 }
 
 fn wide(s: &str) -> Vec<u16> {

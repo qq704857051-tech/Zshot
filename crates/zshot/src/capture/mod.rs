@@ -226,12 +226,7 @@ pub fn capture_for_action(
         (vd.x, vd.y, vd.w.max(1) as u32, vd.h.max(1) as u32)
     } else {
         let t0 = &monitors[target_indices[0]];
-        (
-            t0.x,
-            t0.y,
-            t0.w.max(1) as u32,
-            t0.h.max(1) as u32,
-        )
+        (t0.x, t0.y, t0.w.max(1) as u32, t0.h.max(1) as u32)
     };
 
     let format = if any_hdr {

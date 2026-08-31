@@ -1,8 +1,8 @@
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
-use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex};
 use windows::Win32::Foundation::GetLastError;
 use windows::Win32::Foundation::ERROR_ALREADY_EXISTS;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex};
 
 use crate::error::{Error, Result};
 

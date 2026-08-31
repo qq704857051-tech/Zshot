@@ -1,4 +1,4 @@
-use windows::core::{BOOL, Interface};
+use windows::core::{Interface, BOOL};
 use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
     DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
@@ -15,9 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
-use windows::Win32::UI::Shell::{
-    SHQueryUserNotificationState, QUNS_RUNNING_D3D_FULL_SCREEN,
-};
+use windows::Win32::UI::Shell::{SHQueryUserNotificationState, QUNS_RUNNING_D3D_FULL_SCREEN};
 
 use crate::error::Result;
 use crate::exclusive::dxgi_output_is_exclusive;
@@ -197,8 +195,7 @@ fn sdr_white_by_device() -> Vec<(String, f32)> {
             modes.as_mut_ptr(),
             None,
         )
-        .0
-            != 0
+        .0 != 0
         {
             return out;
         }
@@ -224,7 +221,8 @@ fn sdr_white_by_device() -> Vec<(String, f32)> {
                 },
                 SDRWhiteLevel: 1000,
             };
-            let nits = if DisplayConfigGetDeviceInfo(&mut sdr.header) == 0 && sdr.SDRWhiteLevel > 0 {
+            let nits = if DisplayConfigGetDeviceInfo(&mut sdr.header) == 0 && sdr.SDRWhiteLevel > 0
+            {
                 sdr_white_nits_from_displayconfig(sdr.SDRWhiteLevel)
             } else {
                 REFERENCE_WHITE_NITS
@@ -293,9 +291,9 @@ pub fn monitor_from_foreground(monitors: &[MonitorInfo]) -> Option<usize> {
         GetWindowRect(hwnd, &mut rc).ok()?;
         let cx = (rc.left + rc.right) / 2;
         let cy = (rc.top + rc.bottom) / 2;
-        monitors.iter().position(|m| {
-            cx >= m.x && cy >= m.y && cx < m.x + m.w && cy < m.y + m.h
-        })
+        monitors
+            .iter()
+            .position(|m| cx >= m.x && cy >= m.y && cx < m.x + m.w && cy < m.y + m.h)
     }
 }
 

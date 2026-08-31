@@ -7,7 +7,7 @@ use std::ptr;
 use std::slice;
 
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND};
-use windows::Win32::Graphics::Gdi::{BI_RGB, BITMAPINFOHEADER};
+use windows::Win32::Graphics::Gdi::{BITMAPINFOHEADER, BI_RGB};
 use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, GUID_ContainerFormatPng, GUID_WICPixelFormat32bppBGRA,
     IWICBitmapEncoder, IWICBitmapFrameEncode, IWICImagingFactory, WICBitmapEncoderNoCache,
@@ -28,7 +28,8 @@ pub fn encode_png_bgra(pixels: &[u8], width: u32, height: u32, stride: u32) -> R
     unsafe {
         let factory: IWICImagingFactory =
             CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
-        let stream: IStream = CreateStreamOnHGlobal(windows::Win32::Foundation::HGLOBAL::default(), true)?;
+        let stream: IStream =
+            CreateStreamOnHGlobal(windows::Win32::Foundation::HGLOBAL::default(), true)?;
         let encoder: IWICBitmapEncoder =
             factory.CreateEncoder(&GUID_ContainerFormatPng, ptr::null())?;
         encoder.Initialize(&stream, WICBitmapEncoderNoCache)?;
@@ -78,7 +79,13 @@ fn trim_png(mut bytes: Vec<u8>) -> Vec<u8> {
     bytes
 }
 
-pub fn write_png_file(path: &Path, pixels: &[u8], width: u32, height: u32, stride: u32) -> Result<()> {
+pub fn write_png_file(
+    path: &Path,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    stride: u32,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -201,7 +208,9 @@ mod tests {
     /// of the clipboard with the same pixels.
     #[test]
     fn clipboard_dib_round_trip() {
-        use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+        use windows::Win32::System::DataExchange::{
+            CloseClipboard, GetClipboardData, OpenClipboard,
+        };
         use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 
         let pixels: Vec<u8> = vec![1, 2, 3, 255, 5, 6, 7, 255, 9, 10, 11, 255, 13, 14, 15, 255];
@@ -220,7 +229,10 @@ mod tests {
             assert_eq!(header.biHeight, 2, "bottom-up DIB");
             let image = &data[std::mem::size_of::<BITMAPINFOHEADER>()..];
             // Bottom-up: the first stored row is the last source row.
-            assert_eq!(image, &[9, 10, 11, 255, 13, 14, 15, 255, 1, 2, 3, 255, 5, 6, 7, 255]);
+            assert_eq!(
+                image,
+                &[9, 10, 11, 255, 13, 14, 15, 255, 1, 2, 3, 255, 5, 6, 7, 255]
+            );
             let _ = GlobalUnlock(h);
             let _ = CloseClipboard();
         }

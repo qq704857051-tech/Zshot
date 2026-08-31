@@ -40,13 +40,9 @@ fn hover_bg() -> Hsla {
 }
 
 fn icon(path: &'static str, size: f32, color: Hsla) -> Div {
-    div().flex_none().child(
-        svg()
-            .path(path)
-            .w(px(size))
-            .h(px(size))
-            .text_color(color),
-    )
+    div()
+        .flex_none()
+        .child(svg().path(path).w(px(size)).h(px(size)).text_color(color))
 }
 
 /// Title row at the top of every page, with room for a status chip on the
@@ -265,7 +261,9 @@ pub fn checkbox(
                 .flex()
                 .items_center()
                 .justify_center()
-                .when(checked, |el| el.child(icon("settings/check.svg", 11., white()))),
+                .when(checked, |el| {
+                    el.child(icon("settings/check.svg", 11., white()))
+                }),
         )
         .child(
             div()
@@ -326,7 +324,11 @@ pub fn select(
         .rounded(px(4.))
         .bg(input_bg())
         .border_1()
-        .border_color(if open { theme::accent() } else { theme::border() })
+        .border_color(if open {
+            theme::accent()
+        } else {
+            theme::border()
+        })
         .cursor(CursorStyle::PointingHand)
         .hover(|s| s.bg(hover_bg()))
         .child(

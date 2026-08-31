@@ -78,13 +78,25 @@ pub fn hit_test(selection: Rect, point: Point, handle_size: f64) -> SelectionHit
     if handle(selection.x + selection.width / 2.0, selection.y, half).contains(point) {
         return SelectionHitKind::North;
     }
-    if handle(selection.x + selection.width / 2.0, selection.bottom(), half).contains(point) {
+    if handle(
+        selection.x + selection.width / 2.0,
+        selection.bottom(),
+        half,
+    )
+    .contains(point)
+    {
         return SelectionHitKind::South;
     }
     if handle(selection.x, selection.y + selection.height / 2.0, half).contains(point) {
         return SelectionHitKind::West;
     }
-    if handle(selection.right(), selection.y + selection.height / 2.0, half).contains(point) {
+    if handle(
+        selection.right(),
+        selection.y + selection.height / 2.0,
+        half,
+    )
+    .contains(point)
+    {
         return SelectionHitKind::East;
     }
     if selection.contains(point) {
@@ -96,11 +108,7 @@ pub fn hit_test(selection: Rect, point: Point, handle_size: f64) -> SelectionHit
 pub fn move_rect(selection: Rect, dx: f64, dy: f64, bounds: Rect) -> Rect {
     let x = (selection.x + dx).clamp(bounds.x, bounds.x + bounds.width - selection.width);
     let y = (selection.y + dy).clamp(bounds.y, bounds.y + bounds.height - selection.height);
-    Rect {
-        x,
-        y,
-        ..selection
-    }
+    Rect { x, y, ..selection }
 }
 
 pub fn resize_rect(

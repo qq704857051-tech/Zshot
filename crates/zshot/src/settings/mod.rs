@@ -14,10 +14,9 @@ use std::cell::{Cell, RefCell};
 use std::time::Duration;
 
 use gpui::{
-    deferred, div, prelude::*, px, size, App, Bounds, Context, Entity, Focusable, FontWeight,
-    CursorStyle, MouseButton,
-    SharedString, Subscription, Timer, TitlebarOptions, Window, WindowBounds, WindowHandle,
-    WindowOptions,
+    deferred, div, prelude::*, px, size, App, Bounds, Context, CursorStyle, Entity, Focusable,
+    FontWeight, MouseButton, SharedString, Subscription, Timer, TitlebarOptions, Window,
+    WindowBounds, WindowHandle, WindowOptions,
 };
 
 use crate::config::Settings;
@@ -165,8 +164,18 @@ enum SelectId {
 }
 
 /// (label, value) presets for the annotation dropdowns.
-const STROKE_WIDTHS: [(&str, f64); 4] = [("细 2 px", 2.0), ("中 4 px", 4.0), ("粗 6 px", 6.0), ("特粗 8 px", 8.0)];
-const MOSAIC_BLOCKS: [(&str, i32); 4] = [("小 8 px", 8), ("中 16 px", 16), ("大 24 px", 24), ("特大 32 px", 32)];
+const STROKE_WIDTHS: [(&str, f64); 4] = [
+    ("细 2 px", 2.0),
+    ("中 4 px", 4.0),
+    ("粗 6 px", 6.0),
+    ("特粗 8 px", 8.0),
+];
+const MOSAIC_BLOCKS: [(&str, i32); 4] = [
+    ("小 8 px", 8),
+    ("中 16 px", 16),
+    ("大 24 px", 24),
+    ("特大 32 px", 32),
+];
 /// (hex, packed RGB) — the swatch row on the screenshot page. The first entry
 /// is the historical default red.
 const SWATCHES: [(&str, u32); 8] = [
@@ -209,13 +218,11 @@ impl SettingsView {
         let t = settings.translation.clone();
         let saved_api_key = crate::translate::api_key().unwrap_or_default();
 
-        let base_url = cx.new(|cx| {
-            TextInput::new(cx, t.base_url.clone(), "https://api.openai.com/v1", false)
-        });
+        let base_url =
+            cx.new(|cx| TextInput::new(cx, t.base_url.clone(), "https://api.openai.com/v1", false));
         let api_key = cx.new(|cx| TextInput::new(cx, saved_api_key.clone(), "sk-...", true));
         let model = cx.new(|cx| TextInput::new(cx, t.model.clone(), "gpt-4o-mini", false));
-        let timeout =
-            cx.new(|cx| TextInput::new(cx, t.timeout_seconds.to_string(), "30", false));
+        let timeout = cx.new(|cx| TextInput::new(cx, t.timeout_seconds.to_string(), "30", false));
         let prompt = cx.new(|cx| TextInput::new(cx, t.prompt.clone(), "使用内置提示词", false));
 
         let mut subscriptions = Vec::new();
@@ -512,7 +519,11 @@ impl SettingsView {
         cx.notify();
     }
 
-    fn open_folder(&mut self, dir: crate::error::Result<std::path::PathBuf>, cx: &mut Context<Self>) {
+    fn open_folder(
+        &mut self,
+        dir: crate::error::Result<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
         let result = dir.and_then(|path| system::open_folder(&path));
         if let Err(e) = result {
             self.fail(format!("{e}"));
@@ -598,7 +609,11 @@ impl SettingsView {
                 .rounded_full()
                 .bg(gpui::rgb(rgb24))
                 .border_2()
-                .border_color(if selected { theme::accent() } else { theme::border() })
+                .border_color(if selected {
+                    theme::accent()
+                } else {
+                    theme::border()
+                })
                 .cursor(CursorStyle::PointingHand)
                 .on_mouse_down(
                     MouseButton::Left,
@@ -626,11 +641,14 @@ impl SettingsView {
                     label,
                     (v - stored_w).abs() < f64::EPSILON,
                 )
-                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                    this.settings.screenshot.annotation.stroke_width = v;
-                    this.open_select = None;
-                    this.persist(cx);
-                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.settings.screenshot.annotation.stroke_width = v;
+                        this.open_select = None;
+                        this.persist(cx);
+                    }),
+                )
             })
             .into_iter()
             .collect();
@@ -656,11 +674,14 @@ impl SettingsView {
                     label,
                     v == stored_b,
                 )
-                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                    this.settings.screenshot.annotation.mosaic_block = v;
-                    this.open_select = None;
-                    this.persist(cx);
-                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.settings.screenshot.annotation.mosaic_block = v;
+                        this.open_select = None;
+                        this.persist(cx);
+                    }),
+                )
             })
             .into_iter()
             .collect();
@@ -707,17 +728,13 @@ impl SettingsView {
                     .flex_row()
                     .items_center()
                     .gap(px(8.))
-                    .child(
-                        div()
-                            .w(px(7.))
-                            .h(px(7.))
-                            .rounded(px(4.))
-                            .bg(if crate::ocr::models_available() {
-                                theme::success()
-                            } else {
-                                theme::danger()
-                            }),
-                    )
+                    .child(div().w(px(7.)).h(px(7.)).rounded(px(4.)).bg(
+                        if crate::ocr::models_available() {
+                            theme::success()
+                        } else {
+                            theme::danger()
+                        },
+                    ))
                     .child(
                         div()
                             .text_size(px(13.))
@@ -729,15 +746,11 @@ impl SettingsView {
         let current = self.settings.translation.target_language.clone();
         let rows = LANGUAGES
             .map(|(code, name)| {
-                widgets::select_option(
-                    code,
-                    format!("{name} ({code})"),
-                    current == code,
-                )
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| this.set_language(code, cx)),
-                )
+                widgets::select_option(code, format!("{name} ({code})"), current == code)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.set_language(code, cx)),
+                    )
             })
             .into_iter()
             .collect();
@@ -833,27 +846,21 @@ impl SettingsView {
                                 .items_center()
                                 .gap(px(8.))
                                 .child(
-                                    widgets::hotkey_field(
-                                        id,
-                                        self.hotkey_text(action),
-                                        recording,
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.start_recording(action, cx);
-                                        }),
-                                    ),
-                                )
-                                .when(recording, |el| {
-                                    el.child(
-                                        widgets::cancel_button("hk-cancel").on_mouse_down(
+                                    widgets::hotkey_field(id, self.hotkey_text(action), recording)
+                                        .on_mouse_down(
                                             MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| {
-                                                this.cancel_recording(cx);
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.start_recording(action, cx);
                                             }),
                                         ),
-                                    )
+                                )
+                                .when(recording, |el| {
+                                    el.child(widgets::cancel_button("hk-cancel").on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.cancel_recording(cx);
+                                        }),
+                                    ))
                                 }),
                         )
                     })),
@@ -879,12 +886,10 @@ impl SettingsView {
                     "开机时启动",
                     Some("写入当前用户的 Run 注册表项，不需要管理员权限。".into()),
                 )
-                .child(
-                    widgets::toggle("autostart", self.autostart).on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.set_autostart(cx)),
-                    ),
-                ),
+                .child(widgets::toggle("autostart", self.autostart).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.set_autostart(cx)),
+                )),
             )
             .child(widgets::group_header("维护"))
             .child(
@@ -893,25 +898,24 @@ impl SettingsView {
                     .flex_col()
                     .gap(px(4.))
                     .child(
-                        widgets::card("数据目录", None)
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap(px(12.))
-                                    .child(widgets::path_line(path_of(system::data_dir())))
-                                    .child(
-                                        widgets::icon_button("open-data", "settings/folder.svg")
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(|this, _, _, cx| {
-                                                    this.open_folder(system::data_dir(), cx);
-                                                }),
-                                            ),
-                                    ),
-                            ),
+                        widgets::card("数据目录", None).child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(12.))
+                                .child(widgets::path_line(path_of(system::data_dir())))
+                                .child(
+                                    widgets::icon_button("open-data", "settings/folder.svg")
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.open_folder(system::data_dir(), cx);
+                                            }),
+                                        ),
+                                ),
+                        ),
                     )
                     .child(
                         widgets::card("日志目录", None).child(
