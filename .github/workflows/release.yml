@@ -1,0 +1,27 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      # The exe looks for models\v6 next to itself, so the zip has to carry them:
+      # without this the OCR and translate buttons are dead on a fresh machine.
+      - name: Stage
+        run: |
+          $dir = "dist/Zshot-${{ github.ref_name }}"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item target/release/Zshot.exe $dir
+          Copy-Item LICENSE $dir
+          New-Item -ItemType Directory -Force "$dir/models/v6" | Out-Null
+          Copy-Item models/v6/* "$dir/models/v6"
+          Compress-Archive -Path $dir -DestinationPath "dist/Zshot-${{ github.ref_name }}-x64.zip"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Zshot-${{ github.ref_name }}-x64.zip
