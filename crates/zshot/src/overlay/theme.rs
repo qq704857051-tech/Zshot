@@ -61,6 +61,20 @@ pub fn transparent() -> Hsla {
 /// ARGB for annotation strokes.
 pub const STROKE_ARGB: u32 = 0xFFFA_3C3C;
 
+/// (hex, packed RGB) — the annotation palette, shared by the settings page's
+/// default-colour row and the overlay toolbar's colour popup so the two can
+/// never offer different colours. The first entry is `STROKE_ARGB`.
+pub const SWATCHES: [(&str, u32); 8] = [
+    ("#FA3C3C", 0xFA3C3C),
+    ("#FF8C00", 0xFF8C00),
+    ("#FFD700", 0xFFD700),
+    ("#22B14C", 0x22B14C),
+    ("#3B82F6", 0x3B82F6),
+    ("#A855F7", 0xA855F7),
+    ("#1E1E1E", 0x1E1E1E),
+    ("#FFFFFF", 0xFFFFFF),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,6 +97,11 @@ mod tests {
         assert_eq!(border().h, 0.0);
         assert_eq!(border().s, 0.0);
         assert!(border().l < 0.01);
+    }
+
+    #[test]
+    fn first_swatch_is_the_default_stroke() {
+        assert_eq!(0xFF00_0000 | SWATCHES[0].1, STROKE_ARGB);
     }
 
     #[test]

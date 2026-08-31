@@ -176,18 +176,6 @@ const MOSAIC_BLOCKS: [(&str, i32); 4] = [
     ("大 24 px", 24),
     ("特大 32 px", 32),
 ];
-/// (hex, packed RGB) — the swatch row on the screenshot page. The first entry
-/// is the historical default red.
-const SWATCHES: [(&str, u32); 8] = [
-    ("#FA3C3C", 0xFA3C3C),
-    ("#FF8C00", 0xFF8C00),
-    ("#FFD700", 0xFFD700),
-    ("#22B14C", 0x22B14C),
-    ("#3B82F6", 0x3B82F6),
-    ("#A855F7", 0xA855F7),
-    ("#1E1E1E", 0x1E1E1E),
-    ("#FFFFFF", 0xFFFFFF),
-];
 
 pub struct SettingsView {
     page: Page,
@@ -615,7 +603,7 @@ impl SettingsView {
 
         let ann = &self.settings.screenshot.annotation;
         let current_argb = ann.stroke_argb();
-        let swatches = SWATCHES.map(|(hex, rgb24)| {
+        let swatches = theme::SWATCHES.map(|(hex, rgb24)| {
             let selected = current_argb == 0xFF00_0000 | rgb24;
             div()
                 .id(SharedString::from(format!("swatch-{hex}")))

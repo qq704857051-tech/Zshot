@@ -63,12 +63,23 @@ The API key is **not** in that file. It stays in the Windows credential vault
 under resource `Zshot.Translation`, account `apiKey` — the same entry the C#
 build writes, so configuring it there covers both.
 
+## Pin and long capture
+Toolbar 钉住 puts the annotated crop on the screen as a topmost, borderless
+window (PixPin-style): drag to move, wheel to zoom, `Esc` or double-click to
+close. Any number of pins can be up at once.
+Toolbar 长截图 swaps the bar for a status chip, then stitches while you
+scroll the window underneath by hand: one frame every 450 ms, SAD-aligned
+against the previous frame (the C# `VerticalFrameAligner`), capped at
+16384 px. 完成 saves the stitched PNG and copies it; 取消 / `Esc` /
+right-click drops the session and returns to the editor. The selection is
+click-through during the capture so the app beneath receives the scroll.
+
 ## Phase 1 notes
 
 - Capture: WGC first, `DXGI DuplicateOutput1` on failure / timeout / near-black / exclusive fullscreen (same-adapter only). Each monitor gets 500 ms to hand back a frame.
 - Overlay freeze is a composition swapchain on DComp visual 0 (no full-frame CPU blit)
 - Exclusive-fullscreen region: grab the game frame, then force the freeze overlay
-- Not in this PoC: annotation editor, long capture, AVIF/JXL/UHDR
+- Not in this PoC: AVIF/JXL/UHDR
 - OCR runs in-process with a lazily built ORT session that drops after 60 s idle,
   not the separate `Zshot.Ocr.exe` worker the design doc calls for — revisit if
   resident memory does not fall back after that drop

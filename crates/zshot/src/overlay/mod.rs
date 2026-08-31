@@ -25,7 +25,9 @@ use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
 use windows::Win32::Graphics::Dxgi::IDXGISwapChain1;
-use windows::Win32::Graphics::Gdi::ClientToScreen;
+use windows::Win32::Graphics::Gdi::{
+    ClientToScreen, CombineRgn, CreateRectRgn, DeleteObject, SetWindowRgn, RGN_DIFF,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect, IsIconic,
     IsWindowVisible, PostMessageW, SetForegroundWindow, SetWindowDisplayAffinity, SetWindowPos,
@@ -39,6 +41,7 @@ use crate::geom::{
     hit_test, move_rect, physical_source_rect, resize_rect, Point, Rect, SelectionHitKind,
 };
 use crate::gpui_bridge::present_freeze_from_texture;
+use crate::longcapture::{align_vertical, bgra_to_gray, Stitcher};
 use crate::overlay::composite::{element_mask, CoverageMask};
 use crate::overlay::editor::{Element, PressKind, Session, Shape, Tool};
 use crate::overlay::toolbar::PHASE1_ITEMS;
@@ -158,6 +161,15 @@ pub struct OverlayView {
     /// Copy-only capture: mouse-up on a fresh selection confirms immediately,
     /// skipping the toolbar — "框选后直接复制".
     copy_only: bool,
+    /// The colour popup is open. Session state, not settings: the picker changes
+    /// the colour of the next annotation, it does not rewrite the saved default.
+    color_open: bool,
+    /// Active scrolling-capture session, if any.
+    long: Option<LongCaptureState>,
+    /// Session counter: each start bumps it, so a stale poll task wakes up,
+    /// sees its generation is gone, and exits instead of appending into a
+    /// new session.
+    long_seq: u64,
 }
 
 /// OCR / translation output: read-only text plus copy, same as the C# panel.
@@ -183,6 +195,137 @@ const PANEL_MARGIN: f32 = 4.;
 enum Phase {
     Selecting,
     Active,
+    /// Scrolling capture running: the bar is swapped for the long-capture
+    /// bar, the selection is frozen, and the selection area is click-through.
+    LongCapturing,
+}
+
+/// One scrolling-capture session, ported from the C# LongCaptureRunner: poll
+/// the region every `LONG_POLL`, SAD-align each frame against the previous
+/// one, and append the rows that scrolled into view. The user scrolls by
+/// hand; 完成 stitches and exports, 取消 restores the editor.
+struct LongCaptureState {
+    /// Absolute screen coordinates of the polled region.
+    abs_x: i32,
+    abs_y: i32,
+    w: u32,
+    h: u32,
+    stitcher: Stitcher,
+    prev_gray: Vec<u8>,
+    status: String,
+    /// Bumped per session so a stale poll task from a cancelled session
+    /// cannot append into a new one.
+    gen: u64,
+    /// Height cap hit: polling stops, the bar stays up for 完成/取消.
+    maxed: bool,
+}
+
+/// C# samples every 450 ms: often enough to catch a smooth scroll, rare
+/// enough that a full WGC round per tick stays off the user's back.
+const LONG_POLL: Duration = Duration::from_millis(450);
+/// D3D texture height limit, same cap as the C# LongImageBuffer.
+const LONG_MAX_H: usize = 16384;
+
+/// Click-through for the selection while a long capture runs: the wheel must
+/// reach the app underneath, not the overlay. HTTRANSPARENT from a WM_NCHITTEST
+/// subclass does not do this -- it only walks windows of the same thread -- and
+/// WS_EX_TRANSPARENT needs WS_EX_LAYERED, which gpui's DirectComposition window
+/// (WS_EX_NOREDIRECTIONBITMAP) cannot take. Cutting the selection out of the
+/// window region does work across processes, keeps the backdrop and the
+/// long-capture bar clickable, and stops painting the stale freeze over the
+/// page the user is scrolling.
+fn set_long_passthrough(hwnd: HWND, rect: Option<RECT>) {
+    unsafe {
+        let Some(r) = rect else {
+            let _ = SetWindowRgn(hwnd, None, true);
+            return;
+        };
+        // SetWindowRgn takes window coordinates, and gpui's popup insets the
+        // client area, so the screen rect is offset by the window origin.
+        let mut wr = RECT::default();
+        if GetWindowRect(hwnd, &mut wr).is_err() {
+            return;
+        }
+        let full = CreateRectRgn(0, 0, wr.right - wr.left, wr.bottom - wr.top);
+        let hole = CreateRectRgn(
+            r.left - wr.left,
+            r.top - wr.top,
+            r.right - wr.left,
+            r.bottom - wr.top,
+        );
+        CombineRgn(Some(full), Some(full), Some(hole), RGN_DIFF);
+        let _ = DeleteObject(hole.into());
+        // On success the region belongs to the system; only a failed call
+        // leaves it ours to free.
+        if SetWindowRgn(hwnd, Some(full), true) == 0 {
+            let _ = DeleteObject(full.into());
+        }
+    }
+}
+
+/// Pulls the hole back so the long-capture bar is not inside it. `place_toolbar`
+/// clamps the bar into the monitor, so a selection that fills the screen leaves
+/// it sitting over the selection -- and nothing inside the hole is drawn or
+/// clickable, which would strip the 完成 button. The band it gives up only
+/// stops being click-through; the capture reads the screen, not the overlay.
+fn hole_clear_of_bar(mut hole: RECT, bar_top: i32, bar_bottom: i32) -> RECT {
+    if bar_bottom <= hole.top || bar_top >= hole.bottom {
+        return hole;
+    }
+    if bar_top < (hole.top + hole.bottom) / 2 {
+        hole.top = bar_bottom.min(hole.bottom);
+    } else {
+        hole.bottom = bar_top.max(hole.top);
+    }
+    hole
+}
+
+/// WM_MOUSEWHEEL goes to the window with keyboard focus, not the one under
+/// the cursor, so the region hole alone cannot make the page scroll: the
+/// focused overlay would swallow every wheel tick the capture is waiting for. Handing the foreground to the topmost window under the
+/// selection center is what actually lets the user scroll.
+fn focus_window_under(overlay: HWND, pt: POINT) {
+    struct Ctx {
+        exclude: HWND,
+        pt: POINT,
+        found: HWND,
+    }
+    unsafe extern "system" fn walk(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
+        unsafe {
+            let ctx = &mut *(lparam.0 as *mut Ctx);
+            if hwnd == ctx.exclude {
+                return windows::core::BOOL(1);
+            }
+            // Without the cloak filter the foreground goes to a suspended UWP
+            // frame that still reports a full-screen rect, and the wheel then
+            // reaches nobody.
+            let Some(wr) = real_window_rect(hwnd) else {
+                return windows::core::BOOL(1);
+            };
+            if ctx.pt.x >= wr.left
+                && ctx.pt.x < wr.right
+                && ctx.pt.y >= wr.top
+                && ctx.pt.y < wr.bottom
+            {
+                ctx.found = hwnd;
+                return windows::core::BOOL(0);
+            }
+            windows::core::BOOL(1)
+        }
+    }
+    let mut ctx = Ctx {
+        exclude: overlay,
+        pt,
+        found: HWND::default(),
+    };
+    unsafe {
+        // EnumWindows walks top-level windows in z-order: the overlay is
+        // topmost and skipped, so the first hit is the scrolled app.
+        let _ = EnumWindows(Some(walk), LPARAM(&mut ctx as *mut _ as isize));
+        if !ctx.found.0.is_null() {
+            let _ = SetForegroundWindow(ctx.found);
+        }
+    }
 }
 
 pub fn show_overlay(
@@ -309,6 +452,9 @@ impl OverlayView {
             panel: None,
             hidden_toolbar_items: crate::config::get().screenshot.hidden_toolbar_items,
             copy_only: false,
+            color_open: false,
+            long: None,
+            long_seq: 0,
         }
     }
 
@@ -349,6 +495,9 @@ impl OverlayView {
             panel: None,
             hidden_toolbar_items: crate::config::get().screenshot.hidden_toolbar_items,
             copy_only,
+            color_open: false,
+            long: None,
+            long_seq: 0,
         };
         view.sync_from_cap(window);
         view
@@ -383,6 +532,10 @@ impl OverlayView {
         self.panel = None;
         self.hidden_toolbar_items = crate::config::get().screenshot.hidden_toolbar_items;
         self.copy_only = copy_only;
+        self.color_open = false;
+        self.long = None;
+        self.long_seq = self.long_seq.wrapping_add(1);
+        set_long_passthrough(window.win32_hwnd(), None);
         self.sync_from_cap(window);
     }
 
@@ -521,7 +674,15 @@ impl OverlayView {
         if !self.visible {
             return;
         }
+        // The toolbar and the popup occlude and stop propagation, so reaching
+        // here means the click landed outside both.
+        self.color_open = false;
         if event.button == MouseButton::Right {
+            // Cancel happens on release (same as the C# WM_RBUTTONUP path),
+            // so a right press mid-capture does nothing yet.
+            if self.phase == Phase::LongCapturing {
+                return;
+            }
             if self.text_edit.take().is_some() {
                 cx.notify();
                 return;
@@ -530,6 +691,20 @@ impl OverlayView {
             return;
         }
         if event.button != MouseButton::Left {
+            return;
+        }
+        if self.phase == Phase::LongCapturing {
+            // The selection is click-through; what little lands here is the
+            // dim backdrop, which must not start a drag or an edit. Clicking
+            // the backdrop also activates this window, which would steal the
+            // wheel back -- hand the foreground to the scroll target again.
+            if let Some(state) = self.long.as_ref() {
+                let center = POINT {
+                    x: state.abs_x + (state.w / 2) as i32,
+                    y: state.abs_y + (state.h / 2) as i32,
+                };
+                focus_window_under(window.win32_hwnd(), center);
+            }
             return;
         }
         let scale = window.scale_factor();
@@ -617,7 +792,16 @@ impl OverlayView {
                 cx.notify();
                 return;
             }
+            // Mid-capture a right-click only cancels the session (the C#
+            // HandleRightRelease path); the overlay itself stays open.
+            if self.phase == Phase::LongCapturing {
+                self.cancel_long_capture(window, cx);
+                return;
+            }
             self.cancel(window, cx);
+            return;
+        }
+        if self.phase == Phase::LongCapturing {
             return;
         }
         if event.button != MouseButton::Left {
@@ -711,7 +895,7 @@ impl OverlayView {
     }
 
     fn current_rect(&self) -> Option<Rect> {
-        if self.phase == Phase::Active && self.has_sel {
+        if matches!(self.phase, Phase::Active | Phase::LongCapturing) && self.has_sel {
             return Some(self.selection);
         }
         if self.down && self.has_sel && self.selection.width > MIN_RECT {
@@ -765,12 +949,23 @@ impl OverlayView {
             cx.notify();
             return;
         }
+        // The C# build ignores Enter mid-capture: 完成 on the bar is the only
+        // way out with pixels, so a stray Enter cannot end a scroll early.
+        if self.phase == Phase::LongCapturing {
+            return;
+        }
         self.confirm(window, cx);
     }
 
     fn cancel_action(&mut self, _: &CancelOverlay, window: &mut Window, cx: &mut Context<Self>) {
         if self.text_edit.take().is_some() {
             cx.notify();
+            return;
+        }
+        // Esc mid-capture drops the session and returns to the editor, same
+        // as the C# LongCaptureCancel path -- it never closes the overlay.
+        if self.phase == Phase::LongCapturing {
+            self.cancel_long_capture(window, cx);
             return;
         }
         self.cancel(window, cx);
@@ -845,6 +1040,10 @@ impl OverlayView {
 
     fn finish(&mut self, result: OverlayResult, window: &mut Window, cx: &mut Context<Self>) {
         self.visible = false;
+        // Whatever path ends the capture, the click-through and any poll task
+        // must not outlive it.
+        self.long = None;
+        set_long_passthrough(window.win32_hwnd(), None);
         // Hide only once the now-empty frame has been committed, so nothing of this
         // capture survives in gpui's swap chain for the next one to flash. Hiding is
         // idempotent, and a full-screen topmost window that never goes away would be
@@ -942,6 +1141,8 @@ impl OverlayView {
         } else {
             self.commit_text_draft();
         }
+        // Any button other than COLOR dismisses the popup; COLOR toggles it.
+        self.color_open = id == toolbar::COLOR && !self.color_open;
         if let Some(tool) = Tool::from_id(id) {
             self.editor.cancel_draft();
             self.editor.tool = tool;
@@ -949,6 +1150,7 @@ impl OverlayView {
             return;
         }
         match id {
+            toolbar::COLOR => cx.notify(),
             toolbar::UNDO => {
                 self.editor.undo();
                 cx.notify();
@@ -963,6 +1165,8 @@ impl OverlayView {
             }
             toolbar::OCR => self.run_ocr(cx),
             toolbar::TRANSLATE => self.run_translate(cx),
+            toolbar::PIN => self.pin(window, cx),
+            toolbar::LONG_CAPTURE => self.start_long_capture(window, cx),
             toolbar::SAVE => self.save(cx),
             toolbar::COMPLETE => self.confirm(window, cx),
             toolbar::CANCEL => self.cancel(window, cx),
@@ -1020,6 +1224,168 @@ impl OverlayView {
         cx.notify();
     }
 
+    /// Enters scrolling capture on the current selection (the C#
+    /// `LongCapture_Click`): the toolbar swaps for the long-capture bar, the
+    /// selection turns click-through so the app beneath can scroll, and a poll
+    /// task stitches one frame every `LONG_POLL`.
+    fn start_long_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.phase != Phase::Active || !self.has_sel || self.busy() {
+            return;
+        }
+        self.commit_text_draft();
+        let Some(result) = self.result_from_current() else {
+            return;
+        };
+        let abs_x = self.origin_x + result.x as i32;
+        let abs_y = self.origin_y + result.y as i32;
+        let (w, h) = (result.w as usize, result.h as usize);
+        let Some(mut stitcher) = Stitcher::new(w, h, LONG_MAX_H) else {
+            return;
+        };
+        // The freeze frame may be stale by the time the user reaches for this
+        // button, so -- like the C# runner -- the first frame is a fresh
+        // capture, not a crop of it.
+        let (px, pw, ph, _) =
+            match crate::app::capture_region_bgra(cx, abs_x, abs_y, result.w, result.h) {
+                Ok(frame) => frame,
+                Err(e) => {
+                    self.show_panel("长截图失败", e.to_string(), false, cx);
+                    return;
+                }
+            };
+        if pw != result.w || ph != result.h || !stitcher.fill_first(&px) {
+            return;
+        }
+        let prev_gray = bgra_to_gray(&px, w, h);
+        self.long_seq = self.long_seq.wrapping_add(1);
+        let gen = self.long_seq;
+        self.long = Some(LongCaptureState {
+            abs_x,
+            abs_y,
+            w: result.w,
+            h: result.h,
+            stitcher,
+            prev_gray,
+            status: "滚动页面以继续截图".to_string(),
+            gen,
+            maxed: false,
+        });
+        // The OCR/translate panel has no meaning mid-capture; the C# build
+        // collapses ResultPanel here too.
+        self.panel = None;
+        self.phase = Phase::LongCapturing;
+        let (bar, bar_h) = self.long_bar_placement(window.scale_factor(), 0.0);
+        let rect = hole_clear_of_bar(
+            RECT {
+                left: abs_x,
+                top: abs_y,
+                right: abs_x + result.w as i32,
+                bottom: abs_y + result.h as i32,
+            },
+            self.origin_y + bar.y as i32,
+            self.origin_y + (bar.y + bar_h).ceil() as i32,
+        );
+        set_long_passthrough(window.win32_hwnd(), Some(rect));
+        let center = POINT {
+            x: abs_x + result.w as i32 / 2,
+            y: abs_y + result.h as i32 / 2,
+        };
+        focus_window_under(window.win32_hwnd(), center);
+        self.spawn_long_poll(gen, cx);
+        cx.notify();
+    }
+
+    fn spawn_long_poll(&self, gen: u64, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                Timer::after(LONG_POLL).await;
+                match this.update(cx, |this, cx| this.long_tick(gen, cx)) {
+                    Ok(true) => {}
+                    // View gone, session over, or the cap stopped the polling.
+                    _ => break,
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// One poll: fresh frame, SAD-align against the previous one, append the
+    /// rows that scrolled into view. Returns false when the loop should stop.
+    fn long_tick(&mut self, gen: u64, cx: &mut Context<Self>) -> bool {
+        let Some(state) = self.long.as_ref() else {
+            return false;
+        };
+        if state.gen != gen || state.maxed || self.phase != Phase::LongCapturing {
+            return false;
+        }
+        let (ax, ay, w, h) = (state.abs_x, state.abs_y, state.w, state.h);
+        let Ok((px, pw, ph, _)) = crate::app::capture_region_bgra(cx, ax, ay, w, h) else {
+            // A transient capture failure skips the frame, same as the C# loop.
+            return true;
+        };
+        if pw != w || ph != h {
+            return true;
+        }
+        let gray = bgra_to_gray(&px, w as usize, h as usize);
+        let Some(state) = self.long.as_mut() else {
+            return false;
+        };
+        let strip = (h as usize / 4).min(32);
+        // 0.9, not the C# 0.35: with `score = 1 - SAD/(strip*255)` two unrelated
+        // frames still score ~0.67, so the low bar accepted every scroll that
+        // outran the overlap.
+        let align = align_vertical(&state.prev_gray, &gray, w as usize, h as usize, strip, 0.9);
+        if !align.accepted {
+            return true;
+        }
+        let new_rows = h as usize - align.offset_y;
+        // <= 2 rows of "new" content is the strip matching itself on a
+        // stationary page; appending it would duplicate the seam.
+        if new_rows <= 2 {
+            return true;
+        }
+        if !state
+            .stitcher
+            .append(&px, w as usize, h as usize, align.offset_y)
+        {
+            state.maxed = true;
+            state.status = "已达最大高度".to_string();
+            cx.notify();
+            return false;
+        }
+        state.prev_gray = gray;
+        state.status = format!(
+            "已捕获 {} 段 · 共 {} px",
+            state.stitcher.segment_count(),
+            state.stitcher.total_height()
+        );
+        cx.notify();
+        true
+    }
+
+    /// 完成 on the bar: stitch whatever was captured and export it like a
+    /// finished shot, then close the overlay without another export.
+    fn finish_long_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.long.take() else {
+            return;
+        };
+        set_long_passthrough(window.win32_hwnd(), None);
+        self.phase = Phase::Active;
+        let (px, w, h) = state.stitcher.into_pixels();
+        crate::app::export_long_capture(px, w, h);
+        self.finish(empty_result(), window, cx);
+    }
+
+    /// 取消 / Esc / right-click: drop the session, back to the editor.
+    fn cancel_long_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.long.take().is_none() {
+            return;
+        }
+        set_long_passthrough(window.win32_hwnd(), None);
+        self.phase = Phase::Active;
+        cx.notify();
+    }
+
     fn run_ocr(&mut self, cx: &mut Context<Self>) {
         // Inference is ~130 ms; without this a double click queues two of them.
         if self.busy() {
@@ -1069,6 +1435,24 @@ impl OverlayView {
             });
         })
         .detach();
+    }
+
+    /// Pins the annotated crop to the screen and ends this capture: the pin
+    /// window holds the pixels, so no file or clipboard export runs.
+    fn pin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy() {
+            return;
+        }
+        let Some(result) = self.result_from_current() else {
+            return;
+        };
+        let Some((px, w, h, stride)) = self.selection_pixels(cx) else {
+            return;
+        };
+        let screen_x = self.origin_x + result.x as i32;
+        let screen_y = self.origin_y + result.y as i32;
+        crate::pin::show_pin(cx, px, w, h, stride, screen_x, screen_y);
+        self.finish(empty_result(), window, cx);
     }
 
     fn copy_panel(&mut self, cx: &mut Context<Self>) {
@@ -1206,6 +1590,8 @@ impl OverlayView {
         let tool_id = self.editor.tool.id();
         let can_undo = self.editor.history.can_undo();
         let can_redo = self.editor.history.can_redo();
+        let color_open = self.color_open;
+        let stroke = self.editor.stroke;
         let items = self.visible_items();
         Some(
             div()
@@ -1233,11 +1619,197 @@ impl OverlayView {
                     cx.stop_propagation();
                 })
                 .children(items.into_iter().map(|id| {
-                    let active = tool_id == id;
+                    let is_color = id == toolbar::COLOR;
+                    // The colour button tracks its popup, not the active tool.
+                    let active = if is_color { color_open } else { tool_id == id };
                     let dim =
                         (id == toolbar::UNDO && !can_undo) || (id == toolbar::REDO && !can_redo);
-                    toolbar_button(id, active, dim, cx)
+                    toolbar_button(id, active, dim, is_color.then_some(stroke), cx)
                 })),
+        )
+    }
+
+    /// The colour popup. Only `visible_items` knows where the COLOR button ended
+    /// up once the user hides tools, so the index comes from the same list the
+    /// bar is drawn and hit-tested from.
+    fn swatches_element(&self, scale: f32, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.color_open {
+            return None;
+        }
+        let index = self
+            .visible_items()
+            .iter()
+            .position(|id| *id == toolbar::COLOR)?;
+        // toolbar_geom is physical; the element tree is logical.
+        let s = scale.max(0.01) as f64;
+        let bar = self.toolbar_geom(scale)?;
+        let bar = Rect::new(bar.x / s, bar.y / s, bar.width / s, bar.height / s);
+        let mon = self.active_monitor_rect();
+        let mon = Rect::new(mon.x / s, mon.y / s, mon.width / s, mon.height / s);
+        let (w, h) = toolbar::swatches_size(theme::SWATCHES.len());
+        let pos = toolbar::place_swatches(
+            toolbar::item_center_x(bar, index),
+            bar,
+            w,
+            h,
+            mon,
+            toolbar::ANCHOR_GAP,
+        );
+        let current = self.editor.stroke;
+        Some(
+            div()
+                .absolute()
+                .left(px(pos.x as f32))
+                .top(px(pos.y as f32))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(toolbar::SWATCH_GAP as f32))
+                .p(px(toolbar::PAD as f32))
+                .rounded_xl()
+                .bg(theme::surface())
+                .border_1()
+                .border_color(theme::border())
+                .shadow(vec![BoxShadow {
+                    color: theme::base().opacity(0.12),
+                    offset: point(px(0.), px(4.)),
+                    blur_radius: px(16.),
+                    spread_radius: px(0.),
+                }])
+                .occlude()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .children(theme::SWATCHES.map(|(hex, rgb24)| {
+                    let argb = 0xFF00_0000 | rgb24;
+                    div()
+                        .id(SharedString::from(hex))
+                        .w(px(toolbar::SWATCH as f32))
+                        .h(px(toolbar::SWATCH as f32))
+                        .rounded_full()
+                        .bg(rgb(rgb24))
+                        .border_2()
+                        .border_color(if current == argb {
+                            theme::accent()
+                        } else {
+                            theme::border()
+                        })
+                        .cursor(CursorStyle::PointingHand)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.editor.stroke = argb;
+                                this.color_open = false;
+                                cx.notify();
+                            }),
+                        )
+                })),
+        )
+    }
+
+    /// The bar that replaces the toolbar mid-capture (the C# LongCaptureBar):
+    /// status text plus 完成/取消 chips, placed where the toolbar would sit.
+    /// It must stay outside the selection -- that area is click-through.
+    /// Where the long-capture bar lands, in capture coordinates: top-left plus
+    /// height. `est_w` only shifts x, so the passthrough hole can ask for the
+    /// band with a zero width and still get the y the bar will be drawn at.
+    fn long_bar_placement(&self, scale: f32, est_w: f64) -> (Point, f64) {
+        let s = scale.max(0.01) as f64;
+        let h = toolbar::H * s;
+        let pos = toolbar::place_toolbar(
+            self.selection,
+            est_w,
+            h,
+            self.active_monitor_rect(),
+            toolbar::ANCHOR_GAP * s,
+        );
+        (pos, h)
+    }
+
+    fn long_bar_element(&self, scale: f32, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if self.phase != Phase::LongCapturing {
+            return None;
+        }
+        let state = self.long.as_ref()?;
+        let s = scale.max(0.01) as f64;
+        // place_toolbar centers on the selection and clamps into the monitor;
+        // the width estimate only affects centering -- the bar sizes to
+        // content once laid out.
+        let est_w = (state.status.chars().count() as f64 * 13.0 + 2.0 * 64.0 + 48.0) * s;
+        let (pos, _) = self.long_bar_placement(scale, est_w);
+        let status: SharedString = state.status.clone().into();
+        Some(
+            div()
+                .absolute()
+                .left(px(pos.x as f32 / scale))
+                .top(px(pos.y as f32 / scale))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.))
+                .px(px(12.))
+                .py(px(6.))
+                .rounded_xl()
+                .bg(theme::surface())
+                .border_1()
+                .border_color(theme::border())
+                .shadow(vec![BoxShadow {
+                    color: theme::base().opacity(0.12),
+                    offset: point(px(0.), px(4.)),
+                    blur_radius: px(16.),
+                    spread_radius: px(0.),
+                }])
+                .occlude()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme::primary_fg())
+                        .child(status),
+                )
+                .child(
+                    div()
+                        .id("long-finish")
+                        .px(px(10.))
+                        .py(px(5.))
+                        .rounded_md()
+                        .text_size(px(12.))
+                        .text_color(white())
+                        .bg(theme::accent())
+                        .hover(|s| s.bg(theme::accent_hover()))
+                        .cursor(CursorStyle::PointingHand)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.finish_long_capture(window, cx);
+                            }),
+                        )
+                        .child("完成"),
+                )
+                .child(
+                    div()
+                        .id("long-cancel")
+                        .px(px(10.))
+                        .py(px(5.))
+                        .rounded_md()
+                        .text_size(px(12.))
+                        .text_color(theme::primary_fg())
+                        .bg(theme::active_background())
+                        .hover(|s| s.bg(theme::elevated_surface()))
+                        .cursor(CursorStyle::PointingHand)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.cancel_long_capture(window, cx);
+                            }),
+                        )
+                        .child("取消"),
+                ),
         )
     }
 
@@ -1480,6 +2052,8 @@ impl Render for OverlayView {
                 )
                 .child(coord_label(shown, mouse, phase, scale))
                 .children(self.toolbar_element(scale, cx))
+                .children(self.long_bar_element(scale, cx))
+                .children(self.swatches_element(scale, cx))
                 .children(self.panel_element(scale, cx))
                 .children(self.text_layer(scale))
             })
@@ -1505,10 +2079,13 @@ impl Render for ToolLabel {
     }
 }
 
+/// `swatch` is `Some` only for COLOR, which shows the current stroke colour
+/// instead of an icon.
 fn toolbar_button(
     id: &'static str,
     active: bool,
     dim: bool,
+    swatch: Option<u32>,
     cx: &mut Context<OverlayView>,
 ) -> impl IntoElement {
     let fg = if dim {
@@ -1544,13 +2121,22 @@ fn toolbar_button(
             CursorStyle::PointingHand
         })
         .when(!dim, |el| el.hover(move |s| s.bg(hover_bg)))
-        .child(
-            svg()
+        .child(match swatch {
+            Some(argb) => div()
+                .w(px(toolbar::ICON))
+                .h(px(toolbar::ICON))
+                .rounded_full()
+                .bg(rgb(argb & 0xFF_FFFF))
+                .border_1()
+                .border_color(theme::border())
+                .into_any_element(),
+            None => svg()
                 .path(toolbar::icon_path(id).unwrap_or(""))
                 .w(px(toolbar::ICON))
                 .h(px(toolbar::ICON))
-                .text_color(fg),
-        )
+                .text_color(fg)
+                .into_any_element(),
+        })
         .tooltip(move |_, cx| {
             let view: AnyView = cx.new(|_| ToolLabel(toolbar::label(id).into())).into();
             view
@@ -1906,47 +2492,60 @@ fn detect_windows(self_hwnd: HWND, ox: i32, oy: i32) -> Vec<Rect> {
     ctx.rects
 }
 
+/// Frame bounds of a window a user could actually be looking at: visible, not
+/// minimised, not a cloaked ghost (suspended UWP frames stay "visible" and
+/// full-screen), not a passive tool window, not a sliver. Both the snap
+/// detection and the long-capture focus hand-off need exactly this set.
+fn real_window_rect(hwnd: HWND) -> Option<RECT> {
+    unsafe {
+        if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+            return None;
+        }
+        let mut cloaked: i32 = 0;
+        let _ = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked as *mut _ as *mut _, 4);
+        if cloaked != 0 {
+            return None;
+        }
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        if ex & WS_EX_TOOLWINDOW.0 != 0 && ex & WS_EX_NOACTIVATE.0 != 0 {
+            return None;
+        }
+        let mut wr = RECT::default();
+        if DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut wr as *mut _ as *mut _,
+            std::mem::size_of::<RECT>() as u32,
+        )
+        .is_err()
+            && GetWindowRect(hwnd, &mut wr).is_err()
+        {
+            return None;
+        }
+        if wr.right - wr.left <= 5 || wr.bottom - wr.top <= 5 {
+            return None;
+        }
+        Some(wr)
+    }
+}
+
 unsafe extern "system" fn enum_win(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
-    let ctx = &mut *(lparam.0 as *mut WinCtx);
-    if hwnd == ctx.self_hwnd {
-        return windows::core::BOOL(1);
+    unsafe {
+        let ctx = &mut *(lparam.0 as *mut WinCtx);
+        if hwnd == ctx.self_hwnd {
+            return windows::core::BOOL(1);
+        }
+        let Some(wr) = real_window_rect(hwnd) else {
+            return windows::core::BOOL(1);
+        };
+        ctx.rects.push(Rect::new(
+            (wr.left - ctx.ox) as f64,
+            (wr.top - ctx.oy) as f64,
+            (wr.right - wr.left) as f64,
+            (wr.bottom - wr.top) as f64,
+        ));
+        windows::core::BOOL(1)
     }
-    if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
-        return windows::core::BOOL(1);
-    }
-    let mut cloaked: i32 = 0;
-    let _ = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked as *mut _ as *mut _, 4);
-    if cloaked != 0 {
-        return windows::core::BOOL(1);
-    }
-    let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-    if ex & WS_EX_TOOLWINDOW.0 != 0 && ex & WS_EX_NOACTIVATE.0 != 0 {
-        return windows::core::BOOL(1);
-    }
-    let mut wr = RECT::default();
-    if DwmGetWindowAttribute(
-        hwnd,
-        DWMWA_EXTENDED_FRAME_BOUNDS,
-        &mut wr as *mut _ as *mut _,
-        std::mem::size_of::<RECT>() as u32,
-    )
-    .is_err()
-        && GetWindowRect(hwnd, &mut wr).is_err()
-    {
-        return windows::core::BOOL(1);
-    }
-    let w = wr.right - wr.left;
-    let h = wr.bottom - wr.top;
-    if w <= 5 || h <= 5 {
-        return windows::core::BOOL(1);
-    }
-    ctx.rects.push(Rect::new(
-        (wr.left - ctx.ox) as f64,
-        (wr.top - ctx.oy) as f64,
-        w as f64,
-        h as f64,
-    ));
-    windows::core::BOOL(1)
 }
 
 struct WinCtx {
@@ -1997,6 +2596,32 @@ mod tests {
     /// The dash phase must stay in [0, period) for every elapsed value, including
     /// large ones: `offset` is negative and grows without bound, so a single `%`
     /// would hand a negative leading gap to PathBuilder.
+    #[test]
+    fn hole_gives_up_the_band_under_the_bar() {
+        let hole = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        // Bar below the selection: the hole is untouched.
+        assert_eq!(hole_clear_of_bar(hole, 1088, 1132).top, 0);
+        assert_eq!(hole_clear_of_bar(hole, 1088, 1132).bottom, 1080);
+        // Full-screen selection clamps the bar to the top edge, inside the hole.
+        assert_eq!(hole_clear_of_bar(hole, 0, 44).top, 44);
+        // Same at the bottom edge.
+        assert_eq!(hole_clear_of_bar(hole, 1036, 1080).bottom, 1036);
+        // A selection shorter than the bar cannot end up with an inverted hole.
+        let tiny = RECT {
+            left: 0,
+            top: 100,
+            right: 200,
+            bottom: 120,
+        };
+        let cut = hole_clear_of_bar(tiny, 90, 134);
+        assert!(cut.top <= cut.bottom, "{cut:?}");
+    }
+
     #[test]
     fn ants_dash_phase_is_never_negative() {
         for ms in 0..2000 {

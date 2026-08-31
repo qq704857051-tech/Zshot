@@ -18,6 +18,7 @@ pub const CLEAR: &str = "clear";
 pub const OCR: &str = "ocr";
 pub const TRANSLATE: &str = "translate";
 pub const LONG_CAPTURE: &str = "longCapture";
+pub const PIN: &str = "pin";
 pub const SAVE: &str = "save";
 pub const COMPLETE: &str = "complete";
 pub const CANCEL: &str = "cancel";
@@ -40,6 +41,7 @@ pub const CUSTOMIZABLE: &[&str] = &[
     OCR,
     TRANSLATE,
     LONG_CAPTURE,
+    PIN,
     SAVE,
 ];
 
@@ -47,7 +49,22 @@ pub const CUSTOMIZABLE: &[&str] = &[
 pub const DEFAULT_HIDDEN: &[&str] = &[ELLIPSE, TEXT, NUMBER, REDO];
 
 pub const PHASE1_ITEMS: &[&str] = &[
-    SELECT, RECT, ARROW, PEN, MOSAIC, TEXT, UNDO, REDO, CLEAR, OCR, TRANSLATE, SAVE, COMPLETE,
+    SELECT,
+    RECT,
+    ARROW,
+    PEN,
+    MOSAIC,
+    TEXT,
+    COLOR,
+    UNDO,
+    REDO,
+    CLEAR,
+    OCR,
+    TRANSLATE,
+    LONG_CAPTURE,
+    PIN,
+    SAVE,
+    COMPLETE,
     CANCEL,
 ];
 
@@ -57,6 +74,43 @@ pub const PAD: f64 = 4.0;
 pub const ITEM_GAP: f64 = 2.0;
 pub const H: f64 = 44.0;
 pub const ANCHOR_GAP: f64 = 8.0;
+pub const SWATCH: f64 = 22.0;
+pub const SWATCH_GAP: f64 = 6.0;
+
+pub fn swatches_size(n: usize) -> (f64, f64) {
+    let n = n as f64;
+    (
+        PAD * 2.0 + n * SWATCH + (n - 1.0).max(0.0) * SWATCH_GAP,
+        SWATCH + PAD * 2.0,
+    )
+}
+
+/// Centre of button `index` on a bar drawn at `bar`.
+pub fn item_center_x(bar: Rect, index: usize) -> f64 {
+    bar.x + PAD + index as f64 * (BTN + ITEM_GAP) + BTN / 2.0
+}
+
+/// The colour popup hangs above the bar, centred on its button. It flips below
+/// only when there is no room above -- which happens when the selection fills
+/// the monitor and `place_toolbar` has already clamped the bar to the top edge.
+pub fn place_swatches(
+    button_center_x: f64,
+    bar: Rect,
+    popup_width: f64,
+    popup_height: f64,
+    monitor: Rect,
+    gap: f64,
+) -> Point {
+    let max_x = (monitor.x + monitor.width - popup_width).max(monitor.x);
+    let x = (button_center_x - popup_width / 2.0).clamp(monitor.x, max_x);
+    let above = bar.y - gap - popup_height;
+    let y = if above >= monitor.y {
+        above
+    } else {
+        bar.y + bar.height + gap
+    };
+    Point { x, y }
+}
 
 pub fn bar_size(n: usize) -> (f64, f64) {
     let n = n as f64;
@@ -77,6 +131,8 @@ pub fn icon_path(id: &str) -> Option<&'static str> {
         CLEAR => "toolbar/clear.svg",
         OCR => "toolbar/ocr.svg",
         TRANSLATE => "toolbar/translate.svg",
+        LONG_CAPTURE => "toolbar/longCapture.svg",
+        PIN => "toolbar/pin.svg",
         SAVE => "toolbar/save.svg",
         COMPLETE => "toolbar/complete.svg",
         CANCEL => "toolbar/cancel.svg",
@@ -94,11 +150,14 @@ pub fn label(id: &str) -> &'static str {
         PEN => "画笔",
         MOSAIC => "马赛克",
         TEXT => "文字",
+        COLOR => "颜色",
         UNDO => "撤销",
         REDO => "重做",
         CLEAR => "清空",
         OCR => "取字",
         TRANSLATE => "翻译",
+        LONG_CAPTURE => "长截图",
+        PIN => "钉住",
         SAVE => "保存",
         COMPLETE => "完成",
         CANCEL => "取消",
@@ -460,11 +519,46 @@ mod tests {
         assert_eq!(bar_size(0), (8.0, 44.0));
     }
 
+    /// COLOR is the one button painted from state instead of an asset -- it
+    /// shows the current stroke colour -- so it is the only one without an svg.
     #[test]
-    fn every_phase1_item_has_an_icon() {
+    fn every_phase1_item_has_an_icon_except_the_colour_swatch() {
         for id in PHASE1_ITEMS {
-            assert!(icon_path(id).is_some(), "{id}");
+            assert_eq!(icon_path(id).is_some(), *id != COLOR, "{id}");
         }
+    }
+
+    #[test]
+    fn swatches_hang_above_the_bar_centred_on_their_button() {
+        let mon = Rect::new(0.0, 0.0, 1920.0, 1080.0);
+        let bar = Rect::new(500.0, 600.0, bar_size(15).0, H);
+        let (w, h) = swatches_size(8);
+        let cx = item_center_x(bar, 6);
+        let p = place_swatches(cx, bar, w, h, mon, ANCHOR_GAP);
+        assert_eq!(p.x, cx - w / 2.0);
+        assert_eq!(p.y, bar.y - ANCHOR_GAP - h);
+    }
+
+    /// Selection filling the monitor clamps the bar to the top edge, and a popup
+    /// above it would be off screen.
+    #[test]
+    fn swatches_flip_below_when_there_is_no_room_above() {
+        let mon = Rect::new(0.0, 0.0, 1920.0, 1080.0);
+        let bar = Rect::new(500.0, 0.0, bar_size(15).0, H);
+        let (w, h) = swatches_size(8);
+        let p = place_swatches(item_center_x(bar, 6), bar, w, h, mon, ANCHOR_GAP);
+        assert_eq!(p.y, bar.y + bar.height + ANCHOR_GAP);
+    }
+
+    #[test]
+    fn swatches_stay_inside_the_monitor_horizontally() {
+        let mon = Rect::new(0.0, 0.0, 1920.0, 1080.0);
+        let bar = Rect::new(1800.0, 600.0, bar_size(15).0, H);
+        let (w, h) = swatches_size(8);
+        let right = place_swatches(1915.0, bar, w, h, mon, ANCHOR_GAP);
+        assert_eq!(right.x, mon.width - w);
+        let left = place_swatches(5.0, bar, w, h, mon, ANCHOR_GAP);
+        assert_eq!(left.x, mon.x);
     }
 
     #[test]

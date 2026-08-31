@@ -233,7 +233,8 @@ pub struct Session {
     /// Defaults for new elements, snapshotted from settings when the session
     /// starts so a mid-capture settings edit cannot change the tool under the
     /// user's hand.
-    stroke: u32,
+    /// The colour popup writes this mid-session; the settings value only seeds it.
+    pub stroke: u32,
     stroke_width: f64,
     mosaic_block: i32,
 }

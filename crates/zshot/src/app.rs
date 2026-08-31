@@ -131,6 +131,48 @@ pub(crate) fn crop_from_app(
     }
 }
 
+/// Long-capture poll tick: a fresh capture cropped to the polling region.
+/// `abs_x`/`abs_y` are absolute screen coordinates (the overlay's origin plus
+/// the selection), so the crop survives whichever origin the fresh capture
+/// ends up with -- a single-monitor fallback shifts it.
+///
+/// The returned buffer is repacked to a tight `width * 4` stride: the
+/// stitcher and the grayscale aligner both index rows directly.
+pub(crate) fn capture_region_bgra(
+    cx: &mut App,
+    abs_x: i32,
+    abs_y: i32,
+    w: u32,
+    h: u32,
+) -> Result<(Vec<u8>, u32, u32, u32)> {
+    let mut perf = PerfSession::start();
+    let cap = capture_from_app(cx, true, &mut perf)?;
+    let x = abs_x - cap.origin_x;
+    let y = abs_y - cap.origin_y;
+    if x < 0 || y < 0 {
+        return Err(Error::new("long-capture region outside the fresh capture"));
+    }
+    let (px, cw, ch, stride) = crop_from_app(cx, &cap, x as u32, y as u32, w, h)?;
+    if stride == cw * 4 {
+        return Ok((px, cw, ch, stride));
+    }
+    let tight = (cw * 4) as usize;
+    let mut packed = Vec::with_capacity(tight * ch as usize);
+    for row in 0..ch as usize {
+        let start = row * stride as usize;
+        packed.extend_from_slice(&px[start..start + tight]);
+    }
+    Ok((packed, cw, ch, cw * 4))
+}
+
+/// The stitched long screenshot exports like a finished capture: PNG file
+/// plus clipboard, so both the 保存 and 完成 habits keep working.
+pub(crate) fn export_long_capture(px: Vec<u8>, w: u32, h: u32) {
+    if let Err(e) = export_pixels(px, w, h, w * 4, true, true) {
+        crate::perf::log_app(&format!("long-capture export failed: {e}"));
+    }
+}
+
 /// Release builds are Windows-subsystem, so a shell-launched process starts with
 /// no standard handles and every `println!` goes nowhere. The CLI subcommands
 /// document their output, so borrow the parent's console before producing any.
