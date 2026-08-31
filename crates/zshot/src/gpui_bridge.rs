@@ -80,24 +80,26 @@ unsafe fn create_composition_swapchain(
     width: u32,
     height: u32,
 ) -> Result<IDXGISwapChain1> {
-    let dxgi_device: IDXGIDevice = device.cast()?;
-    let adapter = dxgi_device.GetAdapter()?;
-    let factory: IDXGIFactory2 = adapter.GetParent()?;
-    let desc = DXGI_SWAP_CHAIN_DESC1 {
-        Width: width,
-        Height: height,
-        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-        Stereo: false.into(),
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-        BufferCount: 2,
-        Scaling: DXGI_SCALING_STRETCH,
-        SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-        AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
-        Flags: 0,
-    };
-    Ok(factory.CreateSwapChainForComposition(device, &desc, None)?)
+    unsafe {
+        let dxgi_device: IDXGIDevice = device.cast()?;
+        let adapter = dxgi_device.GetAdapter()?;
+        let factory: IDXGIFactory2 = adapter.GetParent()?;
+        let desc = DXGI_SWAP_CHAIN_DESC1 {
+            Width: width,
+            Height: height,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            Stereo: false.into(),
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            BufferCount: 2,
+            Scaling: DXGI_SCALING_STRETCH,
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+            AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
+            Flags: 0,
+        };
+        Ok(factory.CreateSwapChainForComposition(device, &desc, None)?)
+    }
 }

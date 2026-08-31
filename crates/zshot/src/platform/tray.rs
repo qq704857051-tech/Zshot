@@ -43,6 +43,9 @@ pub fn taskbar_created_message() -> u32 {
 }
 
 /// Embedded by `build.rs` as resource 1 (`winres` `set_icon`).
+// MAKEINTRESOURCEW(1) puts the resource id in the pointer slot by design; it
+// is not a dereferenceable address, which is exactly what the lint assumes.
+#[allow(clippy::manual_dangling_ptr)]
 pub fn load_app_icon() -> Result<HICON> {
     unsafe {
         let module = GetModuleHandleW(None)?;

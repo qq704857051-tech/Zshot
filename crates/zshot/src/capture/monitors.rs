@@ -239,11 +239,13 @@ unsafe extern "system" fn enum_proc(
     lprect: *mut RECT,
     lparam: LPARAM,
 ) -> BOOL {
-    let list = &mut *(lparam.0 as *mut Vec<(HMONITOR, RECT)>);
-    if !lprect.is_null() {
-        list.push((monitor, *lprect));
+    unsafe {
+        let list = &mut *(lparam.0 as *mut Vec<(HMONITOR, RECT)>);
+        if !lprect.is_null() {
+            list.push((monitor, *lprect));
+        }
+        BOOL(1)
     }
-    BOOL(1)
 }
 
 pub fn foreground_covers_monitor(mon: &MonitorInfo) -> bool {

@@ -263,10 +263,12 @@ fn post_json(url: &str, api_key: &str, body: &str, timeout_seconds: u32) -> Resu
 }
 
 unsafe fn slice_of(p: PWSTR, len: u32) -> Vec<u16> {
-    if p.is_null() || len == 0 {
-        return Vec::new();
+    unsafe {
+        if p.is_null() || len == 0 {
+            return Vec::new();
+        }
+        std::slice::from_raw_parts(p.0, len as usize).to_vec()
     }
-    std::slice::from_raw_parts(p.0, len as usize).to_vec()
 }
 
 fn nul_terminated(s: &str) -> Vec<u16> {
