@@ -70,6 +70,9 @@ pub const PHASE1_ITEMS: &[&str] = &[
 
 pub const BTN: f64 = 36.0;
 pub const ICON: f32 = 20.0;
+/// The colour button's swatch is smaller than the svg icons so it doesn't
+/// look oversized next to them.
+pub const SWATCH_ICON: f32 = 16.0;
 pub const PAD: f64 = 4.0;
 pub const ITEM_GAP: f64 = 2.0;
 pub const H: f64 = 44.0;

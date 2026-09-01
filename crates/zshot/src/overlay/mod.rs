@@ -2123,8 +2123,8 @@ fn toolbar_button(
         .when(!dim, |el| el.hover(move |s| s.bg(hover_bg)))
         .child(match swatch {
             Some(argb) => div()
-                .w(px(toolbar::ICON))
-                .h(px(toolbar::ICON))
+                .w(px(toolbar::SWATCH_ICON))
+                .h(px(toolbar::SWATCH_ICON))
                 .rounded_full()
                 .bg(rgb(argb & 0xFF_FFFF))
                 .border_1()
