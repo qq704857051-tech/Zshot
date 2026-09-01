@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     ffi::OsStr,
     mem::ManuallyDrop,
     path::{Path, PathBuf},
@@ -52,6 +52,10 @@ struct WindowsPlatformInner {
     validation_number: usize,
     main_receiver: flume::Receiver<Runnable>,
     gpu_generation: Arc<AtomicU64>,
+    /// Closing the last window posts WM_QUIT by default (upstream behavior).
+    /// Tray-resident apps set this to false so a closing window never exits
+    /// the process; they quit through their own explicit path instead.
+    quit_on_last_window_close: Cell<bool>,
 }
 
 pub(crate) struct WindowsPlatformState {
@@ -686,6 +690,10 @@ impl Platform for WindowsPlatform {
         self.inner.state.borrow_mut().callbacks.gpu_reset_begin = Some(callback);
     }
 
+    fn set_quit_on_last_window_close(&self, quit: bool) {
+        self.inner.quit_on_last_window_close.set(quit);
+    }
+
     fn perform_dock_menu_action(&self, action: usize) {
         unsafe {
             PostMessageW(
@@ -718,6 +726,7 @@ impl WindowsPlatformInner {
             validation_number: context.validation_number,
             main_receiver: context.main_receiver.take().unwrap(),
             gpu_generation: Arc::new(AtomicU64::new(0)),
+            quit_on_last_window_close: Cell::new(true),
         }))
     }
 
@@ -751,7 +760,9 @@ impl WindowsPlatformInner {
         }
         match message {
             WM_GPUI_CLOSE_ONE_WINDOW => {
-                if self.close_one_window(HWND(lparam.0 as _)) {
+                if self.close_one_window(HWND(lparam.0 as _))
+                    && self.quit_on_last_window_close.get()
+                {
                     unsafe { PostQuitMessage(0) };
                 }
                 Some(0)

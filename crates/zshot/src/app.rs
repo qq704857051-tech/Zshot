@@ -586,6 +586,10 @@ fn boot_resident(
     cleanup_hwnd: std::rc::Rc<std::cell::RefCell<Option<HWND>>>,
 ) -> Result<()> {
     install_gpu_lifecycle(cx);
+    // Tray-resident: closing the settings window (possibly the only window)
+    // must not quit the process. Upstream gpui posts WM_QUIT when the last
+    // window closes; the tray Exit menu is this app's only quit path.
+    cx.set_quit_on_last_window_close(false);
     let hwnd = create_hidden_overlapped_window()?;
     *cleanup_hwnd.borrow_mut() = Some(hwnd);
 

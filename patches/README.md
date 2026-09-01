@@ -4,7 +4,7 @@
 through `[patch.crates-io]` in the workspace `Cargo.toml`. The vendored tree is
 3.3 MB, but the actual delta is small — keep it that way.
 
-`gpui-0.2.2-zshot-overlay.patch` is that delta: **302 added lines, 17 removed,
+`gpui-0.2.2-zshot-overlay.patch` is that delta: **327 added lines, 19 removed,
 across 8 source files**. Everything else in `third_party/gpui` is pristine
 upstream (with `examples/` and `UPSTREAM.md` excluded from the diff).
 
@@ -12,10 +12,10 @@ upstream (with `examples/` and `UPSTREAM.md` excluded from the diff).
 
 | File | Change |
 | --- | --- |
-| `src/app.rs` | `App::gpu_generation`, `adapter_luid`, `with_gpu_context`, `on_gpu_reset_begin` |
-| `src/platform.rs` | The same four on the `Platform` trait, plus `set_background_swap_chain`, `wait_for_commit_completion`, `on_app_ready_sentinel` |
+| `src/app.rs` | `App::gpu_generation`, `adapter_luid`, `with_gpu_context`, `on_gpu_reset_begin`, `set_quit_on_last_window_close` |
+| `src/platform.rs` | The same four on the `Platform` trait, plus `set_background_swap_chain`, `wait_for_commit_completion`, `on_app_ready_sentinel`, `set_quit_on_last_window_close` |
 | `src/window.rs` | `Window::set_background_swap_chain`, `win32_hwnd`, `wait_for_commit_completion`, `on_app_ready_sentinel` |
-| `src/platform/windows/platform.rs` | Windows implementations of the trait additions |
+| `src/platform/windows/platform.rs` | Windows implementations of the trait additions; the last-window-close `PostQuitMessage` is gated on `quit_on_last_window_close` (default on, upstream behavior) |
 | `src/platform/windows/window.rs` | `WindowOptions.topmost` → `WS_EX_TOPMOST` at creation |
 | `src/platform/windows/directx_devices.rs` | `adapter_luid()` on the device set |
 | `src/platform/windows/directx_renderer.rs` | Second DirectComposition visual + `set_freeze_swap_chain` |

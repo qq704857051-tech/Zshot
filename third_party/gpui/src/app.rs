@@ -1189,6 +1189,14 @@ impl App {
         self.platform.on_gpu_reset_begin(Box::new(callback));
     }
 
+    /// Sets whether closing the last window quits the application.
+    ///
+    /// Upstream Windows behavior quits; tray-resident apps opt out and quit
+    /// through their own explicit path (e.g. a tray menu Exit item).
+    pub fn set_quit_on_last_window_close(&self, quit: bool) {
+        self.platform.set_quit_on_last_window_close(quit);
+    }
+
     /// Restarts the application.
     pub fn restart(&mut self) {
         self.restart_observers

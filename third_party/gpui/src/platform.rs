@@ -297,6 +297,10 @@ pub(crate) trait Platform: 'static {
 
     #[cfg(target_os = "windows")]
     fn on_gpu_reset_begin(&self, _callback: Box<dyn FnMut()>) {}
+
+    /// Windows quits the app when the last window closes; tray-resident apps
+    /// opt out so a closing window never kills the process.
+    fn set_quit_on_last_window_close(&self, _quit: bool) {}
 }
 
 /// A handle to a platform's display, e.g. a monitor or laptop screen.
