@@ -182,7 +182,20 @@ fn attach_parent_console() {
     }
 }
 
+/// Release builds are windows-subsystem with `panic = "abort"`: without this
+/// hook a panic dies silently and the tray icon just vanishes. The message and
+/// location land in crash.log so field reports have something to attach.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let name = std::thread::current().name().unwrap_or("<unnamed>").to_string();
+        let msg = format!("panic on thread {name}: {info}");
+        crate::perf::log_crash(&msg);
+        eprintln!("{msg}");
+    }));
+}
+
 pub fn run() -> Result<()> {
+    install_panic_hook();
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 {
         attach_parent_console();
@@ -734,12 +747,17 @@ enum ShotFlow {
 fn take_shot(action: HotkeyAction) -> Result<ShotFlow> {
     let mut perf = PerfSession::start();
     perf.mark("T2");
+    // Crash breadcrumbs: if the process dies mid-capture, app.log shows how far it got.
+    crate::perf::log_app(&format!("capture start: {action:?}"));
     // Copy-only freezes the desktop like a region capture; the overlay then
     // confirms the drag straight to the clipboard. Only fullscreen skips the
     // overlay.
     let region = !matches!(action, HotkeyAction::Fullscreen);
     let cap = match with_gpui_app(|cx| capture_from_app(cx, region, &mut perf)) {
-        Some(Ok(c)) => c,
+        Some(Ok(c)) => {
+            crate::perf::log_app(&format!("capture ok: {}x{} hdr={} dxgi_dup={}", c.width, c.height, c.hdr, c.used_dxgi_dup));
+            c
+        }
         Some(Err(e)) => {
             crate::perf::log_app(&format!("capture failed: {e}"));
             return Err(e);
@@ -752,7 +770,10 @@ fn take_shot(action: HotkeyAction) -> Result<ShotFlow> {
             // Capture is done; do not hold App across overlay interaction.
             let copy_only = matches!(action, HotkeyAction::CopyOnly);
             match with_gpui_app(|cx| show_overlay(cx, cap, &mut perf, copy_only)) {
-                Some(_) => Ok(ShotFlow::OverlayOpen),
+                Some(_) => {
+                    crate::perf::log_app("overlay open");
+                    Ok(ShotFlow::OverlayOpen)
+                }
                 None => Err(Error::new("GPUI app unavailable")),
             }
         }

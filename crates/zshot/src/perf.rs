@@ -97,6 +97,16 @@ pub fn log_dir() -> Result<PathBuf> {
 /// is where operational failures (capture, export, clipboard) end up. Never
 /// fails loudly: a logging error must not break a screenshot.
 pub fn log_app(msg: &str) {
+    append_log("app.log", msg);
+}
+
+/// Append one line to `logs/crash.log`, the panic hook's target. Kept apart
+/// from app.log so a crash is greppable; same never-fail rule.
+pub fn log_crash(msg: &str) {
+    append_log("crash.log", msg);
+}
+
+fn append_log(file: &str, msg: &str) {
     let Ok(dir) = log_dir() else {
         return;
     };
@@ -106,13 +116,12 @@ pub fn log_app(msg: &str) {
     let Ok(mut f) = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(dir.join("app.log"))
+        .open(dir.join(file))
     else {
         return;
     };
     let _ = writeln!(f, "{} {msg}", now_stamp());
 }
-
 fn missing_localappdata() -> crate::error::Error {
     crate::error::Error::new("LOCALAPPDATA is not set")
 }
