@@ -35,14 +35,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WDA_EXCLUDEFROMCAPTURE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
-use crate::capture::{crop_sdr_bgra, enumerate_monitors, CapturedDesktop};
+use crate::capture::{crop_sdr_bgra, CapturedDesktop};
 use crate::error::Result;
 use crate::geom::{
     hit_test, move_rect, physical_source_rect, resize_rect, Point, Rect, SelectionHitKind,
 };
 use crate::gpui_bridge::present_freeze_from_texture;
 use crate::longcapture::{align_vertical, bgra_to_gray, Stitcher};
-use crate::overlay::composite::{element_mask, CoverageMask};
+use crate::overlay::composite::{element_mask, CoverageRun};
 use crate::overlay::editor::{Element, PressKind, Session, Shape, Tool};
 use crate::overlay::toolbar::PHASE1_ITEMS;
 use crate::perf::PerfSession;
@@ -107,14 +107,14 @@ fn empty_result() -> OverlayResult {
 /// how many path points -- extending a stroke inside its own bounds moves nothing else.
 type MosaicKey = Vec<(u64, Rect, i32, usize)>;
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct MosaicTiles {
     tiles: Vec<(Rect, u32)>,
     covered: Vec<u64>,
 }
 
-/// Cached coverage masks aligned 1:1 with the element list that produced them.
-type MarkMasks = (Vec<Element>, Vec<Option<Rc<CoverageMask>>>);
+/// Cached coverage runs aligned 1:1 with the element list that produced them.
+type MarkMasks = (Vec<Element>, Vec<Option<Rc<Vec<CoverageRun>>>>);
 
 struct TextDraft {
     pt: Point,
@@ -139,16 +139,26 @@ pub struct OverlayView {
     from_drag: bool,
     has_sel: bool,
     windows: Vec<Rect>,
+    /// Monitor bounds in capture-relative coordinates, captured once per
+    /// capture instead of enumerated every frame -- the overlay repaints at
+    /// 60fps for the marching ants, and `active_monitor_rect` is called
+    /// several times per frame.
+    monitor_rects: Vec<Rect>,
     hit: SelectionHitKind,
     sel_at_press: Rect,
     start: Instant,
     visible: bool,
     mag: Option<(Vec<u8>, u32, u32, u32)>,
+    /// Clamped (x, y) the last magnifier readback was taken at, so a mouse
+    /// move that lands on the same source pixel skips the GPU round trip.
+    mag_origin: Option<(u32, u32)>,
     editor: Session,
     text_edit: Option<TextDraft>,
     /// Last mosaic readback, keyed by the elements that produced it. The overlay
     /// repaints every frame; without this each mosaic costs a GPU readback per frame.
-    mosaic_cache: RefCell<Option<(MosaicKey, MosaicTiles)>>,
+    /// Shared via `Rc` so a cache hit does not clone a tiles Vec that can hold
+    /// thousands of entries.
+    mosaic_cache: RefCell<Option<(MosaicKey, Rc<MosaicTiles>)>>,
     /// Coverage masks for the annotation elements, keyed by the exact element list.
     /// The overlay repaints every frame for the marching ants; rasterizing the
     /// strokes again only happens when the annotations actually change.
@@ -440,11 +450,13 @@ impl OverlayView {
             from_drag: false,
             has_sel: false,
             windows: Vec::new(),
+            monitor_rects: Vec::new(),
             hit: SelectionHitKind::None,
             sel_at_press: Rect::new(0.0, 0.0, 0.0, 0.0),
             start: Instant::now(),
             visible: false,
             mag: None,
+            mag_origin: None,
             editor: Session::new(),
             text_edit: None,
             mosaic_cache: RefCell::new(None),
@@ -483,11 +495,13 @@ impl OverlayView {
             from_drag: false,
             has_sel: false,
             windows: Vec::new(),
+            monitor_rects: Vec::new(),
             hit: SelectionHitKind::None,
             sel_at_press: Rect::new(0.0, 0.0, 0.0, 0.0),
             start: Instant::now(),
             visible: true,
             mag: None,
+            mag_origin: None,
             editor: Session::new(),
             text_edit: None,
             mosaic_cache: RefCell::new(None),
@@ -526,6 +540,7 @@ impl OverlayView {
         self.start = Instant::now();
         self.visible = true;
         self.mag = None;
+        self.mag_origin = None;
         self.editor = Session::new();
         self.text_edit = None;
         self.mask_cache = RefCell::new(None);
@@ -547,6 +562,13 @@ impl OverlayView {
         self.origin_x = ox;
         self.origin_y = oy;
         self.freeze_size = (w, h);
+        self.monitor_rects = crate::capture::enumerate_monitors()
+            .map(|mons| {
+                mons.iter()
+                    .map(|m| Rect::new((m.x - ox) as f64, (m.y - oy) as f64, m.w as f64, m.h as f64))
+                    .collect()
+            })
+            .unwrap_or_default();
         let hwnd = window.win32_hwnd();
         self.windows = detect_windows(hwnd, ox, oy);
         let mut mouse = Point { x: 0.0, y: 0.0 };
@@ -777,9 +799,6 @@ impl OverlayView {
         }
         self.mouse = Self::pointer_to_capture(event.position, window.scale_factor());
         self.on_move();
-        if self.phase == Phase::Selecting {
-            self.refresh_magnifier_gpu(cx);
-        }
         cx.notify();
     }
 
@@ -1071,22 +1090,13 @@ impl OverlayView {
     }
 
     fn active_monitor_rect(&self) -> Rect {
-        let cx = self.origin_x as f64 + self.selection.x + self.selection.width / 2.0;
-        let cy = self.origin_y as f64 + self.selection.y + self.selection.height / 2.0;
-        if let Ok(mons) = enumerate_monitors() {
-            for m in mons {
-                if cx >= m.x as f64
-                    && cx < (m.x + m.w) as f64
-                    && cy >= m.y as f64
-                    && cy < (m.y + m.h) as f64
-                {
-                    return Rect::new(
-                        (m.x - self.origin_x) as f64,
-                        (m.y - self.origin_y) as f64,
-                        m.w as f64,
-                        m.h as f64,
-                    );
-                }
+        // Capture-relative, so compare against the selection's center in the
+        // same space (monitor rects are already shifted by origin_x/origin_y).
+        let cx = self.selection.x + self.selection.width / 2.0;
+        let cy = self.selection.y + self.selection.height / 2.0;
+        for m in &self.monitor_rects {
+            if cx >= m.x && cx < m.x + m.width && cy >= m.y && cy < m.y + m.height {
+                return *m;
             }
         }
         Rect::new(
@@ -1174,19 +1184,19 @@ impl OverlayView {
         }
     }
 
-    /// Per-element coverage masks, cached against the exact element list. Preview
+    /// Per-element coverage runs, cached against the exact element list. Preview
     /// and export rasterize from the same masks (`composite::element_mask`), so
     /// this cache is the only thing standing between the ants animation and
-    /// re-rasterizing every stroke at 60 fps.
-    fn mark_masks(&self, marks: &[Element]) -> Vec<Option<Rc<CoverageMask>>> {
+    /// re-rasterizing every stroke (and re-scanning it into runs) at 60 fps.
+    fn mark_masks(&self, marks: &[Element]) -> Vec<Option<Rc<Vec<CoverageRun>>>> {
         if let Some((key, masks)) = self.mask_cache.borrow().as_ref() {
             if key.as_slice() == marks {
                 return masks.clone();
             }
         }
-        let masks: Vec<Option<Rc<CoverageMask>>> = marks
+        let masks: Vec<Option<Rc<Vec<CoverageRun>>>> = marks
             .iter()
-            .map(|el| element_mask(el).map(Rc::new))
+            .map(|el| element_mask(el).map(|m| Rc::new(m.runs())))
             .collect();
         *self.mask_cache.borrow_mut() = Some((marks.to_vec(), masks.clone()));
         masks
@@ -1473,10 +1483,10 @@ impl OverlayView {
     /// missing from that list still needs a placeholder drawn for it.
     /// Pixelated tiles plus the ids of the elements that produced them; an element
     /// missing from that list still needs a placeholder drawn for it.
-    fn mosaic_tiles(&self, cx: &mut App) -> MosaicTiles {
+    fn mosaic_tiles(&self, cx: &mut App) -> Rc<MosaicTiles> {
         let mut out = MosaicTiles::default();
         let Some(cap) = self.cap.as_ref() else {
-            return out;
+            return Rc::new(out);
         };
         let key: MosaicKey = self
             .editor
@@ -1564,6 +1574,7 @@ impl OverlayView {
             }
             out.covered.push(el.id);
         }
+        let out = Rc::new(out);
         *self.mosaic_cache.borrow_mut() = Some((key, out.clone()));
         out
     }
@@ -1578,11 +1589,18 @@ impl OverlayView {
         let max_y = cap.height.saturating_sub(MAG_COUNT) as i32;
         let x = (self.mouse.x.floor() as i32 - half).clamp(0, max_x) as u32;
         let y = (self.mouse.y.floor() as i32 - half).clamp(0, max_y) as u32;
+        // A staging texture + CopySubresourceRegion + Map is a GPU sync; skip it
+        // when the cursor has not moved to a new source pixel since the last
+        // readback (high-polling mice fire hundreds of moves per painted frame).
+        if self.mag_origin == Some((x, y)) && self.mag.is_some() {
+            return;
+        }
         self.mag = cx
             .with_gpu_context(|_device, ctx| {
                 crate::capture::crop_sdr_bgra(cap, ctx, x, y, MAG_COUNT, MAG_COUNT)
             })
             .and_then(|r| r.ok());
+        self.mag_origin = if self.mag.is_some() { Some((x, y)) } else { None };
     }
 
     fn toolbar_element(&self, scale: f32, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -1984,6 +2002,12 @@ impl Render for OverlayView {
         if self.visible {
             window.request_animation_frame();
         }
+        // One magnifier readback per painted frame, not one per WM_MOUSEMOVE:
+        // `refresh_magnifier_gpu` also short-circuits when the cursor has not
+        // moved to a new source pixel since the last readback.
+        if self.visible && self.phase == Phase::Selecting {
+            self.refresh_magnifier_gpu(cx);
+        }
         let scale = window.scale_factor().max(0.01);
         let shown = self.current_rect();
         let mouse = self.mouse;
@@ -2213,8 +2237,8 @@ struct OverlayPaint {
     has_sel: bool,
     scale: f32,
     marks: Vec<Element>,
-    masks: Vec<Option<Rc<CoverageMask>>>,
-    mosaic: MosaicTiles,
+    masks: Vec<Option<Rc<Vec<CoverageRun>>>>,
+    mosaic: Rc<MosaicTiles>,
 }
 
 fn paint_overlay(window: &mut Window, bounds: Bounds<Pixels>, paint: OverlayPaint) {
@@ -2266,7 +2290,7 @@ fn paint_overlay(window: &mut Window, bounds: Bounds<Pixels>, paint: OverlayPain
 fn paint_marks(
     window: &mut Window,
     marks: &[Element],
-    masks: &[Option<Rc<CoverageMask>>],
+    masks: &[Option<Rc<Vec<CoverageRun>>>],
     mosaic: &MosaicTiles,
     scale: f32,
 ) {
@@ -2286,8 +2310,8 @@ fn paint_marks(
             // Text is a GPUI div in the overlay tree; CPU composite handles export.
             Shape::Text { .. } => {}
             _ => {
-                if let Some(mask) = mask {
-                    paint_mask(window, mask, scale, rgb(el.stroke & 0x00FF_FFFF));
+                if let Some(runs) = mask {
+                    paint_mask(window, runs, scale, rgb(el.stroke & 0x00FF_FFFF));
                 }
             }
         }
@@ -2306,8 +2330,8 @@ fn paint_marks(
 /// filled quads take a hard-edged fast path in the DirectX shader). Runs are
 /// disjoint, so overlapping segments never double-blend -- the mask already
 /// resolved them with max.
-fn paint_mask(window: &mut Window, mask: &CoverageMask, scale: f32, color: gpui::Rgba) {
-    for run in mask.runs() {
+fn paint_mask(window: &mut Window, runs: &[CoverageRun], scale: f32, color: gpui::Rgba) {
+    for run in runs {
         let mut c = color;
         c.a *= run.alpha as f32 / 255.0;
         window.paint_quad(fill(
