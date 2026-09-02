@@ -1,3 +1,5 @@
 /target
 **/*.pdb
 .superpowers/
+/dist
+/installer/Output
