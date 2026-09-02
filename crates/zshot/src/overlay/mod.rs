@@ -3,6 +3,7 @@
 mod assets;
 pub(crate) mod composite;
 pub(crate) mod editor;
+pub(crate) mod text_raster;
 pub(crate) mod theme;
 pub(crate) mod toolbar;
 
@@ -2028,6 +2029,7 @@ impl OverlayView {
                         .absolute()
                         .left(px((el.bounds.x - sel.x) as f32 / scale))
                         .top(px((el.bounds.y - sel.y) as f32 / scale))
+                        .font_family(text_raster::FONT_FAMILY)
                         .text_color(rgb(el.stroke & 0x00FF_FFFF))
                         .text_size(px(*font_size as f32 / scale))
                         .child(text.clone()),
@@ -2050,6 +2052,7 @@ impl OverlayView {
                 .bg(white())
                 .text_color(black())
                 .text_sm()
+                .font_family(text_raster::FONT_FAMILY)
                 .occlude()
                 .child(shown)
         });

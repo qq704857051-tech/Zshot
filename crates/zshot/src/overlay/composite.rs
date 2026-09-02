@@ -4,6 +4,7 @@
 
 use crate::geom::{Point, Rect};
 use crate::overlay::editor::{Element, Shape};
+use crate::overlay::text_raster;
 
 struct Bgra<'a> {
     pixels: &'a mut [u8],
@@ -55,7 +56,7 @@ fn draw_element(buf: &mut Bgra<'_>, el: &Element) {
     match &el.shape {
         Shape::Mosaic { points, block_size } => draw_mosaic(buf, points, *block_size),
         Shape::Text { text, font_size } => {
-            draw_text(buf, el.bounds, text, *font_size, color);
+            draw_text(buf, el.bounds, text, *font_size, el.stroke);
         }
         // Rect, Arrow and Pen all rasterize through the shared coverage mask, so
         // what the overlay preview shows is what this export writes.
@@ -409,53 +410,48 @@ fn draw_mosaic(buf: &mut Bgra<'_>, points: &[Point], block_size: i32) {
     }
 }
 
-fn draw_text(buf: &mut Bgra<'_>, bounds: Rect, text: &str, font_size: f64, c: [u8; 4]) {
-    let cell_h = font_size.max(8.0);
-    let cell_w = (cell_h * 0.6).max(4.0);
-    let mut x = bounds.x;
-    let y = bounds.y;
-    for ch in text.chars() {
-        stamp_glyph(buf, x, y, cell_w, cell_h, ch, c);
-        x += cell_w;
-        if x > bounds.x + bounds.width {
-            break;
+/// Rasterizes `text` through DirectWrite/Direct2D (the same face as the overlay
+/// preview) and composites the premultiplied result at `bounds`'s origin. The
+/// raster's own size defines the extent -- unlike the old placeholder there is
+/// no `bounds.width` clamp, matching the preview, which does not clip either.
+fn draw_text(buf: &mut Bgra<'_>, bounds: Rect, text: &str, font_size: f64, argb: u32) {
+    let (px_data, w, h) = match text_raster::rasterize(text, font_size, argb) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::perf::log_app(&format!("text raster failed: {e}"));
+            return;
         }
-    }
-}
-
-/// 5×7 bitmap font (ASCII); other glyphs get a filled block so CJK still marks the crop.
-fn stamp_glyph(buf: &mut Bgra<'_>, x: f64, y: f64, cell_w: f64, cell_h: f64, ch: char, c: [u8; 4]) {
-    let bits = glyph_bits(ch);
-    let sx = cell_w / 5.0;
-    let sy = cell_h / 7.0;
-    for (row, row_bits) in bits.iter().enumerate() {
-        for col in 0..5 {
-            if *row_bits & (1 << (4 - col)) != 0 {
-                let px0 = (x + col as f64 * sx).floor() as i32;
-                let py0 = (y + row as f64 * sy).floor() as i32;
-                let px1 = (x + (col + 1) as f64 * sx).ceil() as i32;
-                let py1 = (y + (row + 1) as f64 * sy).ceil() as i32;
-                for py in py0..py1 {
-                    for px in px0..px1 {
-                        buf.put(px, py, c);
-                    }
-                }
+    };
+    let x0 = bounds.x.floor() as i32;
+    let y0 = bounds.y.floor() as i32;
+    let stride = (w * 4) as usize;
+    for row in 0..h as usize {
+        for col in 0..w as usize {
+            let i = row * stride + col * 4;
+            let src = [
+                px_data[i],
+                px_data[i + 1],
+                px_data[i + 2],
+                px_data[i + 3],
+            ];
+            if src[3] == 0 {
+                continue;
             }
-        }
-    }
-}
-
-fn glyph_bits(ch: char) -> [u8; 7] {
-    match ch {
-        'A' | 'a' => [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
-        'H' | 'h' => [0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
-        'I' | 'i' => [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1F],
-        _ => {
-            if ch.is_ascii_alphanumeric() || ch.is_ascii_punctuation() {
-                [0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F]
-            } else {
-                [0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F]
-            }
+            let x = x0 + col as i32;
+            let y = y0 + row as i32;
+            let dst = buf.get(x, y);
+            let inv = 1.0 - src[3] as f64 / 255.0;
+            let mix = |s: u8, d: u8| (s as f64 + d as f64 * inv).round() as u8;
+            buf.put(
+                x,
+                y,
+                [
+                    mix(src[0], dst[0]),
+                    mix(src[1], dst[1]),
+                    mix(src[2], dst[2]),
+                    mix(src[3], dst[3]),
+                ],
+            );
         }
     }
 }
@@ -902,5 +898,73 @@ mod tests {
             "body should taper: tail {tail} neck {neck}"
         );
         assert!(head > neck, "head {head} should be wider than neck {neck}");
+    }
+
+    /// Real glyphs, not the old placeholder block: antialiased edges and a mix
+    /// of opaque/transparent pixels, not a solid rectangle.
+    #[test]
+    fn text_export_draws_real_glyphs() {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+        let (buf, w, h) = text_raster::rasterize("Hi 你好 123", 24.0, 0xFFFF_FFFF).expect("raster");
+        assert!(w >= 40, "width too small: {w}");
+        assert!(h >= 20, "height too small: {h}");
+        let total = (w * h) as usize;
+        let mut opaque = 0;
+        let mut partial = 0;
+        let mut transparent = 0;
+        for px in buf.chunks_exact(4) {
+            match px[3] {
+                255 => opaque += 1,
+                0 => transparent += 1,
+                _ => partial += 1,
+            }
+        }
+        assert!(opaque > 0, "no opaque pixels");
+        assert!(partial > 0, "no antialiased edge pixels");
+        assert!(opaque < total / 2, "looks like a solid block: {opaque}/{total}");
+        assert!(
+            transparent as f64 > total as f64 * 0.3,
+            "too little background: {transparent}/{total}"
+        );
+    }
+
+    /// The raster lands at the element's bounds and nowhere else in the crop.
+    #[test]
+    fn text_annotation_lands_in_the_crop() {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+        let (mut px, stride) = solid(200, 64, [0, 0, 0, 255]);
+        let original = px.clone();
+        let el = Element {
+            id: 10,
+            bounds: Rect::new(10.0, 10.0, 140.0, 30.0),
+            stroke: 0xFFFF_FFFF,
+            stroke_width: 1.0,
+            shape: Shape::Text {
+                text: "Zshot".to_string(),
+                font_size: 20.0,
+            },
+        };
+        apply_annotations(&mut px, 200, 64, stride, 0.0, 0.0, &[el]);
+        let at = |buf: &[u8], x: u32, y: u32| {
+            let i = (y * stride + x * 4) as usize;
+            buf[i..i + 4].to_vec()
+        };
+        let mut changed_in_box = false;
+        for y in 0..64u32 {
+            for x in 0..200u32 {
+                let inside = (10..150).contains(&x) && (10..40).contains(&y);
+                let differs = at(&px, x, y) != at(&original, x, y);
+                if inside {
+                    changed_in_box |= differs;
+                } else if !(0..60).contains(&y) {
+                    assert!(!differs, "pixel {x},{y} changed far from the text");
+                }
+            }
+        }
+        assert!(changed_in_box, "no pixels changed inside the text bounds");
     }
 }
