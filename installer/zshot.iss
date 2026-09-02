@@ -3,7 +3,10 @@
 ; Payload mirrors the portable layout: Zshot.exe + DirectML.dll + models\v6,
 ; which is exactly what ocr::models_dir expects next to the exe.
 
+// release.yml injects /DAppVersion=<tag>; the fallback matches Cargo.toml.
+#ifndef AppVersion
 #define AppVersion "0.2.0"
+#endif
 
 [Setup]
 AppId={{8F3A5C2E-9B7D-4E1F-A6C3-2D5E8F0B1A47}

@@ -214,6 +214,21 @@ PP-OCRv6 Small 覆盖中日英与拉丁语系。韩文、阿拉伯文等不在�
 - [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) — PP-OCRv6 模型（Apache-2.0）
 - [ONNX Runtime](https://github.com/microsoft/onnxruntime)（MIT）
 
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://signpath.io), certificate by [SignPath Foundation](https://signpath.org).
+
+### Roles
+
+- Committer and Reviewer: [@Zyl0812](https://github.com/Zyl0812)
+- Approver: [@Zyl0812](https://github.com/Zyl0812)
+
+### Privacy
+
+Zshot 不会把截图、OCR 结果、API 密钥或任何用户数据发送到用户未显式配置或请求的系统。网络访问只发生在两种情况：用户主动请求的翻译（发往用户自己配置的 API 端点）和针对 GitHub Releases 的更新检查。
+
+Zshot does not transfer screenshots, OCR results, API keys, or other user data to systems not explicitly configured or requested by the user. Network access only occurs for user-requested translation through the configured API endpoint and update checks against GitHub Releases.
+
 ## 许可证
 
 MIT，见 [LICENSE](LICENSE)。
