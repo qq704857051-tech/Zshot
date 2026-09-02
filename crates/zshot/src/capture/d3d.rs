@@ -139,6 +139,7 @@ impl Drop for RestoreGpu<'_> {
     }
 }
 
+#[derive(Clone)]
 pub struct Gpu {
     pub device: ID3D11Device,
     vs: ID3D11VertexShader,

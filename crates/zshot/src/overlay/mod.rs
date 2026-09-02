@@ -35,7 +35,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WDA_EXCLUDEFROMCAPTURE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
-use crate::capture::{crop_sdr_bgra, CapturedDesktop};
+use crate::capture::{crop_sdr_bgra, CapturedDesktop, Gpu, WgcLive};
 use crate::error::Result;
 use crate::geom::{
     hit_test, move_rect, physical_source_rect, resize_rect, Point, Rect, SelectionHitKind,
@@ -228,6 +228,21 @@ struct LongCaptureState {
     gen: u64,
     /// Height cap hit: polling stops, the bar stays up for 完成/取消.
     maxed: bool,
+    /// Persistent WGC session for this capture's monitor, if one could be
+    /// started. `None` falls back to `capture_region_bgra` per tick (a fresh
+    /// WGC start every 450 ms), same as before this session existed.
+    live: Option<LongLive>,
+}
+
+/// A running WGC session plus what `capture_region_live` needs to crop it:
+/// the GPU handle it was started on and the monitor's origin, so an absolute
+/// screen rect can be converted to monitor-local coordinates.
+struct LongLive {
+    session: WgcLive,
+    gpu: Gpu,
+    sdr_white: f32,
+    mon_x: i32,
+    mon_y: i32,
 }
 
 /// C# samples every 450 ms: often enough to catch a smooth scroll, rare
@@ -1254,15 +1269,35 @@ impl OverlayView {
         };
         // The freeze frame may be stale by the time the user reaches for this
         // button, so -- like the C# runner -- the first frame is a fresh
-        // capture, not a crop of it.
-        let (px, pw, ph, _) =
-            match crate::app::capture_region_bgra(cx, abs_x, abs_y, result.w, result.h) {
-                Ok(frame) => frame,
-                Err(e) => {
-                    self.show_panel("长截图失败", e.to_string(), false, cx);
-                    return;
+        // capture, not a crop of it. A persistent WGC session on the covering
+        // monitor turns every later poll into a crop of its newest frame
+        // instead of a fresh WGC start every 450 ms.
+        let live = self.start_live_session(abs_x, abs_y, result.w, result.h);
+        let live_first = live.as_ref().and_then(|l| {
+            crate::app::capture_region_live(
+                cx, &l.session, &l.gpu, l.sdr_white, l.mon_x, l.mon_y, abs_x, abs_y, result.w,
+                result.h,
+            )
+            .ok()
+            .flatten()
+        });
+        let (live, (px, pw, ph, _)) = match live_first {
+            Some(frame) => (live, frame),
+            None => {
+                if live.is_some() {
+                    crate::perf::log_app(
+                        "long-capture: live session produced no first frame, falling back",
+                    );
                 }
-            };
+                match crate::app::capture_region_bgra(cx, abs_x, abs_y, result.w, result.h) {
+                    Ok(frame) => (None, frame),
+                    Err(e) => {
+                        self.show_panel("长截图失败", e.to_string(), false, cx);
+                        return;
+                    }
+                }
+            }
+        };
         if pw != result.w || ph != result.h || !stitcher.fill_first(&px) {
             return;
         }
@@ -1279,6 +1314,7 @@ impl OverlayView {
             status: "滚动页面以继续截图".to_string(),
             gen,
             maxed: false,
+            live,
         });
         // The OCR/translate panel has no meaning mid-capture; the C# build
         // collapses ResultPanel here too.
@@ -1305,6 +1341,37 @@ impl OverlayView {
         cx.notify();
     }
 
+    /// Starts a persistent WGC session for the monitor that fully contains the
+    /// polled region, so every long-capture poll can crop the session's
+    /// newest frame instead of paying for a fresh WGC start every 450 ms.
+    /// Any failure -- no containing monitor, a start error, or no frame
+    /// within the wait -- returns `None`; the caller then falls back to
+    /// `capture_region_bgra` for the whole session.
+    /// ponytail: exclusive-fullscreen apps and DXGI-duplication-only monitors
+    /// have no WGC frame to deliver here either, so they take the same
+    /// fallback path as any other start failure -- no separate detection.
+    fn start_live_session(&self, abs_x: i32, abs_y: i32, w: u32, h: u32) -> Option<LongLive> {
+        let cap = self.cap.as_ref()?;
+        let monitors = crate::capture::enumerate_monitors().ok()?;
+        let mon = monitors.iter().find(|m| {
+            abs_x >= m.x
+                && abs_y >= m.y
+                && abs_x + w as i32 <= m.x + m.w
+                && abs_y + h as i32 <= m.y + m.h
+        })?;
+        let session = crate::capture::start_live(&cap.gpu, mon, mon.hdr).ok()?;
+        if !session.wait_first(Duration::from_millis(500)) {
+            return None;
+        }
+        Some(LongLive {
+            session,
+            gpu: cap.gpu.clone(),
+            sdr_white: cap.sdr_white_nits,
+            mon_x: mon.x,
+            mon_y: mon.y,
+        })
+    }
+
     fn spawn_long_poll(&self, gen: u64, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             loop {
@@ -1329,13 +1396,22 @@ impl OverlayView {
             return false;
         }
         let (ax, ay, w, h) = (state.abs_x, state.abs_y, state.w, state.h);
-        let Ok((px, pw, ph, _)) = crate::app::capture_region_bgra(cx, ax, ay, w, h) else {
-            // A transient capture failure skips the frame, same as the C# loop.
-            return true;
+        let px = match state.live.as_ref() {
+            Some(live) => match crate::app::capture_region_live(
+                cx, &live.session, &live.gpu, live.sdr_white, live.mon_x, live.mon_y, ax, ay, w, h,
+            ) {
+                // No new frame since the last poll: nothing scrolled, not an
+                // error -- skip aligning without touching prev_gray.
+                Ok(None) => return true,
+                Ok(Some((px, pw, ph, _))) if pw == w && ph == h => px,
+                Ok(Some(_)) | Err(_) => return true,
+            },
+            None => match crate::app::capture_region_bgra(cx, ax, ay, w, h) {
+                // A transient capture failure skips the frame, same as the C# loop.
+                Ok((px, pw, ph, _)) if pw == w && ph == h => px,
+                Ok(_) | Err(_) => return true,
+            },
         };
-        if pw != w || ph != h {
-            return true;
-        }
         let gray = bgra_to_gray(&px, w as usize, h as usize);
         let Some(state) = self.long.as_mut() else {
             return false;

@@ -26,8 +26,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::capture::{
-    capture_for_action, crop_sdr_bgra, drop_gpu_resources, prepare_capture, CapturedDesktop,
-    GpuShaders,
+    capture_for_action, crop_live_frame, crop_sdr_bgra, drop_gpu_resources, prepare_capture,
+    CapturedDesktop, Gpu, GpuShaders, WgcLive,
 };
 use crate::codec::{set_clipboard_dib, write_png_file};
 use crate::error::{Error, Result};
@@ -96,7 +96,12 @@ fn install_gpu_lifecycle(cx: &App) {
     });
 }
 
-fn capture_from_app(cx: &mut App, region: bool, perf: &mut PerfSession) -> Result<CapturedDesktop> {
+fn capture_from_app(
+    cx: &mut App,
+    region: bool,
+    region_hint: Option<(i32, i32, u32, u32)>,
+    perf: &mut PerfSession,
+) -> Result<CapturedDesktop> {
     let generation = cx.gpu_generation();
     let overlay_luid = cx.adapter_luid().unwrap_or((0, 0));
     // Borrow GPU only long enough to clone the device and compile shaders — do not hold
@@ -108,7 +113,7 @@ fn capture_from_app(cx: &mut App, region: bool, perf: &mut PerfSession) -> Resul
         Some(Err(e)) => return Err(e),
         None => return Err(Error::new("GPU context unavailable")),
     };
-    let prepared = prepare_capture(region, &device, &shaders, overlay_luid)?;
+    let prepared = prepare_capture(region, region_hint, &device, &shaders, overlay_luid)?;
     match cx
         .with_gpu_context(|device, ctx| capture_for_action(prepared, perf, device, ctx, &shaders))
     {
@@ -146,15 +151,21 @@ pub(crate) fn capture_region_bgra(
     h: u32,
 ) -> Result<(Vec<u8>, u32, u32, u32)> {
     let mut perf = PerfSession::start();
-    let cap = capture_from_app(cx, true, &mut perf)?;
+    let cap = capture_from_app(cx, true, Some((abs_x, abs_y, w, h)), &mut perf)?;
     let x = abs_x - cap.origin_x;
     let y = abs_y - cap.origin_y;
     if x < 0 || y < 0 {
         return Err(Error::new("long-capture region outside the fresh capture"));
     }
     let (px, cw, ch, stride) = crop_from_app(cx, &cap, x as u32, y as u32, w, h)?;
+    Ok(repack_tight(px, cw, ch, stride))
+}
+
+/// Repacks a BGRA buffer to a tight `width * 4` stride: the stitcher and the
+/// grayscale aligner both index rows directly.
+fn repack_tight(px: Vec<u8>, cw: u32, ch: u32, stride: u32) -> (Vec<u8>, u32, u32, u32) {
     if stride == cw * 4 {
-        return Ok((px, cw, ch, stride));
+        return (px, cw, ch, stride);
     }
     let tight = (cw * 4) as usize;
     let mut packed = Vec::with_capacity(tight * ch as usize);
@@ -162,15 +173,56 @@ pub(crate) fn capture_region_bgra(
         let start = row * stride as usize;
         packed.extend_from_slice(&px[start..start + tight]);
     }
-    Ok((packed, cw, ch, cw * 4))
+    (packed, cw, ch, cw * 4)
+}
+
+/// Long-capture poll tick using a persistent WGC session: crops the session's
+/// newest frame instead of starting a fresh capture. `Ok(None)` means WGC has
+/// delivered nothing new since the last call -- the caller treats that as
+/// "nothing scrolled", not an error.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) fn capture_region_live(
+    cx: &mut App,
+    live: &WgcLive,
+    gpu: &Gpu,
+    sdr_white: f32,
+    mon_x: i32,
+    mon_y: i32,
+    abs_x: i32,
+    abs_y: i32,
+    w: u32,
+    h: u32,
+) -> Result<Option<(Vec<u8>, u32, u32, u32)>> {
+    let outcome = cx.with_gpu_context(|_device, ctx| -> Result<Option<(Vec<u8>, u32, u32, u32)>> {
+        let Some(frame) = live.take_latest(gpu, ctx)? else {
+            return Ok(None);
+        };
+        let cropped = crop_live_frame(
+            gpu,
+            ctx,
+            &frame.texture,
+            sdr_white,
+            (abs_x - mon_x) as u32,
+            (abs_y - mon_y) as u32,
+            w,
+            h,
+        )?;
+        Ok(Some(cropped))
+    });
+    match outcome {
+        Some(Ok(Some((px, cw, ch, stride)))) => Ok(Some(repack_tight(px, cw, ch, stride))),
+        Some(Ok(None)) => Ok(None),
+        Some(Err(e)) => Err(e),
+        None => Err(Error::new("GPU context unavailable")),
+    }
 }
 
 /// The stitched long screenshot exports like a finished capture: PNG file
-/// plus clipboard, so both the 保存 and 完成 habits keep working.
+/// plus clipboard, so both the 保存 and 完成 habits keep working. The stitched
+/// image can be 16384 px tall, so its DIB copy is the biggest one -- run it
+/// off the UI thread like every other export.
 pub(crate) fn export_long_capture(px: Vec<u8>, w: u32, h: u32) {
-    if let Err(e) = export_pixels(px, w, h, w * 4, true, true) {
-        crate::perf::log_app(&format!("long-capture export failed: {e}"));
-    }
+    export_pixels_async(px, w, h, w * 4, true, true, None);
 }
 
 /// Release builds are Windows-subsystem, so a shell-launched process starts with
@@ -252,7 +304,7 @@ pub fn once_capture(path: PathBuf) -> Result<()> {
             perf.mark("T1");
             perf.mark("T2");
             let r = (|| {
-                let cap = capture_from_app(cx, false, &mut perf)?;
+                let cap = capture_from_app(cx, false, None, &mut perf)?;
                 let (px, w, h, stride) = crop_from_app(cx, &cap, 0, 0, cap.width, cap.height)?;
                 write_png_file(&path, &px, w, h, stride)?;
                 let _ = perf.write_log();
@@ -469,7 +521,7 @@ fn parse_bench_sample(stdout: &str) -> Option<u128> {
 fn start_bench_iteration(cx: &mut App) {
     let mut perf = PerfSession::start();
     perf.mark("T2");
-    match capture_from_app(cx, true, &mut perf) {
+    match capture_from_app(cx, true, None, &mut perf) {
         Ok(cap) => {
             let _ = show_overlay(cx, cap, &mut perf, false);
         }
@@ -753,7 +805,7 @@ fn take_shot(action: HotkeyAction) -> Result<ShotFlow> {
     // confirms the drag straight to the clipboard. Only fullscreen skips the
     // overlay.
     let region = !matches!(action, HotkeyAction::Fullscreen);
-    let cap = match with_gpui_app(|cx| capture_from_app(cx, region, &mut perf)) {
+    let cap = match with_gpui_app(|cx| capture_from_app(cx, region, None, &mut perf)) {
         Some(Ok(c)) => {
             crate::perf::log_app(&format!("capture ok: {}x{} hdr={} dxgi_dup={}", c.width, c.height, c.hdr, c.used_dxgi_dup));
             c

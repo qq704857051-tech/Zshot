@@ -1,4 +1,5 @@
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
 use windows::core::{IInspectable, Interface};
 use windows::Foundation::TypedEventHandler;
@@ -120,6 +121,111 @@ impl Drop for WgcPending {
 impl Drop for WgcReady {
     fn drop(&mut self) {
         let _ = self.frame.take();
+        if let (Some(pool), Some(session)) = (self.pool.take(), self.session.take()) {
+            let _ = pool.RemoveFrameArrived(self.token);
+            let _ = session.Close();
+            let _ = pool.Close();
+        }
+    }
+}
+
+/// One long-lived capture session for a monitor, used by long-capture polling
+/// instead of starting a fresh WGC item + session every tick. `latest` always
+/// holds the newest frame WGC delivered; an older undelivered frame is simply
+/// replaced, so the size-1 pool never starves waiting for a consumer.
+pub struct WgcLive {
+    pool: Option<Direct3D11CaptureFramePool>,
+    session: Option<GraphicsCaptureSession>,
+    token: i64,
+    latest: Arc<Mutex<Option<Direct3D11CaptureFrame>>>,
+    hdr: bool,
+}
+
+/// Starts a persistent session on `mon`, same pool/session setup as
+/// `start_item` but keeping every delivered frame in `latest` instead of a
+/// one-shot channel.
+pub fn start_live(gpu: &Gpu, mon: &MonitorInfo, want_hdr: bool) -> Result<WgcLive> {
+    let item = create_item_for_monitor(mon.handle)?;
+    let size: SizeInt32 = item.Size()?;
+    if size.Width <= 0 || size.Height <= 0 {
+        return Err(Error::new("WGC item has empty size"));
+    }
+    let format = if want_hdr {
+        DirectXPixelFormat::R16G16B16A16Float
+    } else {
+        DirectXPixelFormat::B8G8R8A8UIntNormalized
+    };
+    let device: IDirect3DDevice = gpu.winrt_device()?;
+    let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(&device, format, 1, size)?;
+    let session: GraphicsCaptureSession = pool.CreateCaptureSession(&item)?;
+    let _ = session.SetIsBorderRequired(false);
+    let _ = session.SetIsCursorCaptureEnabled(false);
+    let _ = session.SetIncludeSecondaryWindows(true);
+
+    let latest: Arc<Mutex<Option<Direct3D11CaptureFrame>>> = Arc::new(Mutex::new(None));
+    let latest_handler = latest.clone();
+    let token = pool.FrameArrived(
+        &TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new(move |pool, _| {
+            if let Some(pool) = pool.as_ref() {
+                if let Ok(frame) = pool.TryGetNextFrame() {
+                    *latest_handler.lock().unwrap_or_else(|p| p.into_inner()) = Some(frame);
+                }
+            }
+            Ok(())
+        }),
+    )?;
+
+    session.StartCapture()?;
+    Ok(WgcLive {
+        pool: Some(pool),
+        session: Some(session),
+        token,
+        latest,
+        hdr: mon.hdr && want_hdr,
+    })
+}
+
+impl WgcLive {
+    /// Polls for the first frame, only used right after `start_live`.
+    pub fn wait_first(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if self
+                .latest
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_some()
+            {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Takes the newest frame if one arrived since the last call. `None`
+    /// means nothing on screen changed -- not an error.
+    pub fn take_latest(&self, gpu: &Gpu, ctx: &ID3D11DeviceContext) -> Result<Option<WgcFrame>> {
+        let frame = self.latest.lock().unwrap_or_else(|p| p.into_inner()).take();
+        let Some(frame) = frame else {
+            return Ok(None);
+        };
+        let surface = frame.Surface()?;
+        let access: IDirect3DDxgiInterfaceAccess = surface.cast()?;
+        let src: ID3D11Texture2D = unsafe { access.GetInterface()? };
+        let owned = gpu.copy_to_owned(ctx, &src)?;
+        drop(frame);
+        Ok(Some(WgcFrame {
+            texture: owned,
+            hdr: self.hdr,
+        }))
+    }
+}
+
+impl Drop for WgcLive {
+    fn drop(&mut self) {
         if let (Some(pool), Some(session)) = (self.pool.take(), self.session.take()) {
             let _ = pool.RemoveFrameArrived(self.token);
             let _ = session.Close();

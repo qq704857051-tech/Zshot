@@ -8,6 +8,7 @@ pub use monitors::{
     dxgi_allowed, enumerate_monitors, foreground_covers_monitor, monitor_from_foreground,
     query_monitor_exclusive, virtual_desktop, MonitorInfo, VirtualDesktop,
 };
+pub use wgc::{start_live, WgcLive};
 
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D};
 use windows::Win32::Graphics::Dxgi::Common::{
@@ -62,6 +63,7 @@ pub struct PreparedCapture {
 /// holding `with_gpu_context` — only the device (via `Gpu`) is needed here.
 pub fn prepare_capture(
     region: bool,
+    region_hint: Option<(i32, i32, u32, u32)>,
     device: &ID3D11Device,
     shaders: &GpuShaders,
     overlay_luid: (u32, i32),
@@ -85,6 +87,18 @@ pub fn prepare_capture(
     let exclusive_guess = is_exclusive_fullscreen(exclusive_hint);
 
     let capture_all = region && !exclusive_guess;
+    // A region hint that lands fully inside one monitor only needs that monitor:
+    // long-capture polls this every 450 ms, and capturing the whole virtual
+    // desktop each tick just to crop it back down is wasted WGC/composite work.
+    let hint_idx = region_hint.and_then(|(x, y, w, h)| {
+        monitors.iter().position(|m| {
+            x >= m.x && y >= m.y && x + w as i32 <= m.x + m.w && y + h as i32 <= m.y + m.h
+        })
+    });
+    let (focus_idx, capture_all) = match hint_idx {
+        Some(idx) => (idx, false),
+        None => (focus_idx, capture_all),
+    };
     let target_indices: Vec<usize> = if capture_all {
         (0..monitors.len()).collect()
     } else {
@@ -285,4 +299,24 @@ pub fn crop_sdr_bgra(
 ) -> Result<(Vec<u8>, u32, u32, u32)> {
     let _restore = d3d::RestoreGpu(ctx);
     cap.gpu.read_bgra_region(ctx, &cap.sdr_display, x, y, w, h)
+}
+
+/// Fresh crop from a live session: tonemap/copy the frame to BGRA8 then read
+/// the region back. Mirrors `capture_for_action` + `crop_sdr_bgra`'s pipeline
+/// but for a single already-owned frame texture instead of a full desktop
+/// composite.
+#[allow(clippy::too_many_arguments)]
+pub fn crop_live_frame(
+    gpu: &Gpu,
+    ctx: &ID3D11DeviceContext,
+    frame: &ID3D11Texture2D,
+    sdr_white_nits: f32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<(Vec<u8>, u32, u32, u32)> {
+    let _restore = d3d::RestoreGpu(ctx);
+    let display = gpu.to_sdr_bgra(ctx, frame, sdr_white_nits)?;
+    gpu.read_bgra_region(ctx, &display, x, y, w, h)
 }
