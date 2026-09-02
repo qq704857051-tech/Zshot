@@ -34,6 +34,7 @@ use crate::error::{Error, Result};
 use crate::gpui_bridge::drop_freeze_swapchain;
 use crate::hotkey::{HotkeyAction, HotkeyBindings};
 use crate::overlay::composite::apply_annotations;
+use crate::overlay::editor::Element;
 use crate::overlay::{show_overlay, OverlayResult};
 use crate::perf::{write_perf_summary, PerfSession};
 use crate::platform::{
@@ -873,22 +874,43 @@ pub(crate) fn complete_region_shot(
 
 pub(crate) fn export_annotated_region(cx: &mut App, cap: &CapturedDesktop, result: &OverlayResult) {
     match crop_from_app(cx, cap, result.x, result.y, result.w, result.h) {
-        Ok((mut px, cw, ch, stride)) => {
-            apply_annotations(
-                &mut px,
-                cw,
-                ch,
-                stride,
-                result.x as f64,
-                result.y as f64,
-                &result.marks,
-            );
-            if let Err(e) = export_pixels(px, cw, ch, stride, result.write_file, result.copy) {
-                crate::perf::log_app(&format!("export failed: {e}"));
-            }
+        Ok((px, cw, ch, stride)) => {
+            let marks = Some((result.x as f64, result.y as f64, result.marks.clone()));
+            export_pixels_async(px, cw, ch, stride, result.write_file, result.copy, marks);
         }
         Err(e) => crate::perf::log_app(&format!("crop failed: {e}")),
     }
+}
+
+/// Runs annotation compositing and the clipboard/PNG export off the UI thread.
+/// `crop_from_app`'s GPU readback has to stay on the UI thread, but everything
+/// after that -- rasterizing marks, the clipboard DIB copy, the PNG encode --
+/// is pure CPU work that would otherwise run before the overlay window gets a
+/// chance to hide on the next frame.
+fn export_pixels_async(
+    mut px: Vec<u8>,
+    cw: u32,
+    ch: u32,
+    stride: u32,
+    write_file: bool,
+    copy: bool,
+    marks: Option<(f64, f64, Vec<Element>)>,
+) {
+    std::thread::spawn(move || {
+        // default_png_path -> SHGetKnownFolderPath is COM; this is a fresh thread.
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_MULTITHREADED,
+            );
+        }
+        if let Some((ox, oy, marks)) = marks {
+            apply_annotations(&mut px, cw, ch, stride, ox, oy, &marks);
+        }
+        if let Err(e) = export_pixels(px, cw, ch, stride, write_file, copy) {
+            crate::perf::log_app(&format!("export failed: {e}"));
+        }
+    });
 }
 
 fn export_pixels(
