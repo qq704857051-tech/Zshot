@@ -10,16 +10,17 @@ pub(crate) mod toolbar;
 pub use assets::ToolbarAssets;
 
 use std::cell::{Cell, RefCell};
+use std::ops::Range;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
     actions, black, canvas, div, fill, hsla, outline, point, prelude::*, px, rgb, size, svg, white,
-    AnyView, App, BorderStyle, Bounds, BoxShadow, ContentMask, Context, CursorStyle, Entity,
-    FocusHandle, Focusable, InteractiveElement, KeyBinding, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point as GpuiPoint,
-    SharedString, Timer, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
-    WindowKind, WindowOptions,
+    AnyView, App, BorderStyle, Bounds, BoxShadow, ContentMask, Context, CursorStyle,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, InteractiveElement,
+    KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PathBuilder, Pixels, Point as GpuiPoint, SharedString, Timer, UTF16Selection, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions,
 };
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -44,7 +45,7 @@ use crate::geom::{
 use crate::gpui_bridge::present_freeze_from_texture;
 use crate::longcapture::{align_vertical, bgra_to_gray, Stitcher};
 use crate::overlay::composite::{element_mask, CoverageRun};
-use crate::overlay::editor::{Element, PressKind, Session, Shape, Tool};
+use crate::overlay::editor::{Element, PressKind, Session, Shape, Tool, TEXT_FONT_SIZE};
 use crate::overlay::toolbar::PHASE1_ITEMS;
 use crate::perf::PerfSession;
 use crate::platform::WM_APP_READY_SENTINEL;
@@ -120,6 +121,25 @@ type MarkMasks = (Vec<Element>, Vec<Option<Rc<Vec<CoverageRun>>>>);
 struct TextDraft {
     pt: Point,
     buf: String,
+    /// Byte range of the IME composition (未上屏) text inside `buf`; the next
+    /// composition update or result replaces exactly this range.
+    marked: Option<Range<usize>>,
+}
+
+/// UTF-16 offset (what the platform IME speaks) to a byte offset in `s`.
+fn utf16_to_byte(s: &str, utf16: usize) -> usize {
+    let mut units = 0;
+    for (i, ch) in s.char_indices() {
+        if units >= utf16 {
+            return i;
+        }
+        units += ch.len_utf16();
+    }
+    s.len()
+}
+
+fn byte_to_utf16(s: &str, byte: usize) -> usize {
+    s[..byte.min(s.len())].encode_utf16().count()
 }
 
 /// Region overlay root view. Freeze is DComp visual 0; this paints UI visual 1.
@@ -797,6 +817,7 @@ impl OverlayView {
                     self.text_edit = Some(TextDraft {
                         pt: self.mouse,
                         buf: String::new(),
+                        marked: None,
                     });
                 }
                 PressKind::Capture => {}
@@ -1022,26 +1043,18 @@ impl OverlayView {
         cx.notify();
     }
 
+    /// Only Backspace lives here. Characters arrive through the
+    /// `EntityInputHandler` below (WM_CHAR and the IME result string), which is
+    /// also what makes Chinese input work; inserting `key_char` as well would
+    /// type every Latin key twice.
     fn on_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let Some(edit) = self.text_edit.as_mut() else {
             return;
         };
-        if event.keystroke.key == "backspace" {
+        // Mid-composition the IME owns Backspace.
+        if event.keystroke.key == "backspace" && edit.marked.is_none() {
             edit.buf.pop();
             cx.notify();
-            return;
-        }
-        if event.keystroke.modifiers.control
-            || event.keystroke.modifiers.alt
-            || event.keystroke.modifiers.platform
-        {
-            return;
-        }
-        if let Some(ch) = event.keystroke.key_char.as_ref() {
-            if !ch.is_empty() && ch != "\r" && ch != "\n" && ch != "\u{1b}" {
-                edit.buf.push_str(ch);
-                cx.notify();
-            }
         }
     }
 
@@ -2036,25 +2049,20 @@ impl OverlayView {
                 )
             })
             .collect();
+        // The draft is drawn exactly like the committed element will be -- same
+        // origin, face, size and colour, no box -- so typing is a live preview.
+        let stroke = self.editor.stroke;
         let draft = self.text_edit.as_ref().map(|edit| {
-            let shown = if edit.buf.is_empty() {
-                "|".to_string()
-            } else {
-                format!("{}|", edit.buf)
-            };
             div()
                 .absolute()
                 .left(px((edit.pt.x - sel.x) as f32 / scale))
                 .top(px((edit.pt.y - sel.y) as f32 / scale))
-                .min_w(px(80.))
-                .px(px(4.))
-                .py(px(2.))
-                .bg(white())
-                .text_color(black())
-                .text_sm()
+                .min_w(px(40.))
                 .font_family(text_raster::FONT_FAMILY)
+                .text_color(rgb(stroke & 0x00FF_FFFF))
+                .text_size(px(TEXT_FONT_SIZE as f32 / scale))
                 .occlude()
-                .child(shown)
+                .child(format!("{}|", edit.buf))
         });
         Some(
             div()
@@ -2073,6 +2081,119 @@ impl OverlayView {
 impl Focusable for OverlayView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+/// Text input for the draft: the caret is always at the end, so this is the
+/// minimum the platform needs -- append committed text, keep the IME's
+/// composition string marked so the next update replaces it, and tell the IME
+/// where the draft sits so the candidate window opens next to it.
+impl EntityInputHandler for OverlayView {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        actual_range: &mut Option<Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        let buf = &self.text_edit.as_ref()?.buf;
+        let range = utf16_to_byte(buf, range_utf16.start)..utf16_to_byte(buf, range_utf16.end);
+        actual_range.replace(byte_to_utf16(buf, range.start)..byte_to_utf16(buf, range.end));
+        Some(buf[range].to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let buf = &self.text_edit.as_ref()?.buf;
+        let end = byte_to_utf16(buf, buf.len());
+        Some(UTF16Selection {
+            range: end..end,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
+        let edit = self.text_edit.as_ref()?;
+        let m = edit.marked.as_ref()?;
+        Some(byte_to_utf16(&edit.buf, m.start)..byte_to_utf16(&edit.buf, m.end))
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
+        if let Some(edit) = self.text_edit.as_mut() {
+            edit.marked = None;
+        }
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(edit) = self.text_edit.as_mut() else {
+            return;
+        };
+        let range = range_utf16
+            .map(|r| utf16_to_byte(&edit.buf, r.start)..utf16_to_byte(&edit.buf, r.end))
+            .or_else(|| edit.marked.clone())
+            .unwrap_or(edit.buf.len()..edit.buf.len());
+        edit.buf.replace_range(range, new_text);
+        edit.marked = None;
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        _new_selected_range_utf16: Option<Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(edit) = self.text_edit.as_mut() else {
+            return;
+        };
+        let range = range_utf16
+            .map(|r| utf16_to_byte(&edit.buf, r.start)..utf16_to_byte(&edit.buf, r.end))
+            .or_else(|| edit.marked.clone())
+            .unwrap_or(edit.buf.len()..edit.buf.len());
+        edit.buf.replace_range(range.clone(), new_text);
+        edit.marked = (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        window: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let edit = self.text_edit.as_ref()?;
+        let scale = window.scale_factor().max(0.01);
+        // ponytail: the whole draft line, not the exact caret x; the IME only
+        // uses this to park its candidate window nearby.
+        Some(Bounds {
+            origin: point(
+                element_bounds.origin.x + px(edit.pt.x as f32 / scale),
+                element_bounds.origin.y + px(edit.pt.y as f32 / scale),
+            ),
+            size: size(px(1.), px(TEXT_FONT_SIZE as f32 / scale)),
+        })
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _: GpuiPoint<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
     }
 }
 
@@ -2098,6 +2219,12 @@ impl Render for OverlayView {
         let masks = self.mark_masks(&marks);
         let mosaic = self.mosaic_tiles(cx);
         let tool = self.editor.tool;
+        // Registered from the canvas paint so the IME talks to this view while
+        // a text draft is open; the handler is a no-op otherwise.
+        let input = self
+            .text_edit
+            .is_some()
+            .then(|| (self.focus_handle.clone(), cx.entity()));
         let cursor = match (phase, tool, self.text_edit.is_some()) {
             (_, _, true) => CursorStyle::IBeam,
             (Phase::Selecting, _, _) => CursorStyle::Crosshair,
@@ -2132,7 +2259,14 @@ impl Render for OverlayView {
                 el.child(
                     canvas(
                         move |_, _, _| (),
-                        move |bounds, _, window, _cx| {
+                        move |bounds, _, window, cx| {
+                            if let Some((focus, entity)) = input {
+                                window.handle_input(
+                                    &focus,
+                                    ElementInputHandler::new(bounds, entity),
+                                    cx,
+                                );
+                            }
                             paint_overlay(
                                 window,
                                 bounds,

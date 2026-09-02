@@ -5,6 +5,8 @@ use crate::geom::{Point, Rect};
 
 pub const DEFAULT_STROKE_WIDTH: f64 = 4.0;
 pub const DEFAULT_MOSAIC_BLOCK: i32 = 16;
+/// Physical px; the overlay draft and the export raster both use it.
+pub const TEXT_FONT_SIZE: f64 = 20.0;
 const MIN_KEEP: f64 = 2.0;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -373,7 +375,7 @@ impl Session {
             stroke_width: self.stroke_width,
             shape: Shape::Text {
                 text: trimmed.to_string(),
-                font_size: 20.0,
+                font_size: TEXT_FONT_SIZE,
             },
         };
         self.history.execute(&mut self.elements, Command::Add(el));
