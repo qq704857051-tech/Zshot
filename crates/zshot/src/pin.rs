@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use gpui::{
     actions, div, hsla, img, prelude::*, px, size, white, App, Bounds, Context, CursorStyle,
-    FocusHandle, Focusable, Image, ImageFormat, ImageSource, KeyBinding, MouseButton,
-    MouseDownEvent, MouseMoveEvent, Point as GpuiPoint, Render, ScrollDelta, ScrollWheelEvent,
-    Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowOptions,
+    FocusHandle, Focusable, ImageSource, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
+    Point as GpuiPoint, Render, RenderImage, ScrollDelta, ScrollWheelEvent, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowOptions,
 };
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
@@ -43,14 +43,12 @@ pub fn show_pin(
     screen_x: i32,
     screen_y: i32,
 ) {
-    let png = match crate::codec::encode_png_bgra(&pixels, w, h, stride) {
-        Ok(png) => png,
-        Err(e) => {
-            crate::perf::log_app(&format!("pin encode failed: {e}"));
-            return;
-        }
+    let buf = repack_opaque(&pixels, w, h, stride);
+    let Some(rgba) = image::RgbaImage::from_raw(w, h, buf) else {
+        crate::perf::log_app("pin: pixel buffer size mismatch");
+        return;
     };
-    let image = Arc::new(Image::from_bytes(ImageFormat::Png, png));
+    let image = Arc::new(RenderImage::new(vec![image::Frame::new(rgba)]));
 
     bind_pin_keys(cx);
     // Bounds here are logical; attach_to_screen repositions in physical pixels
@@ -105,7 +103,7 @@ fn bind_pin_keys(cx: &mut App) {
 }
 
 pub struct PinView {
-    image: Arc<Image>,
+    image: Arc<RenderImage>,
     /// Physical pixel size of the flattened crop.
     pixel_size: (u32, u32),
     zoom: f32,
@@ -117,7 +115,7 @@ pub struct PinView {
 impl PinView {
     fn new(
         cx: &mut Context<Self>,
-        image: Arc<Image>,
+        image: Arc<RenderImage>,
         w: u32,
         h: u32,
         _window: &mut Window,
@@ -315,7 +313,7 @@ impl Render for PinView {
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .on_action(cx.listener(Self::close))
             .child(
-                img(ImageSource::Image(self.image.clone()))
+                img(ImageSource::Render(self.image.clone()))
                     .w(px(w))
                     .h(px(h)),
             )
@@ -353,6 +351,22 @@ impl Render for PinView {
                     .child("✕")
             }))
     }
+}
+
+/// Packs a possibly-padded BGRA buffer to a tight `width * 4` stride and
+/// forces every pixel opaque -- the crop is opaque, but the source alpha can
+/// be 0 from some desktop sources, which would render as blank in gpui.
+fn repack_opaque(pixels: &[u8], w: u32, h: u32, stride: u32) -> Vec<u8> {
+    let tight = (w * 4) as usize;
+    let mut out = Vec::with_capacity(tight * h as usize);
+    for row in 0..h as usize {
+        let start = row * stride as usize;
+        out.extend_from_slice(&pixels[start..start + tight]);
+    }
+    for px in out.chunks_exact_mut(4) {
+        px[3] = 255;
+    }
+    out
 }
 
 /// Outer HWND rect whose client area equals `desired` (screen coordinates),
