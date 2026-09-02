@@ -363,7 +363,8 @@ fn repack_opaque(pixels: &[u8], w: u32, h: u32, stride: u32) -> Vec<u8> {
         let start = row * stride as usize;
         out.extend_from_slice(&pixels[start..start + tight]);
     }
-    for px in out.chunks_exact_mut(4) {
+    // `out` is tightly packed BGRA, so the remainder is always empty.
+    for px in out.as_chunks_mut::<4>().0 {
         px[3] = 255;
     }
     out

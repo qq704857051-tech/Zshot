@@ -914,7 +914,7 @@ mod tests {
         let mut opaque = 0;
         let mut partial = 0;
         let mut transparent = 0;
-        for px in buf.chunks_exact(4) {
+        for px in buf.as_chunks::<4>().0 {
             match px[3] {
                 255 => opaque += 1,
                 0 => transparent += 1,
