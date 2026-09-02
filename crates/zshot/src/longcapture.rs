@@ -63,15 +63,35 @@ pub fn align_vertical(
     let search_max = height - strip;
 
     let prev_start = (height - strip) * width;
-    let len = strip * width;
     let mut sads = Vec::with_capacity(search_max + 1);
+    // Row-wise early exit: a candidate whose partial SAD already exceeds twice
+    // the best completed SAD so far cannot become the new best (its full SAD
+    // can only be larger), so it is abandoned rather than summed to the end.
+    // The true best is never abandoned this way, since its partial sum can
+    // never exceed its own final SAD, which is <= best_so_far by definition.
+    let mut best_so_far = u64::MAX;
 
     for y in 0..=search_max {
         let curr_start = y * width;
+        let limit = best_so_far.saturating_mul(2);
         let mut sad = 0u64;
-        for i in 0..len {
-            sad += previous[prev_start + i].abs_diff(current[curr_start + i]) as u64;
+        let mut abandoned = false;
+        for row in 0..strip {
+            let p = prev_start + row * width;
+            let c = curr_start + row * width;
+            for i in 0..width {
+                sad += previous[p + i].abs_diff(current[c + i]) as u64;
+            }
+            if sad > limit {
+                abandoned = true;
+                break;
+            }
         }
+        if abandoned {
+            sads.push(u64::MAX);
+            continue;
+        }
+        best_so_far = best_so_far.min(sad);
         sads.push(sad);
     }
 
@@ -90,7 +110,7 @@ pub fn align_vertical(
         .min()
         .unwrap_or(u64::MAX);
 
-    let score = 1.0 - best_sad as f64 / (len * 255) as f64;
+    let score = 1.0 - best_sad as f64 / (strip * width * 255) as f64;
     let accepted = score >= accept_score && runner_up > best_sad.saturating_mul(2);
     // best_y is where the previous bottom strip starts in `current`; skip the
     // whole overlap, so the new rows begin at best_y + strip.
@@ -364,6 +384,121 @@ mod tests {
         // Empty inputs are rejected, not a panic.
         let r = align_vertical(&[], &[], 0, 0, 8, 0.35);
         assert!(!r.accepted);
+    }
+
+    /// Old full-SAD implementation, kept only to check the row-wise early-exit
+    /// version in `align_vertical` against it: same candidates, same `best_y`
+    /// tie-break (first minimum), same score, no abandonment.
+    fn align_vertical_naive(
+        previous: &[u8],
+        current: &[u8],
+        width: usize,
+        height: usize,
+        strip_height: usize,
+        accept_score: f64,
+    ) -> FrameAlignResult {
+        if width == 0
+            || height == 0
+            || previous.len() < width * height
+            || current.len() < width * height
+        {
+            return FrameAlignResult::rejected();
+        }
+        let strip = strip_height.clamp(4, (height / 3).max(4));
+        if height <= strip {
+            return FrameAlignResult::rejected();
+        }
+        let search_max = height - strip;
+        let prev_start = (height - strip) * width;
+        let len = strip * width;
+        let mut sads = Vec::with_capacity(search_max + 1);
+        for y in 0..=search_max {
+            let curr_start = y * width;
+            let mut sad = 0u64;
+            for i in 0..len {
+                sad += previous[prev_start + i].abs_diff(current[curr_start + i]) as u64;
+            }
+            sads.push(sad);
+        }
+        let best_y = (0..=search_max).min_by_key(|&y| sads[y]).unwrap_or(0);
+        let best_sad = sads[best_y];
+        let runner_up = sads
+            .iter()
+            .enumerate()
+            .filter(|(y, _)| y.abs_diff(best_y) > strip)
+            .map(|(_, &s)| s)
+            .min()
+            .unwrap_or(u64::MAX);
+        let score = 1.0 - best_sad as f64 / (len * 255) as f64;
+        let accepted = score >= accept_score && runner_up > best_sad.saturating_mul(2);
+        let offset_y = height.min(best_y + strip);
+        FrameAlignResult {
+            offset_y,
+            score,
+            accepted,
+        }
+    }
+
+    /// The row-wise early-exit `align_vertical` must decide exactly like the
+    /// full-SAD `align_vertical_naive` on every candidate frame pair: same
+    /// `offset_y`, `accepted` and `score`.
+    #[test]
+    fn early_exit_sad_matches_naive_full_sad() {
+        let width = 8;
+        let height = 32;
+        let strip = 8;
+
+        let cases: Vec<(Vec<u8>, Vec<u8>)> = {
+            let identical = {
+                let rows = lcg_rows(height, width, 0x1);
+                let refs: Vec<&[u8]> = rows.iter().map(Vec::as_slice).collect();
+                let f = gray_frame(&refs, width);
+                (f.clone(), f)
+            };
+            let scrolled = {
+                let k = 5;
+                let prev_rows = lcg_rows(height, width, 0x2);
+                let new_rows = lcg_rows(k, width, 0x3);
+                let prev_refs: Vec<&[u8]> = prev_rows.iter().map(Vec::as_slice).collect();
+                let curr_rows: Vec<&[u8]> = prev_refs[k..]
+                    .iter()
+                    .copied()
+                    .chain(new_rows.iter().map(Vec::as_slice))
+                    .collect();
+                (
+                    gray_frame(&prev_refs, width),
+                    gray_frame(&curr_rows, width),
+                )
+            };
+            let unrelated = {
+                let a_rows = lcg_rows(height, width, 0x4);
+                let b_rows = lcg_rows(height, width, 0x5);
+                let a_refs: Vec<&[u8]> = a_rows.iter().map(Vec::as_slice).collect();
+                let b_refs: Vec<&[u8]> = b_rows.iter().map(Vec::as_slice).collect();
+                (gray_frame(&a_refs, width), gray_frame(&b_refs, width))
+            };
+            let blank = {
+                let f = vec![255u8; width * height];
+                (f.clone(), f)
+            };
+            vec![identical, scrolled, unrelated, blank]
+        };
+
+        for (previous, current) in cases {
+            for accept_score in [0.35, 0.9] {
+                let fast = align_vertical(&previous, &current, width, height, strip, accept_score);
+                let naive =
+                    align_vertical_naive(&previous, &current, width, height, strip, accept_score);
+                assert_eq!(fast.offset_y, naive.offset_y);
+                assert_eq!(fast.accepted, naive.accepted);
+                assert!(
+                    (fast.score - naive.score).abs() < 1e-9,
+                    "fast={} naive={}",
+                    fast.score,
+                    naive.score
+                );
+            }
+        }
     }
 
     #[test]
