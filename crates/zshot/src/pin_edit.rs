@@ -468,7 +468,9 @@ mod tests {
     }
 
     fn marked(px: &[u8]) -> usize {
-        px.chunks_exact(4)
+        px.as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[..3] != [255, 255, 255])
             .count()
     }

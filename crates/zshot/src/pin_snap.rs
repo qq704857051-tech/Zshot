@@ -390,7 +390,8 @@ pub fn crop(canvas: &[u8], cw: u32, ch: u32, rect: IRect) -> Option<Vec<u8>> {
 /// Replaces fully transparent pixels with `fill`. The clipboard DIB has no
 /// reliable alpha, so gaps go out white there while the PNG keeps them clear.
 pub fn flatten_gaps(pixels: &mut [u8], fill: [u8; 4]) {
-    for px in pixels.chunks_exact_mut(4) {
+    // `pixels` is tightly packed BGRA, so the remainder is always empty.
+    for px in pixels.as_chunks_mut::<4>().0 {
         if px[3] == 0 {
             px.copy_from_slice(&fill);
         }
