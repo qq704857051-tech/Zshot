@@ -42,7 +42,7 @@ use crate::platform::{
     register_fallback_hotkeys, remove_tray_icon, set_dpi_aware, set_hook_target,
     taskbar_created_message, uninstall_ll_hook, unpack_hotkey, unregister_fallback_hotkeys,
     SingleInstance, TrayCommand, WM_TRAYICON, WM_ZSHOT_HOTKEY, WM_ZSHOT_HOTKEY_RECORDED,
-    WM_ZSHOT_SETTINGS,
+    WM_ZSHOT_PIN_MENU, WM_ZSHOT_SETTINGS,
 };
 
 static BUSY: AtomicBool = AtomicBool::new(false);
@@ -224,6 +224,11 @@ pub(crate) fn capture_region_live(
 /// off the UI thread like every other export.
 pub(crate) fn export_long_capture(px: Vec<u8>, w: u32, h: u32) {
     export_pixels_async(px, w, h, w * 4, true, true, None);
+}
+
+/// Pin copy / save: tight BGRA, already composited, no marks to apply.
+pub(crate) fn export_pin_pixels(px: Vec<u8>, w: u32, h: u32, write_file: bool, copy: bool) {
+    export_pixels_async(px, w, h, w * 4, write_file, copy, None);
 }
 
 /// Release builds are Windows-subsystem, so a shell-launched process starts with
@@ -744,6 +749,15 @@ unsafe extern "system" fn hidden_proc(
     }
     if msg == WM_ZSHOT_SETTINGS {
         with_gpui_app(crate::settings::open);
+        return LRESULT(0);
+    }
+    if msg == WM_ZSHOT_PIN_MENU {
+        let id = wparam.0 as u64;
+        if let Some(Some(items)) = with_gpui_app(|cx| crate::pin::menu_items(cx, id)) {
+            if let Some(cmd) = crate::pin::track_menu(hwnd, &items) {
+                with_gpui_app(move |cx| crate::pin::run_menu_command(cx, id, cmd));
+            }
+        }
         return LRESULT(0);
     }
     if msg == taskbar_created_message() {

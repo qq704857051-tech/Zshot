@@ -1,5 +1,6 @@
 //! GPUI freeze overlay: dim, marching ants, window snap, 15×15 magnifier.
 
+pub(crate) mod annotate;
 mod assets;
 pub(crate) mod composite;
 pub(crate) mod editor;
@@ -15,12 +16,12 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    actions, black, canvas, div, fill, hsla, outline, point, prelude::*, px, rgb, size, svg, white,
-    AnyView, App, BorderStyle, Bounds, BoxShadow, ContentMask, Context, CursorStyle,
-    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, InteractiveElement,
-    KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PathBuilder, Pixels, Point as GpuiPoint, SharedString, Timer, UTF16Selection, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions,
+    actions, black, canvas, div, fill, hsla, outline, point, prelude::*, px, rgb, size, white, App,
+    BorderStyle, Bounds, BoxShadow, ContentMask, Context, CursorStyle, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, Focusable, InteractiveElement, KeyBinding, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels,
+    Point as GpuiPoint, SharedString, Timer, UTF16Selection, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowHandle, WindowKind, WindowOptions,
 };
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -44,8 +45,11 @@ use crate::geom::{
 };
 use crate::gpui_bridge::present_freeze_from_texture;
 use crate::longcapture::{align_vertical, bgra_to_gray, Stitcher};
-use crate::overlay::composite::{element_mask, CoverageRun};
-use crate::overlay::editor::{Element, PressKind, Session, Shape, Tool, TEXT_FONT_SIZE};
+use crate::overlay::annotate::{
+    MaskCache, MosaicCache, MosaicTiles, SwatchesModel, TextDraft, TextLayer, ToolbarModel,
+};
+use crate::overlay::composite::CoverageRun;
+use crate::overlay::editor::{Element, PressKind, Session, Tool};
 use crate::overlay::toolbar::PHASE1_ITEMS;
 use crate::perf::PerfSession;
 use crate::platform::WM_APP_READY_SENTINEL;
@@ -105,43 +109,6 @@ fn empty_result() -> OverlayResult {
     }
 }
 
-/// Identity of a mosaic readback: which elements, where, at what block size, and
-/// how many path points -- extending a stroke inside its own bounds moves nothing else.
-type MosaicKey = Vec<(u64, Rect, i32, usize)>;
-
-#[derive(Default)]
-struct MosaicTiles {
-    tiles: Vec<(Rect, u32)>,
-    covered: Vec<u64>,
-}
-
-/// Cached coverage runs aligned 1:1 with the element list that produced them.
-type MarkMasks = (Vec<Element>, Vec<Option<Rc<Vec<CoverageRun>>>>);
-
-struct TextDraft {
-    pt: Point,
-    buf: String,
-    /// Byte range of the IME composition (未上屏) text inside `buf`; the next
-    /// composition update or result replaces exactly this range.
-    marked: Option<Range<usize>>,
-}
-
-/// UTF-16 offset (what the platform IME speaks) to a byte offset in `s`.
-fn utf16_to_byte(s: &str, utf16: usize) -> usize {
-    let mut units = 0;
-    for (i, ch) in s.char_indices() {
-        if units >= utf16 {
-            return i;
-        }
-        units += ch.len_utf16();
-    }
-    s.len()
-}
-
-fn byte_to_utf16(s: &str, byte: usize) -> usize {
-    s[..byte.min(s.len())].encode_utf16().count()
-}
-
 /// Region overlay root view. Freeze is DComp visual 0; this paints UI visual 1.
 pub struct OverlayView {
     pub selection: Rect,
@@ -179,11 +146,11 @@ pub struct OverlayView {
     /// repaints every frame; without this each mosaic costs a GPU readback per frame.
     /// Shared via `Rc` so a cache hit does not clone a tiles Vec that can hold
     /// thousands of entries.
-    mosaic_cache: RefCell<Option<(MosaicKey, Rc<MosaicTiles>)>>,
+    mosaic_cache: MosaicCache,
     /// Coverage masks for the annotation elements, keyed by the exact element list.
     /// The overlay repaints every frame for the marching ants; rasterizing the
     /// strokes again only happens when the annotations actually change.
-    mask_cache: RefCell<Option<MarkMasks>>,
+    mask_cache: MaskCache,
     panel: Option<Panel>,
     /// Read when the overlay is shown, not per frame: the settings window can
     /// rewrite it while this view is alive, and the bar must not change shape
@@ -601,7 +568,9 @@ impl OverlayView {
         self.monitor_rects = crate::capture::enumerate_monitors()
             .map(|mons| {
                 mons.iter()
-                    .map(|m| Rect::new((m.x - ox) as f64, (m.y - oy) as f64, m.w as f64, m.h as f64))
+                    .map(|m| {
+                        Rect::new((m.x - ox) as f64, (m.y - oy) as f64, m.w as f64, m.h as f64)
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -786,9 +755,7 @@ impl OverlayView {
     /// Fold a pending text draft into the document. Any click that leaves the text
     /// field -- canvas or toolbar -- has to run this or the typed text is lost.
     fn commit_text_draft(&mut self) {
-        if let Some(edit) = self.text_edit.take() {
-            self.editor.add_text(edit.pt, &edit.buf);
-        }
+        annotate::commit_text_draft(&mut self.editor, &mut self.text_edit);
     }
 
     fn on_active_press(&mut self) {
@@ -814,11 +781,7 @@ impl OverlayView {
             _ => match self.editor.pointer_pressed(self.mouse) {
                 PressKind::RequestText => {
                     self.down = false;
-                    self.text_edit = Some(TextDraft {
-                        pt: self.mouse,
-                        buf: String::new(),
-                        marked: None,
-                    });
+                    self.text_edit = Some(TextDraft::new(self.mouse));
                 }
                 PressKind::Capture => {}
             },
@@ -1051,9 +1014,7 @@ impl OverlayView {
         let Some(edit) = self.text_edit.as_mut() else {
             return;
         };
-        // Mid-composition the IME owns Backspace.
-        if event.keystroke.key == "backspace" && edit.marked.is_none() {
-            edit.buf.pop();
+        if event.keystroke.key == "backspace" && edit.backspace() {
             cx.notify();
         }
     }
@@ -1166,42 +1127,21 @@ impl OverlayView {
 
     fn hit_toolbar_item(&self, p: Point, scale: f32) -> Option<&'static str> {
         let geom = self.toolbar_geom(scale)?;
-        toolbar_item_at(p, geom, &self.visible_items())
+        annotate::toolbar_item_at(p, geom, &self.visible_items())
     }
 
     fn handle_toolbar(&mut self, id: &'static str, window: &mut Window, cx: &mut Context<Self>) {
         // Buttons stop propagation, so `on_mouse_down` never runs for these clicks.
-        // Undo/redo/cancel discard the draft instead, matching their keyboard paths.
-        if matches!(id, toolbar::UNDO | toolbar::REDO | toolbar::CANCEL) {
-            if self.text_edit.take().is_some() {
-                cx.notify();
-                return;
-            }
-        } else {
-            self.commit_text_draft();
-        }
-        // Any button other than COLOR dismisses the popup; COLOR toggles it.
-        self.color_open = id == toolbar::COLOR && !self.color_open;
-        if let Some(tool) = Tool::from_id(id) {
-            self.editor.cancel_draft();
-            self.editor.tool = tool;
+        if annotate::handle_common_toolbar(
+            &mut self.editor,
+            &mut self.text_edit,
+            &mut self.color_open,
+            id,
+        ) {
             cx.notify();
             return;
         }
         match id {
-            toolbar::COLOR => cx.notify(),
-            toolbar::UNDO => {
-                self.editor.undo();
-                cx.notify();
-            }
-            toolbar::REDO => {
-                self.editor.redo();
-                cx.notify();
-            }
-            toolbar::CLEAR => {
-                self.editor.clear();
-                cx.notify();
-            }
             toolbar::OCR => self.run_ocr(cx),
             toolbar::TRANSLATE => self.run_translate(cx),
             toolbar::PIN => self.pin(window, cx),
@@ -1213,22 +1153,8 @@ impl OverlayView {
         }
     }
 
-    /// Per-element coverage runs, cached against the exact element list. Preview
-    /// and export rasterize from the same masks (`composite::element_mask`), so
-    /// this cache is the only thing standing between the ants animation and
-    /// re-rasterizing every stroke (and re-scanning it into runs) at 60 fps.
     fn mark_masks(&self, marks: &[Element]) -> Vec<Option<Rc<Vec<CoverageRun>>>> {
-        if let Some((key, masks)) = self.mask_cache.borrow().as_ref() {
-            if key.as_slice() == marks {
-                return masks.clone();
-            }
-        }
-        let masks: Vec<Option<Rc<Vec<CoverageRun>>>> = marks
-            .iter()
-            .map(|el| element_mask(el).map(|m| Rc::new(m.runs())))
-            .collect();
-        *self.mask_cache.borrow_mut() = Some((marks.to_vec(), masks.clone()));
-        masks
+        annotate::mark_masks(&self.mask_cache, marks)
     }
 
     /// What OCR reads is the annotated crop, same as the C# `FlattenSelection`:
@@ -1289,7 +1215,15 @@ impl OverlayView {
         let live = self.start_live_session(abs_x, abs_y, result.w, result.h);
         let live_first = live.as_ref().and_then(|l| {
             crate::app::capture_region_live(
-                cx, &l.session, &l.gpu, l.sdr_white, l.mon_x, l.mon_y, abs_x, abs_y, result.w,
+                cx,
+                &l.session,
+                &l.gpu,
+                l.sdr_white,
+                l.mon_x,
+                l.mon_y,
+                abs_x,
+                abs_y,
+                result.w,
                 result.h,
             )
             .ok()
@@ -1412,7 +1346,16 @@ impl OverlayView {
         let (ax, ay, w, h) = (state.abs_x, state.abs_y, state.w, state.h);
         let px = match state.live.as_ref() {
             Some(live) => match crate::app::capture_region_live(
-                cx, &live.session, &live.gpu, live.sdr_white, live.mon_x, live.mon_y, ax, ay, w, h,
+                cx,
+                &live.session,
+                &live.gpu,
+                live.sdr_white,
+                live.mon_x,
+                live.mon_y,
+                ax,
+                ay,
+                w,
+                h,
             ) {
                 // No new frame since the last poll: nothing scrolled, not an
                 // error -- skip aligning without touching prev_gray.
@@ -1573,100 +1516,19 @@ impl OverlayView {
     /// missing from that list still needs a placeholder drawn for it.
     /// Pixelated tiles plus the ids of the elements that produced them; an element
     /// missing from that list still needs a placeholder drawn for it.
-    fn mosaic_tiles(&self, cx: &mut App) -> Rc<MosaicTiles> {
-        let mut out = MosaicTiles::default();
+    fn mosaic_tiles(&self, marks: &[Element], cx: &mut App) -> Rc<MosaicTiles> {
         let Some(cap) = self.cap.as_ref() else {
-            return Rc::new(out);
+            return Rc::new(MosaicTiles::default());
         };
-        let key: MosaicKey = self
-            .editor
-            .visible()
-            .filter_map(|el| match &el.shape {
-                Shape::Mosaic { points, block_size } => {
-                    Some((el.id, el.bounds, *block_size, points.len()))
-                }
-                _ => None,
-            })
-            .collect();
-        if let Some((cached_key, tiles)) = self.mosaic_cache.borrow().as_ref() {
-            if *cached_key == key {
-                return tiles.clone();
-            }
-        }
-        for el in self.editor.visible() {
-            let Shape::Mosaic { points, block_size } = &el.shape else {
-                continue;
-            };
-            let block = (*block_size).max(2);
-            let cells = crate::overlay::editor::mosaic_cells(points, block);
-            if cells.is_empty() {
-                continue;
-            }
-            // Read back one grid-aligned rect covering every cell, then average
-            // inside it. Per-cell readbacks would be one GPU round trip per tile.
-            // ponytail: every new path point invalidates the cache and re-reads the
-            // whole stroke bounds. Fine up to a few hundred cells; if smudging across
-            // a full screen drops frames, cache per element id and only read back the
-            // cells the newest segment added.
-            let gx0 = cells.iter().map(|c| c.0).min().unwrap_or(0);
-            let gy0 = cells.iter().map(|c| c.1).min().unwrap_or(0);
-            let gx1 = cells.iter().map(|c| c.0).max().unwrap_or(0) + 1;
-            let gy1 = cells.iter().map(|c| c.1).max().unwrap_or(0) + 1;
-            let x = (gx0 * block).clamp(0, cap.width as i32) as u32;
-            let y = (gy0 * block).clamp(0, cap.height as i32) as u32;
-            let w = (gx1 * block).clamp(0, cap.width as i32) as u32 - x;
-            let h = (gy1 * block).clamp(0, cap.height as i32) as u32 - y;
-            if w < 1 || h < 1 {
-                continue;
-            }
-            let Ok((px, cw, ch, stride)) =
-                (match cx.with_gpu_context(|_d, ctx| crop_sdr_bgra(cap, ctx, x, y, w, h)) {
-                    Some(r) => r,
-                    None => continue,
-                })
-            else {
-                continue;
-            };
-            for (gx, gy) in cells {
-                let cx0 = (gx * block - x as i32).clamp(0, cw as i32);
-                let cy0 = (gy * block - y as i32).clamp(0, ch as i32);
-                let cx1 = (gx * block + block - x as i32).clamp(0, cw as i32);
-                let cy1 = (gy * block + block - y as i32).clamp(0, ch as i32);
-                if cx1 <= cx0 || cy1 <= cy0 {
-                    continue;
-                }
-                let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
-                for sy in cy0..cy1 {
-                    for sx in cx0..cx1 {
-                        let i = (sy as u32 * stride + sx as u32 * 4) as usize;
-                        if i + 2 >= px.len() {
-                            continue;
-                        }
-                        b += px[i] as u32;
-                        g += px[i + 1] as u32;
-                        r += px[i + 2] as u32;
-                        n += 1;
-                    }
-                }
-                if n == 0 {
-                    continue;
-                }
-                let rgb = ((r / n) << 16) | ((g / n) << 8) | (b / n);
-                out.tiles.push((
-                    Rect::new(
-                        (gx * block) as f64,
-                        (gy * block) as f64,
-                        block as f64,
-                        block as f64,
-                    ),
-                    rgb,
-                ));
-            }
-            out.covered.push(el.id);
-        }
-        let out = Rc::new(out);
-        *self.mosaic_cache.borrow_mut() = Some((key, out.clone()));
-        out
+        annotate::mosaic_tiles(
+            &self.mosaic_cache,
+            marks,
+            (cap.width, cap.height),
+            |x, y, w, h| {
+                cx.with_gpu_context(|_d, ctx| crop_sdr_bgra(cap, ctx, x, y, w, h))?
+                    .ok()
+            },
+        )
     }
 
     fn refresh_magnifier_gpu(&mut self, cx: &mut App) {
@@ -1690,51 +1552,29 @@ impl OverlayView {
                 crate::capture::crop_sdr_bgra(cap, ctx, x, y, MAG_COUNT, MAG_COUNT)
             })
             .and_then(|r| r.ok());
-        self.mag_origin = if self.mag.is_some() { Some((x, y)) } else { None };
+        self.mag_origin = if self.mag.is_some() {
+            Some((x, y))
+        } else {
+            None
+        };
     }
 
     fn toolbar_element(&self, scale: f32, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let geom = self.toolbar_geom(scale)?;
-        let tool_id = self.editor.tool.id();
-        let can_undo = self.editor.history.can_undo();
-        let can_redo = self.editor.history.can_redo();
-        let color_open = self.color_open;
-        let stroke = self.editor.stroke;
-        let items = self.visible_items();
-        Some(
-            div()
-                .absolute()
-                .left(px(geom.x as f32 / scale))
-                .top(px(geom.y as f32 / scale))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(toolbar::ITEM_GAP as f32))
-                .px(px(toolbar::PAD as f32))
-                .py(px(toolbar::PAD as f32))
-                .rounded_xl()
-                .bg(theme::surface())
-                .border_1()
-                .border_color(theme::border())
-                .shadow(vec![BoxShadow {
-                    color: theme::base().opacity(0.12),
-                    offset: point(px(0.), px(4.)),
-                    blur_radius: px(16.),
-                    spread_radius: px(0.),
-                }])
-                .occlude()
-                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                    cx.stop_propagation();
-                })
-                .children(items.into_iter().map(|id| {
-                    let is_color = id == toolbar::COLOR;
-                    // The colour button tracks its popup, not the active tool.
-                    let active = if is_color { color_open } else { tool_id == id };
-                    let dim =
-                        (id == toolbar::UNDO && !can_undo) || (id == toolbar::REDO && !can_redo);
-                    toolbar_button(id, active, dim, is_color.then_some(stroke), cx)
-                })),
-        )
+        let model = ToolbarModel {
+            origin: (geom.x as f32 / scale, geom.y as f32 / scale),
+            items: self.visible_items(),
+            tool_id: self.editor.tool.id(),
+            can_undo: self.editor.history.can_undo(),
+            can_redo: self.editor.history.can_redo(),
+            color_open: self.color_open,
+            stroke: self.editor.stroke,
+        };
+        Some(annotate::toolbar_element(
+            model,
+            Rc::new(|id, this: &mut Self, window, cx| this.handle_toolbar(id, window, cx)),
+            cx,
+        ))
     }
 
     /// The colour popup. Only `visible_items` knows where the COLOR button ended
@@ -1763,57 +1603,18 @@ impl OverlayView {
             mon,
             toolbar::ANCHOR_GAP,
         );
-        let current = self.editor.stroke;
-        Some(
-            div()
-                .absolute()
-                .left(px(pos.x as f32))
-                .top(px(pos.y as f32))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(toolbar::SWATCH_GAP as f32))
-                .p(px(toolbar::PAD as f32))
-                .rounded_xl()
-                .bg(theme::surface())
-                .border_1()
-                .border_color(theme::border())
-                .shadow(vec![BoxShadow {
-                    color: theme::base().opacity(0.12),
-                    offset: point(px(0.), px(4.)),
-                    blur_radius: px(16.),
-                    spread_radius: px(0.),
-                }])
-                .occlude()
-                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                    cx.stop_propagation();
-                })
-                .children(theme::SWATCHES.map(|(hex, rgb24)| {
-                    let argb = 0xFF00_0000 | rgb24;
-                    div()
-                        .id(SharedString::from(hex))
-                        .w(px(toolbar::SWATCH as f32))
-                        .h(px(toolbar::SWATCH as f32))
-                        .rounded_full()
-                        .bg(rgb(rgb24))
-                        .border_2()
-                        .border_color(if current == argb {
-                            theme::accent()
-                        } else {
-                            theme::border()
-                        })
-                        .cursor(CursorStyle::PointingHand)
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.editor.stroke = argb;
-                                this.color_open = false;
-                                cx.notify();
-                            }),
-                        )
-                })),
-        )
+        Some(annotate::swatches_element(
+            SwatchesModel {
+                origin: (pos.x as f32, pos.y as f32),
+                current: self.editor.stroke,
+            },
+            Rc::new(|argb, this: &mut Self, _, cx| {
+                this.editor.stroke = argb;
+                this.color_open = false;
+                cx.notify();
+            }),
+            cx,
+        ))
     }
 
     /// The bar that replaces the toolbar mid-capture (the C# LongCaptureBar):
@@ -2029,52 +1830,15 @@ impl OverlayView {
             return None;
         }
         let sel = self.selection;
-        let committed: Vec<_> = self
-            .editor
-            .elements
-            .iter()
-            .filter_map(|el| {
-                let Shape::Text { text, font_size } = &el.shape else {
-                    return None;
-                };
-                Some(
-                    div()
-                        .absolute()
-                        .left(px((el.bounds.x - sel.x) as f32 / scale))
-                        .top(px((el.bounds.y - sel.y) as f32 / scale))
-                        .font_family(text_raster::FONT_FAMILY)
-                        .text_color(rgb(el.stroke & 0x00FF_FFFF))
-                        .text_size(px(*font_size as f32 / scale))
-                        .child(text.clone()),
-                )
-            })
-            .collect();
-        // The draft is drawn exactly like the committed element will be -- same
-        // origin, face, size and colour, no box -- so typing is a live preview.
-        let stroke = self.editor.stroke;
-        let draft = self.text_edit.as_ref().map(|edit| {
-            div()
-                .absolute()
-                .left(px((edit.pt.x - sel.x) as f32 / scale))
-                .top(px((edit.pt.y - sel.y) as f32 / scale))
-                .min_w(px(40.))
-                .font_family(text_raster::FONT_FAMILY)
-                .text_color(rgb(stroke & 0x00FF_FFFF))
-                .text_size(px(TEXT_FONT_SIZE as f32 / scale))
-                .occlude()
-                .child(format!("{}|", edit.buf))
-        });
-        Some(
-            div()
-                .absolute()
-                .left(px(sel.x as f32 / scale))
-                .top(px(sel.y as f32 / scale))
-                .w(px(sel.width as f32 / scale))
-                .h(px(sel.height as f32 / scale))
-                .overflow_hidden()
-                .children(committed)
-                .children(draft),
-        )
+        let s = scale as f64;
+        Some(annotate::text_layer(TextLayer {
+            frame: Rect::new(sel.x / s, sel.y / s, sel.width / s, sel.height / s),
+            offset: Point { x: sel.x, y: sel.y },
+            scale,
+            elements: &self.editor.elements,
+            draft: self.text_edit.as_ref(),
+            stroke: self.editor.stroke,
+        }))
     }
 }
 
@@ -2096,10 +1860,11 @@ impl EntityInputHandler for OverlayView {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
-        let buf = &self.text_edit.as_ref()?.buf;
-        let range = utf16_to_byte(buf, range_utf16.start)..utf16_to_byte(buf, range_utf16.end);
-        actual_range.replace(byte_to_utf16(buf, range.start)..byte_to_utf16(buf, range.end));
-        Some(buf[range].to_string())
+        Some(
+            self.text_edit
+                .as_ref()?
+                .text_for_range(range_utf16, actual_range),
+        )
     }
 
     fn selected_text_range(
@@ -2108,23 +1873,16 @@ impl EntityInputHandler for OverlayView {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        let buf = &self.text_edit.as_ref()?.buf;
-        let end = byte_to_utf16(buf, buf.len());
-        Some(UTF16Selection {
-            range: end..end,
-            reversed: false,
-        })
+        Some(self.text_edit.as_ref()?.selected_range())
     }
 
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        let edit = self.text_edit.as_ref()?;
-        let m = edit.marked.as_ref()?;
-        Some(byte_to_utf16(&edit.buf, m.start)..byte_to_utf16(&edit.buf, m.end))
+        self.text_edit.as_ref()?.marked_range()
     }
 
     fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
         if let Some(edit) = self.text_edit.as_mut() {
-            edit.marked = None;
+            edit.unmark();
         }
     }
 
@@ -2135,16 +1893,10 @@ impl EntityInputHandler for OverlayView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(edit) = self.text_edit.as_mut() else {
-            return;
-        };
-        let range = range_utf16
-            .map(|r| utf16_to_byte(&edit.buf, r.start)..utf16_to_byte(&edit.buf, r.end))
-            .or_else(|| edit.marked.clone())
-            .unwrap_or(edit.buf.len()..edit.buf.len());
-        edit.buf.replace_range(range, new_text);
-        edit.marked = None;
-        cx.notify();
+        if let Some(edit) = self.text_edit.as_mut() {
+            edit.replace(range_utf16, new_text);
+            cx.notify();
+        }
     }
 
     fn replace_and_mark_text_in_range(
@@ -2155,16 +1907,10 @@ impl EntityInputHandler for OverlayView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(edit) = self.text_edit.as_mut() else {
-            return;
-        };
-        let range = range_utf16
-            .map(|r| utf16_to_byte(&edit.buf, r.start)..utf16_to_byte(&edit.buf, r.end))
-            .or_else(|| edit.marked.clone())
-            .unwrap_or(edit.buf.len()..edit.buf.len());
-        edit.buf.replace_range(range.clone(), new_text);
-        edit.marked = (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
-        cx.notify();
+        if let Some(edit) = self.text_edit.as_mut() {
+            edit.replace_and_mark(range_utf16, new_text);
+            cx.notify();
+        }
     }
 
     fn bounds_for_range(
@@ -2176,15 +1922,7 @@ impl EntityInputHandler for OverlayView {
     ) -> Option<Bounds<Pixels>> {
         let edit = self.text_edit.as_ref()?;
         let scale = window.scale_factor().max(0.01);
-        // ponytail: the whole draft line, not the exact caret x; the IME only
-        // uses this to park its candidate window nearby.
-        Some(Bounds {
-            origin: point(
-                element_bounds.origin.x + px(edit.pt.x as f32 / scale),
-                element_bounds.origin.y + px(edit.pt.y as f32 / scale),
-            ),
-            size: size(px(1.), px(TEXT_FONT_SIZE as f32 / scale)),
-        })
+        Some(edit.ime_bounds(element_bounds, Point { x: 0.0, y: 0.0 }, scale))
     }
 
     fn character_index_for_point(
@@ -2217,7 +1955,7 @@ impl Render for OverlayView {
         let has_sel = self.has_sel;
         let marks: Vec<Element> = self.editor.visible().cloned().collect();
         let masks = self.mark_masks(&marks);
-        let mosaic = self.mosaic_tiles(cx);
+        let mosaic = self.mosaic_tiles(&marks, cx);
         let tool = self.editor.tool;
         // Registered from the canvas paint so the IME talks to this view while
         // a text draft is open; the handler is a no-op otherwise.
@@ -2297,119 +2035,6 @@ impl Render for OverlayView {
     }
 }
 
-/// Hover label for a toolbar button. gpui owns the show delay and placement; this
-/// only has to render the bubble.
-struct ToolLabel(SharedString);
-
-impl Render for ToolLabel {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .px(px(6.))
-            .py(px(3.))
-            .rounded_md()
-            .bg(theme::surface())
-            .border_1()
-            .border_color(theme::border())
-            .text_color(theme::primary_fg())
-            .text_size(px(12.))
-            .child(self.0.clone())
-    }
-}
-
-/// `swatch` is `Some` only for COLOR, which shows the current stroke colour
-/// instead of an icon.
-fn toolbar_button(
-    id: &'static str,
-    active: bool,
-    dim: bool,
-    swatch: Option<u32>,
-    cx: &mut Context<OverlayView>,
-) -> impl IntoElement {
-    let fg = if dim {
-        theme::disabled_fg()
-    } else if active {
-        theme::accent()
-    } else {
-        theme::primary_fg()
-    };
-    let idle_bg = if active {
-        theme::active_background()
-    } else {
-        theme::transparent()
-    };
-    let hover_bg = if active {
-        theme::active_background()
-    } else {
-        theme::elevated_surface()
-    };
-    div()
-        .id(id)
-        .w(px(toolbar::BTN as f32))
-        .h(px(toolbar::BTN as f32))
-        .rounded_md()
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(idle_bg)
-        .text_color(fg)
-        .cursor(if dim {
-            CursorStyle::Arrow
-        } else {
-            CursorStyle::PointingHand
-        })
-        .when(!dim, |el| el.hover(move |s| s.bg(hover_bg)))
-        .child(match swatch {
-            Some(argb) => div()
-                .w(px(toolbar::SWATCH_ICON))
-                .h(px(toolbar::SWATCH_ICON))
-                .rounded_full()
-                .bg(rgb(argb & 0xFF_FFFF))
-                .border_1()
-                .border_color(theme::border())
-                .into_any_element(),
-            None => svg()
-                .path(toolbar::icon_path(id).unwrap_or(""))
-                .w(px(toolbar::ICON))
-                .h(px(toolbar::ICON))
-                .text_color(fg)
-                .into_any_element(),
-        })
-        .tooltip(move |_, cx| {
-            let view: AnyView = cx.new(|_| ToolLabel(toolbar::label(id).into())).into();
-            view
-        })
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |view, _, window, cx| {
-                view.handle_toolbar(id, window, cx);
-                cx.stop_propagation();
-            }),
-        )
-}
-
-/// Mirror the rendered layout -- `PAD`, then one `BTN` every `BTN + ITEM_GAP`.
-/// Splitting `geom.width` into equal slots instead drifts by the padding and can
-/// land a click on Cancel in Complete's slot.
-fn toolbar_item_at(p: Point, geom: Rect, items: &[&'static str]) -> Option<&'static str> {
-    if items.is_empty() || !geom.contains(p) {
-        return None;
-    }
-    let s = geom.width / toolbar::bar_size(items.len()).0;
-    let pitch = (toolbar::BTN + toolbar::ITEM_GAP) * s;
-    if pitch <= 0.0 {
-        return None;
-    }
-    let rel = p.x - geom.x - toolbar::PAD * s;
-    if rel < 0.0 {
-        return None;
-    }
-    let i = (rel / pitch).floor();
-    if rel - i * pitch > toolbar::BTN * s {
-        return None;
-    }
-    items.get(i as usize).copied()
-}
-
 fn coord_label(shown: Option<Rect>, mouse: Point, phase: Phase, scale: f32) -> impl IntoElement {
     let (text, x, y) = if let Some(r) = shown {
         (
@@ -2467,12 +2092,13 @@ fn paint_overlay(window: &mut Window, bounds: Bounds<Pixels>, paint: OverlayPain
         masks,
         mosaic,
     } = paint;
-    let hole = shown.map(|r| rect_to_bounds(r, scale));
+    let origin = Point { x: 0.0, y: 0.0 };
+    let hole = shown.map(|r| annotate::rect_to_bounds(r, scale));
     for dim in dim_around(bounds, hole) {
         window.paint_quad(fill(dim, hsla(0., 0., 0., 0.2)));
     }
     if let Some(r) = shown {
-        let dest = rect_to_bounds(r, scale);
+        let dest = annotate::rect_to_bounds(r, scale);
         window.paint_quad(outline(dest, black(), BorderStyle::Solid));
         paint_ants(window, dest, start.elapsed().as_secs_f32());
         if phase == Phase::Active && has_sel {
@@ -2485,82 +2111,18 @@ fn paint_overlay(window: &mut Window, bounds: Bounds<Pixels>, paint: OverlayPain
     match shown {
         Some(r) => {
             let mask = ContentMask {
-                bounds: rect_to_bounds(r, scale),
+                bounds: annotate::rect_to_bounds(r, scale),
             };
             window.with_content_mask(Some(mask), |window| {
-                paint_marks(window, &marks, &masks, &mosaic, scale);
+                annotate::paint_marks(window, &marks, &masks, &mosaic, origin, scale);
             });
         }
-        None => paint_marks(window, &marks, &masks, &mosaic, scale),
+        None => annotate::paint_marks(window, &marks, &masks, &mosaic, origin, scale),
     }
     if phase == Phase::Selecting {
         if let Some(pixels) = mag {
             paint_magnifier(window, bounds, mouse, pixels, scale);
         }
-    }
-}
-
-fn paint_marks(
-    window: &mut Window,
-    marks: &[Element],
-    masks: &[Option<Rc<Vec<CoverageRun>>>],
-    mosaic: &MosaicTiles,
-    scale: f32,
-) {
-    for (r, color) in &mosaic.tiles {
-        window.paint_quad(fill(rect_to_bounds(*r, scale), rgb(*color)));
-    }
-    for (el, mask) in marks.iter().zip(masks.iter()) {
-        match &el.shape {
-            Shape::Mosaic { .. } => {
-                if !mosaic.covered.contains(&el.id) {
-                    window.paint_quad(fill(
-                        rect_to_bounds(el.bounds, scale),
-                        hsla(0., 0., 0.5, 0.35),
-                    ));
-                }
-            }
-            // Text is a GPUI div in the overlay tree; CPU composite handles export.
-            Shape::Text { .. } => {}
-            _ => {
-                if let Some(runs) = mask {
-                    paint_mask(window, runs, scale, rgb(el.stroke & 0x00FF_FFFF));
-                }
-            }
-        }
-    }
-}
-
-/// Paint one element's coverage mask as alpha-weighted quads, one per
-/// constant-coverage run of physical pixels.
-///
-/// The mask IS the per-pixel coverage the export composite blends
-/// (`composite::element_mask`), so the preview cannot drift from the saved
-/// image. Each run becomes a quad whose logical coordinates are physical/scale,
-/// which `paint_quad` multiplies back by `scale_factor`: at 100%/125%/.../200%
-/// DPI every quad lands exactly on whole device pixels, and the coverage alpha
-/// supplies the antialiasing the quad pipeline itself does not have (plain
-/// filled quads take a hard-edged fast path in the DirectX shader). Runs are
-/// disjoint, so overlapping segments never double-blend -- the mask already
-/// resolved them with max.
-fn paint_mask(window: &mut Window, runs: &[CoverageRun], scale: f32, color: gpui::Rgba) {
-    for run in runs {
-        let mut c = color;
-        c.a *= run.alpha as f32 / 255.0;
-        window.paint_quad(fill(
-            Bounds {
-                origin: point(px(run.x0 as f32 / scale), px(run.y as f32 / scale)),
-                size: size(px((run.x1 - run.x0) as f32 / scale), px(1.0 / scale)),
-            },
-            c,
-        ));
-    }
-}
-
-fn rect_to_bounds(r: Rect, scale: f32) -> Bounds<Pixels> {
-    Bounds {
-        origin: point(px(r.x as f32 / scale), px(r.y as f32 / scale)),
-        size: size(px(r.width as f32 / scale), px(r.height as f32 / scale)),
     }
 }
 
@@ -2953,7 +2515,7 @@ mod tests {
         let (w, h) = toolbar::bar_size(items.len());
         let geom = Rect::new(100.0, 200.0, w, h);
         // Button i spans [100 + PAD + i*38, +BTN] = [104,140] [142,178] [180,216] [218,254].
-        let at = |x: f64| toolbar_item_at(Point { x, y: 210.0 }, geom, &items);
+        let at = |x: f64| annotate::toolbar_item_at(Point { x, y: 210.0 }, geom, &items);
         assert_eq!(at(104.0), Some("select"));
         assert_eq!(at(139.0), Some("select"));
         assert_eq!(at(142.0), Some("rect"));
@@ -2963,7 +2525,7 @@ mod tests {
         assert_eq!(at(141.0), None, "gap between buttons is not a button");
         assert_eq!(at(50.0), None);
         assert_eq!(
-            toolbar_item_at(Point { x: 210.0, y: 10.0 }, geom, &items),
+            annotate::toolbar_item_at(Point { x: 210.0, y: 10.0 }, geom, &items),
             None
         );
     }
@@ -2978,7 +2540,7 @@ mod tests {
             let left = toolbar::PAD + i as f64 * (toolbar::BTN + toolbar::ITEM_GAP);
             for x in [left, left + toolbar::BTN / 2.0, left + toolbar::BTN - 0.1] {
                 assert_eq!(
-                    toolbar_item_at(Point { x, y: 20.0 }, geom, &items),
+                    annotate::toolbar_item_at(Point { x, y: 20.0 }, geom, &items),
                     Some(*id),
                     "x={x} should hit {id}"
                 );

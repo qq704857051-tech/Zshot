@@ -35,6 +35,10 @@ pub const WM_TRAYICON: u32 = WM_APP + 1;
 pub const WM_ZSHOT_SETTINGS: u32 = WM_APP + 2;
 /// Posted by the recording hook with a packed `Hotkey` in WPARAM.
 pub const WM_ZSHOT_HOTKEY_RECORDED: u32 = WM_APP + 3;
+/// Posted by a pin window on right-click with the pin id in WPARAM. The
+/// hidden window runs the popup menu's modal loop, where no gpui window is
+/// mid-update, then hands the chosen command back to the pin.
+pub const WM_ZSHOT_PIN_MENU: u32 = WM_APP + 4;
 /// Overlay-interactive sentinel. The value is fixed by the vendored gpui patch
 /// (`Window::on_app_ready_sentinel`) — changing it here alone breaks the T7 mark.
 pub const WM_APP_READY_SENTINEL: u32 = WM_APP + 32;

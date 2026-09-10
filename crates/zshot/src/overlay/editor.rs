@@ -48,6 +48,50 @@ impl Element {
         }
     }
 
+    /// The element mapped from one pixel space to another by a uniform
+    /// scale about the origin: geometry, stroke width, mosaic block and font
+    /// size all follow, so a mark drawn over a zoomed pin lands on the
+    /// native pixels at the same relative size.
+    pub fn scaled(&self, k: f64) -> Element {
+        let mut el = self.clone();
+        el.bounds = Rect::new(
+            self.bounds.x * k,
+            self.bounds.y * k,
+            self.bounds.width * k,
+            self.bounds.height * k,
+        );
+        el.stroke_width = self.stroke_width * k;
+        match &mut el.shape {
+            Shape::Arrow { start, end, head } => {
+                *start = Point {
+                    x: start.x * k,
+                    y: start.y * k,
+                };
+                *end = Point {
+                    x: end.x * k,
+                    y: end.y * k,
+                };
+                *head *= k;
+            }
+            Shape::Pen { points } => {
+                for p in points {
+                    p.x *= k;
+                    p.y *= k;
+                }
+            }
+            Shape::Mosaic { points, block_size } => {
+                for p in points {
+                    p.x *= k;
+                    p.y *= k;
+                }
+                *block_size = ((*block_size as f64 * k).round() as i32).max(2);
+            }
+            Shape::Text { font_size, .. } => *font_size *= k,
+            Shape::Rect => {}
+        }
+        el
+    }
+
     /// Freehand shapes are worth keeping even when the drag never moved.
     fn has_path(&self) -> bool {
         matches!(self.shape, Shape::Pen { .. } | Shape::Mosaic { .. })
@@ -783,6 +827,32 @@ mod tests {
         uniq.sort();
         uniq.dedup();
         assert_eq!(doubled.len(), uniq.len());
+    }
+
+    #[test]
+    fn scaled_maps_geometry_stroke_and_block() {
+        let el = Element {
+            id: 1,
+            bounds: Rect::new(10.0, 20.0, 30.0, 40.0),
+            stroke: 0xFFFF_0000,
+            stroke_width: 4.0,
+            shape: Shape::Mosaic {
+                points: vec![Point { x: 10.0, y: 20.0 }],
+                block_size: 16,
+            },
+        };
+        let s = el.scaled(0.5);
+        assert_eq!(s.bounds, Rect::new(5.0, 10.0, 15.0, 20.0));
+        assert_eq!(s.stroke_width, 2.0);
+        match s.shape {
+            Shape::Mosaic { points, block_size } => {
+                assert_eq!(points[0], Point { x: 5.0, y: 10.0 });
+                assert_eq!(block_size, 8);
+            }
+            _ => panic!("shape changed"),
+        }
+        // Identity leaves the element untouched.
+        assert_eq!(el.scaled(1.0), el);
     }
 
     #[test]

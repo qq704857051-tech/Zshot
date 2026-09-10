@@ -14,6 +14,8 @@ pub mod ocr;
 pub mod overlay;
 pub mod perf;
 pub mod pin;
+pub mod pin_edit;
+pub mod pin_snap;
 pub mod platform;
 pub mod settings;
 pub mod translate;
