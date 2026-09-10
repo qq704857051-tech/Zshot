@@ -49,12 +49,12 @@ pub struct HotkeyBindings {
 }
 
 impl HotkeyBindings {
-    /// PoC defaults: PrtSc / Ctrl+Alt+A / Ctrl+Alt+W.
+    /// Defaults: Ctrl+Alt+A (region), Ctrl+Alt+W (copy only), PrtSc (fullscreen).
     pub fn poc_defaults() -> Self {
         Self {
-            region: Hotkey::new(false, false, false, false, VK_SNAPSHOT),
-            copy_only: Hotkey::new(true, true, false, false, VK_A),
-            fullscreen: Hotkey::new(true, true, false, false, VK_W),
+            region: Hotkey::new(true, true, false, false, VK_A),
+            copy_only: Hotkey::new(true, true, false, false, VK_W),
+            fullscreen: Hotkey::new(false, false, false, false, VK_SNAPSHOT),
         }
     }
 
@@ -200,7 +200,7 @@ pub struct HotkeyDecision {
 /// `VK_SNAPSHOT` often arrives as KeyUp-only; we fire the action on KeyUp for
 /// PrintScreen and on KeyDown for every other key. Both edges are swallowed
 /// when the modifiers match a binding. Unbound variants (e.g. Win+PrtSc when
-/// region is plain PrtSc) are not swallowed.
+/// fullscreen is plain PrtSc) are not swallowed.
 pub fn decide(bindings: &HotkeyBindings, ev: KeyEvent) -> HotkeyDecision {
     let bound = bindings.action_for_combo(ev);
     let swallow = bound.is_some();
@@ -283,10 +283,10 @@ mod tests {
     }
 
     #[test]
-    fn prtsc_keyup_only_fires_region() {
+    fn prtsc_keyup_only_fires_fullscreen() {
         let b = HotkeyBindings::poc_defaults();
         let d = decide(&b, ev(VK_SNAPSHOT, false, false, false, false, true));
-        assert_eq!(d.action, Some(HotkeyAction::Region));
+        assert_eq!(d.action, Some(HotkeyAction::Fullscreen));
         assert!(d.swallow);
     }
 
@@ -307,10 +307,10 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_alt_a_keydown_fires_copy_only() {
+    fn ctrl_alt_a_keydown_fires_region() {
         let b = HotkeyBindings::poc_defaults();
         let d = decide(&b, ev(VK_A, true, true, false, false, false));
-        assert_eq!(d.action, Some(HotkeyAction::CopyOnly));
+        assert_eq!(d.action, Some(HotkeyAction::Region));
         assert!(d.swallow);
     }
 
@@ -323,10 +323,10 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_alt_w_fires_fullscreen() {
+    fn ctrl_alt_w_fires_copy_only() {
         let b = HotkeyBindings::poc_defaults();
         let d = decide(&b, ev(VK_W, true, true, false, false, false));
-        assert_eq!(d.action, Some(HotkeyAction::Fullscreen));
+        assert_eq!(d.action, Some(HotkeyAction::CopyOnly));
         assert!(d.swallow);
     }
 }

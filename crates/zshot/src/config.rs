@@ -36,9 +36,9 @@ pub struct Hotkeys {
 impl Default for Hotkeys {
     fn default() -> Self {
         Self {
-            region: "PrtSc".into(),
-            copy_only: "Ctrl+Alt+A".into(),
-            fullscreen: "Ctrl+Alt+W".into(),
+            region: "Ctrl+Alt+A".into(),
+            copy_only: "Ctrl+Alt+W".into(),
+            fullscreen: "PrtSc".into(),
         }
     }
 }
