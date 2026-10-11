@@ -401,6 +401,7 @@ impl Render for PinToolbar {
                 can_redo: e.session.history.can_redo(),
                 color_open: e.color_open,
                 stroke: e.session.stroke,
+                scale: 1.0,
             };
             let swatches = e.color_open.then(|| {
                 let (sw, _) = toolbar::swatches_size(theme::SWATCHES.len());
@@ -413,6 +414,7 @@ impl Render for PinToolbar {
                 SwatchesModel {
                     origin: (x as f32, 0.0),
                     current: e.session.stroke,
+                    scale: 1.0,
                 }
             });
             (model, swatches)

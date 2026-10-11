@@ -34,6 +34,7 @@ pub struct MonitorInfo {
     pub sdr_white_nits: f32,
     pub output: Option<IDXGIOutput>,
     pub adapter_luid: Option<(u32, i32)>,
+    pub dpi_scale: f32,
 }
 
 pub fn dxgi_allowed(mon: &MonitorInfo, overlay_luid: (u32, i32)) -> bool {
@@ -131,6 +132,23 @@ pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>> {
                     .map(|(_, nits)| *nits)
             })
             .unwrap_or(REFERENCE_WHITE_NITS);
+        let mut dpi_x = 96u32;
+        let mut dpi_y = 96u32;
+        let dpi_scale = unsafe {
+            if windows::Win32::UI::HiDpi::GetDpiForMonitor(
+                handle,
+                windows::Win32::UI::HiDpi::MDT_EFFECTIVE_DPI,
+                &mut dpi_x,
+                &mut dpi_y,
+            )
+            .is_ok()
+                && dpi_x > 0
+            {
+                dpi_x as f32 / 96.0
+            } else {
+                1.0
+            }
+        };
         monitors.push(MonitorInfo {
             handle,
             x: rect.left,
@@ -141,6 +159,7 @@ pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>> {
             sdr_white_nits,
             output,
             adapter_luid,
+            dpi_scale,
         });
     }
     Ok(monitors)
@@ -311,6 +330,7 @@ pub fn dummy_monitor(adapter_luid: Option<(u32, i32)>) -> MonitorInfo {
         sdr_white_nits: REFERENCE_WHITE_NITS,
         output: None,
         adapter_luid,
+        dpi_scale: 1.0,
     }
 }
 

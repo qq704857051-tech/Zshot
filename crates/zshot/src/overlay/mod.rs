@@ -132,6 +132,7 @@ pub struct OverlayView {
     /// 60fps for the marching ants, and `active_monitor_rect` is called
     /// several times per frame.
     monitor_rects: Vec<Rect>,
+    monitor_scales: Vec<f32>,
     hit: SelectionHitKind,
     sel_at_press: Rect,
     start: Instant,
@@ -454,6 +455,7 @@ impl OverlayView {
             has_sel: false,
             windows: Vec::new(),
             monitor_rects: Vec::new(),
+            monitor_scales: Vec::new(),
             hit: SelectionHitKind::None,
             sel_at_press: Rect::new(0.0, 0.0, 0.0, 0.0),
             start: Instant::now(),
@@ -499,6 +501,7 @@ impl OverlayView {
             has_sel: false,
             windows: Vec::new(),
             monitor_rects: Vec::new(),
+            monitor_scales: Vec::new(),
             hit: SelectionHitKind::None,
             sel_at_press: Rect::new(0.0, 0.0, 0.0, 0.0),
             start: Instant::now(),
@@ -565,15 +568,18 @@ impl OverlayView {
         self.origin_x = ox;
         self.origin_y = oy;
         self.freeze_size = (w, h);
-        self.monitor_rects = crate::capture::enumerate_monitors()
-            .map(|mons| {
-                mons.iter()
-                    .map(|m| {
-                        Rect::new((m.x - ox) as f64, (m.y - oy) as f64, m.w as f64, m.h as f64)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        if let Ok(mons) = crate::capture::enumerate_monitors() {
+            self.monitor_rects = mons
+                .iter()
+                .map(|m| {
+                    Rect::new((m.x - ox) as f64, (m.y - oy) as f64, m.w as f64, m.h as f64)
+                })
+                .collect();
+            self.monitor_scales = mons.iter().map(|m| m.dpi_scale).collect();
+        } else {
+            self.monitor_rects = Vec::new();
+            self.monitor_scales = Vec::new();
+        }
         let hwnd = window.win32_hwnd();
         self.windows = detect_windows(hwnd, ox, oy);
         let mut mouse = Point { x: 0.0, y: 0.0 };
@@ -1097,6 +1103,21 @@ impl OverlayView {
         )
     }
 
+    fn active_monitor_scale(&self, default_scale: f32) -> f32 {
+        let cx = self.selection.x + self.selection.width / 2.0;
+        let cy = self.selection.y + self.selection.height / 2.0;
+        for (i, m) in self.monitor_rects.iter().enumerate() {
+            if cx >= m.x && cx < m.x + m.width && cy >= m.y && cy < m.y + m.height {
+                if let Some(&scale) = self.monitor_scales.get(i) {
+                    if scale > 0.1 {
+                        return scale;
+                    }
+                }
+            }
+        }
+        default_scale
+    }
+
     /// One list for sizing, hit testing and painting. Sizing the bar for every
     /// tool while painting a filtered subset drifts every slot, so a click on
     /// the last button lands on its neighbour.
@@ -1114,15 +1135,15 @@ impl OverlayView {
         }
         let n = self.visible_items().len();
         let (w, h) = toolbar::bar_size(n);
-        let s = scale as f64;
+        let mon_scale = self.active_monitor_scale(scale) as f64;
         let pos = toolbar::place_toolbar(
             self.selection,
-            w * s,
-            h * s,
+            w * mon_scale,
+            h * mon_scale,
             self.active_monitor_rect(),
-            toolbar::ANCHOR_GAP * s,
+            toolbar::ANCHOR_GAP * mon_scale,
         );
-        Some(Rect::new(pos.x, pos.y, w * s, h * s))
+        Some(Rect::new(pos.x, pos.y, w * mon_scale, h * mon_scale))
     }
 
     fn hit_toolbar_item(&self, p: Point, scale: f32) -> Option<&'static str> {
@@ -1561,6 +1582,8 @@ impl OverlayView {
 
     fn toolbar_element(&self, scale: f32, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let geom = self.toolbar_geom(scale)?;
+        let mon_scale = self.active_monitor_scale(scale);
+        let rel_scale = (mon_scale / scale).max(0.2);
         let model = ToolbarModel {
             origin: (geom.x as f32 / scale, geom.y as f32 / scale),
             items: self.visible_items(),
@@ -1569,6 +1592,7 @@ impl OverlayView {
             can_redo: self.editor.history.can_redo(),
             color_open: self.color_open,
             stroke: self.editor.stroke,
+            scale: rel_scale,
         };
         Some(annotate::toolbar_element(
             model,
@@ -1594,19 +1618,24 @@ impl OverlayView {
         let bar = Rect::new(bar.x / s, bar.y / s, bar.width / s, bar.height / s);
         let mon = self.active_monitor_rect();
         let mon = Rect::new(mon.x / s, mon.y / s, mon.width / s, mon.height / s);
-        let (w, h) = toolbar::swatches_size(theme::SWATCHES.len());
+        let mon_scale = self.active_monitor_scale(scale);
+        let rel_scale = (mon_scale / scale).max(0.2);
+        let (base_w, base_h) = toolbar::swatches_size(theme::SWATCHES.len());
+        let w = base_w * rel_scale as f64;
+        let h = base_h * rel_scale as f64;
         let pos = toolbar::place_swatches(
             toolbar::item_center_x(bar, index),
             bar,
             w,
             h,
             mon,
-            toolbar::ANCHOR_GAP,
+            toolbar::ANCHOR_GAP * rel_scale as f64,
         );
         Some(annotate::swatches_element(
             SwatchesModel {
                 origin: (pos.x as f32, pos.y as f32),
                 current: self.editor.stroke,
+                scale: rel_scale,
             },
             Rc::new(|argb, this: &mut Self, _, cx| {
                 this.editor.stroke = argb;

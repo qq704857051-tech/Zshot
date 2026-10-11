@@ -488,6 +488,7 @@ pub struct ToolbarModel {
     pub can_redo: bool,
     pub color_open: bool,
     pub stroke: u32,
+    pub scale: f32,
 }
 
 fn chrome_shadow() -> Vec<BoxShadow> {
@@ -512,7 +513,9 @@ pub fn toolbar_element<V: 'static>(
         can_redo,
         color_open,
         stroke,
+        scale,
     } = model;
+    let s = if scale > 0.0 { scale } else { 1.0 };
     div()
         .absolute()
         .left(px(origin.0))
@@ -520,9 +523,9 @@ pub fn toolbar_element<V: 'static>(
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(toolbar::ITEM_GAP as f32))
-        .px(px(toolbar::PAD as f32))
-        .py(px(toolbar::PAD as f32))
+        .gap(px((toolbar::ITEM_GAP as f32) * s))
+        .px(px((toolbar::PAD as f32) * s))
+        .py(px((toolbar::PAD as f32) * s))
         .rounded_xl()
         .bg(theme::surface())
         .border_1()
@@ -542,6 +545,7 @@ pub fn toolbar_element<V: 'static>(
                 active,
                 dim,
                 is_color.then_some(stroke),
+                s,
                 on_item.clone(),
                 cx,
             )
@@ -552,6 +556,7 @@ pub struct SwatchesModel {
     /// Logical, window-local top-left of the popup.
     pub origin: (f32, f32),
     pub current: u32,
+    pub scale: f32,
 }
 
 /// The colour popup.
@@ -560,7 +565,8 @@ pub fn swatches_element<V: 'static>(
     on_pick: OnPick<V>,
     cx: &mut Context<V>,
 ) -> impl IntoElement {
-    let SwatchesModel { origin, current } = model;
+    let SwatchesModel { origin, current, scale } = model;
+    let s = if scale > 0.0 { scale } else { 1.0 };
     div()
         .absolute()
         .left(px(origin.0))
@@ -568,8 +574,8 @@ pub fn swatches_element<V: 'static>(
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(toolbar::SWATCH_GAP as f32))
-        .p(px(toolbar::PAD as f32))
+        .gap(px((toolbar::SWATCH_GAP as f32) * s))
+        .p(px((toolbar::PAD as f32) * s))
         .rounded_xl()
         .bg(theme::surface())
         .border_1()
@@ -584,8 +590,8 @@ pub fn swatches_element<V: 'static>(
             let on_pick = on_pick.clone();
             div()
                 .id(SharedString::from(hex))
-                .w(px(toolbar::SWATCH as f32))
-                .h(px(toolbar::SWATCH as f32))
+                .w(px((toolbar::SWATCH as f32) * s))
+                .h(px((toolbar::SWATCH as f32) * s))
                 .rounded_full()
                 .bg(rgb(rgb24))
                 .border_2()
@@ -631,6 +637,7 @@ fn toolbar_button<V: 'static>(
     active: bool,
     dim: bool,
     swatch: Option<u32>,
+    scale: f32,
     on_item: OnItem<V>,
     cx: &mut Context<V>,
 ) -> impl IntoElement {
@@ -653,8 +660,8 @@ fn toolbar_button<V: 'static>(
     };
     div()
         .id(id)
-        .w(px(toolbar::BTN as f32))
-        .h(px(toolbar::BTN as f32))
+        .w(px((toolbar::BTN as f32) * scale))
+        .h(px((toolbar::BTN as f32) * scale))
         .rounded_md()
         .flex()
         .items_center()
@@ -669,8 +676,8 @@ fn toolbar_button<V: 'static>(
         .when(!dim, |el| el.hover(move |s| s.bg(hover_bg)))
         .child(match swatch {
             Some(argb) => div()
-                .w(px(toolbar::SWATCH_ICON))
-                .h(px(toolbar::SWATCH_ICON))
+                .w(px(toolbar::SWATCH_ICON * scale))
+                .h(px(toolbar::SWATCH_ICON * scale))
                 .rounded_full()
                 .bg(rgb(argb & 0xFF_FFFF))
                 .border_1()
@@ -678,8 +685,8 @@ fn toolbar_button<V: 'static>(
                 .into_any_element(),
             None => svg()
                 .path(toolbar::icon_path(id).unwrap_or(""))
-                .w(px(toolbar::ICON))
-                .h(px(toolbar::ICON))
+                .w(px(toolbar::ICON * scale))
+                .h(px(toolbar::ICON * scale))
                 .text_color(fg)
                 .into_any_element(),
         })

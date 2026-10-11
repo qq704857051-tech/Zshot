@@ -9,3 +9,10 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
       - run: cargo build --release --locked
+      - name: Upload Zshot executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zshot-x64-release
+          path: |
+            target/release/Zshot.exe
+            target/release/DirectML.dll
